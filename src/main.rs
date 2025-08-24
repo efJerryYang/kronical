@@ -27,7 +27,10 @@ use ratatui::widgets::Block;
 use ratatui::widgets::Borders;
 use ratatui::widgets::Paragraph;
 use ratatui::Terminal;
+use std::io::Read;
 use std::io::{self, Write};
+use std::io::{BufRead, BufReader};
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::process;
 use std::thread;
@@ -269,9 +272,6 @@ fn monitor_realtime(data_file: PathBuf) -> Result<()> {
     Ok(())
 }
 
-use std::io::Read;
-use std::os::unix::net::UnixStream;
-
 fn run_monitor_loop<B: Backend>(terminal: &mut Terminal<B>, data_file: PathBuf) -> io::Result<()> {
     let notification_socket_path = data_file.parent().unwrap().join("chronicle.notify.sock");
 
@@ -356,9 +356,6 @@ fn run_monitor_loop<B: Backend>(terminal: &mut Terminal<B>, data_file: PathBuf) 
 }
 
 fn query_daemon_via_socket(data_file: &PathBuf) -> Result<socket_server::MonitorResponse> {
-    use std::io::{BufRead, BufReader};
-    use std::os::unix::net::UnixStream;
-
     let socket_path = data_file.parent().unwrap().join("chronicle.sock");
 
     let mut stream = UnixStream::connect(socket_path)?;
