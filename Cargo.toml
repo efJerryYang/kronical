@@ -10,15 +10,6 @@ license = "MIT"
 name = "chronicle"
 path = "src/main.rs"
 
-[dev-dependencies]
-criterion = { version = "0.4", features = ["html_reports"] }
-tokio = { version = "1", features = ["full"] }
-
-[[bench]]
-name = "sqlite_storage"
-path = "benches/sqlite_storage_bench.rs"
-harness = false
-
 [dependencies]
 winshift = { path = "../vendor/winshift-rs" }
 uiohook-rs = { path = "../vendor/uiohook-rs" }
