@@ -1,10 +1,11 @@
+use crate::coordinator::get_global_system;
 use crate::events::WindowFocusInfo;
 use active_win_pos_rs::get_active_window;
 use log::{error, info, warn};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use sysinfo::{Pid, System};
+use sysinfo::Pid;
 
 #[derive(Debug, Clone)]
 pub struct FocusState {
@@ -59,7 +60,6 @@ pub struct FocusEventWrapper {
     current_state: Arc<Mutex<FocusState>>,
     callback: Arc<dyn FocusChangeCallback + Send + Sync>,
     pid_cache: Arc<Mutex<HashMap<i32, u64>>>,
-    sys: Arc<Mutex<System>>,
 }
 
 impl FocusEventWrapper {
@@ -68,7 +68,6 @@ impl FocusEventWrapper {
             current_state: Arc::new(Mutex::new(FocusState::new())),
             callback,
             pid_cache: Arc::new(Mutex::new(HashMap::new())),
-            sys: Arc::new(Mutex::new(System::new())),
         }
     }
 
@@ -78,9 +77,13 @@ impl FocusEventWrapper {
             return *start_time;
         }
 
-        let mut sys = self.sys.lock().unwrap();
-        sys.refresh_process(Pid::from(pid as usize));
-        if let Some(process) = sys.process(Pid::from(pid as usize)) {
+        let mut system = get_global_system().lock().unwrap();
+        system.refresh_processes_specifics(
+            sysinfo::ProcessesToUpdate::Some(&[Pid::from(pid as usize)]),
+            false,
+            sysinfo::ProcessRefreshKind::nothing().with_memory(),
+        );
+        if let Some(process) = system.process(Pid::from(pid as usize)) {
             let start_time = process.start_time();
             cache.insert(pid, start_time);
             start_time
@@ -238,7 +241,6 @@ impl Clone for FocusEventWrapper {
             current_state: Arc::clone(&self.current_state),
             callback: Arc::clone(&self.callback),
             pid_cache: Arc::clone(&self.pid_cache),
-            sys: Arc::clone(&self.sys),
         }
     }
 }

@@ -6,12 +6,24 @@ use crate::socket_server::SocketServer;
 use crate::storage_backend::StorageBackend;
 use anyhow::Result;
 use log::{error, info};
+use once_cell::sync::Lazy;
 use std::collections::VecDeque;
-use std::sync::{mpsc, Arc};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
+use sysinfo::System;
 use uiohook_rs::{EventHandler, Uiohook, UiohookEvent};
 use winshift::{FocusChangeHandler, MonitoringMode, WindowFocusHook, WindowHookConfig};
+
+static GLOBAL_SYSTEM: Lazy<Mutex<System>> = Lazy::new(|| {
+    let mut system = System::new_all();
+    system.refresh_all();
+    Mutex::new(system)
+});
+
+pub fn get_global_system() -> &'static Mutex<System> {
+    &GLOBAL_SYSTEM
+}
 
 #[derive(Debug, Clone)]
 pub enum ChronicleEvent {
