@@ -1,4 +1,4 @@
-use crate::socket_server::{MonitorResponse, ActivityApp};
+use crate::socket_server::{ActivityApp, MonitorResponse};
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
@@ -28,7 +28,9 @@ fn draw_daemon_stats(frame: &mut Frame, area: Rect, response: &MonitorResponse) 
             Span::styled("Status: ", Style::default().fg(Color::Gray)),
             Span::styled(
                 response.daemon_status.clone(),
-                Style::default().fg(Color::Green).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
             ),
         ]),
         Line::from(vec![
@@ -46,17 +48,31 @@ fn draw_daemon_stats(frame: &mut Frame, area: Rect, response: &MonitorResponse) 
 
 fn draw_compression_stats(frame: &mut Frame, area: Rect, response: &MonitorResponse) {
     let stats = &response.compression_stats;
-    let block = Block::default().title("Event Compression").borders(Borders::ALL);
+    let block = Block::default()
+        .title("Event Compression")
+        .borders(Borders::ALL);
     let text = vec![
         Line::from(vec![
             Span::styled("Raw/Compact Events: ", Style::default().fg(Color::Gray)),
-            Span::raw(format!("{} / {} ", stats.events_in_ring_buffer, stats.compact_events_stored)),
-            Span::styled(format!("({:.2}x ratio)", stats.event_compression_ratio), Style::default().fg(Color::Yellow)),
+            Span::raw(format!(
+                "{} / {} ",
+                stats.events_in_ring_buffer, stats.compact_events_stored
+            )),
+            Span::styled(
+                format!("({:.2}x ratio)", stats.event_compression_ratio),
+                Style::default().fg(Color::Yellow),
+            ),
         ]),
         Line::from(vec![
             Span::styled("Raw/Compact Memory: ", Style::default().fg(Color::Gray)),
-            Span::raw(format!("{:.2}MB / {:.2}MB ", stats.raw_events_memory_mb, stats.compact_events_memory_mb)),
-            Span::styled(format!("({:.2}x ratio)", stats.memory_compression_ratio), Style::default().fg(Color::Yellow)),
+            Span::raw(format!(
+                "{:.2}MB / {:.2}MB ",
+                stats.raw_events_memory_mb, stats.compact_events_memory_mb
+            )),
+            Span::styled(
+                format!("({:.2}x ratio)", stats.memory_compression_ratio),
+                Style::default().fg(Color::Yellow),
+            ),
         ]),
         Line::from(vec![
             Span::styled("String Table Size:  ", Style::default().fg(Color::Gray)),
@@ -69,7 +85,9 @@ fn draw_compression_stats(frame: &mut Frame, area: Rect, response: &MonitorRespo
 
 fn draw_memory_stats(frame: &mut Frame, area: Rect, response: &MonitorResponse) {
     let stats = &response.compression_stats;
-    let block = Block::default().title("Data Structure Memory").borders(Borders::ALL);
+    let block = Block::default()
+        .title("Data Structure Memory")
+        .borders(Borders::ALL);
     let text = vec![
         Line::from(vec![
             Span::styled("Compact Events: ", Style::default().fg(Color::Gray)),
@@ -100,14 +118,16 @@ fn draw_recent_activity(frame: &mut Frame, area: Rect, recent_apps: &[ActivityAp
         frame.render_widget(text, area);
         return;
     }
-    
+
     let items: Vec<ListItem> = recent_apps
         .iter()
         .flat_map(|app| {
             let mut app_items = vec![ListItem::new(Line::from(vec![
                 Span::styled(
                     format!("{} ", app.app_name),
-                    Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD),
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
                 ),
                 Span::styled(
                     format!("[PID: {}; Start: {}]", app.pid, app.process_start_time),
@@ -116,24 +136,28 @@ fn draw_recent_activity(frame: &mut Frame, area: Rect, recent_apps: &[ActivityAp
                 Span::raw(format!(" - {} total", app.total_duration_pretty)),
             ]))];
 
-            let window_items: Vec<ListItem> = app.windows.iter().map(|window| {
-                ListItem::new(Line::from(vec![
-                    Span::raw("  └─ "),
-                    Span::styled(
-                        format!("[{}] ", window.window_id),
-                        Style::default().fg(Color::Yellow),
-                    ),
-                    Span::styled(
-                        format!("{} ", window.window_title),
-                        Style::default().fg(Color::White),
-                    ),
-                    Span::styled(
-                        format!("[{}]", window.last_active),
-                        Style::default().fg(Color::DarkGray),
-                    ),
-                ]))
-            }).collect();
-            
+            let window_items: Vec<ListItem> = app
+                .windows
+                .iter()
+                .map(|window| {
+                    ListItem::new(Line::from(vec![
+                        Span::raw("  └─ "),
+                        Span::styled(
+                            format!("[{}] ", window.window_id),
+                            Style::default().fg(Color::Yellow),
+                        ),
+                        Span::styled(
+                            format!("{} ", window.window_title),
+                            Style::default().fg(Color::White),
+                        ),
+                        Span::styled(
+                            format!("[{}]", window.last_active),
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ]))
+                })
+                .collect();
+
             app_items.extend(window_items);
             app_items.push(ListItem::new(Line::from(" "))); // spacer
             app_items

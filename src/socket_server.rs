@@ -1,13 +1,13 @@
 use crate::records::ActivityRecord;
 use anyhow::Result;
+use log::{error, info};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::io::{BufRead, BufReader, Write};
-use log::{error, info};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ActivityWindow {
@@ -96,33 +96,31 @@ impl SocketServer {
             notification_socket_path,
             recent_records: Arc::new(Mutex::new(Vec::new())),
             compression_stats: Arc::new(Mutex::new(None)),
-            notification_clients: Arc::new(Mutex::new(Vec::new()))
+            notification_clients: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
     fn notify_clients(&self) {
         let mut clients = self.notification_clients.lock().unwrap();
-        clients.retain_mut(|stream| {
-            match stream.write_all(&[1]) {
-                Ok(_) => true,
-                Err(_) => false,
-            }
+        clients.retain_mut(|stream| match stream.write_all(&[1]) {
+            Ok(_) => true,
+            Err(_) => false,
         });
     }
-    
+
     pub fn update_records(&self, records: Vec<ActivityRecord>) {
         let mut recent = self.recent_records.lock().unwrap();
         *recent = records;
         info!("Updated socket server with {} records", recent.len());
         self.notify_clients();
     }
-    
+
     pub fn update_compression_stats(&self, stats: CompressionInfo) {
         let mut compression = self.compression_stats.lock().unwrap();
         *compression = Some(stats);
         info!("Updated socket server with compression stats");
     }
-    
+
     pub fn start(&self) -> Result<()> {
         if self.socket_path.exists() {
             std::fs::remove_file(&self.socket_path)?;
@@ -130,12 +128,15 @@ impl SocketServer {
         if self.notification_socket_path.exists() {
             std::fs::remove_file(&self.notification_socket_path)?;
         }
-        
+
         let listener = UnixListener::bind(&self.socket_path)?;
         info!("Socket server listening on: {:?}", self.socket_path);
 
         let notification_listener = UnixListener::bind(&self.notification_socket_path)?;
-        info!("Notification server listening on: {:?}", self.notification_socket_path);
+        info!(
+            "Notification server listening on: {:?}",
+            self.notification_socket_path
+        );
 
         let notification_clients = Arc::clone(&self.notification_clients);
         thread::spawn(move || {
@@ -145,11 +146,11 @@ impl SocketServer {
                 }
             }
         });
-        
+
         let recent_records = Arc::clone(&self.recent_records);
         let compression_stats = Arc::clone(&self.compression_stats);
         let socket_path = self.socket_path.clone();
-        
+
         thread::spawn(move || {
             for stream in listener.incoming() {
                 match stream {
@@ -158,7 +159,8 @@ impl SocketServer {
                         let stats = Arc::clone(&compression_stats);
                         let socket_path_clone = socket_path.clone();
                         thread::spawn(move || {
-                            if let Err(e) = handle_client(stream, records, stats, socket_path_clone) {
+                            if let Err(e) = handle_client(stream, records, stats, socket_path_clone)
+                            {
                                 error!("Error handling client: {}", e);
                             }
                         });
@@ -169,28 +171,29 @@ impl SocketServer {
                 }
             }
         });
-        
+
         Ok(())
     }
 }
 
 fn handle_client(
-    mut stream: UnixStream, 
+    mut stream: UnixStream,
     recent_records: Arc<Mutex<Vec<ActivityRecord>>>,
     compression_stats: Arc<Mutex<Option<CompressionInfo>>>,
-    socket_path: PathBuf
+    socket_path: PathBuf,
 ) -> Result<()> {
     let mut reader = BufReader::new(&stream);
     let mut line = String::new();
-    
+
     reader.read_line(&mut line)?;
     let command = line.trim();
-    
+
     info!("Received command: {}", command);
-    
+
     match command {
         "status" => {
-            let response = generate_status_response(recent_records, compression_stats, socket_path)?;
+            let response =
+                generate_status_response(recent_records, compression_stats, socket_path)?;
             let json_response = serde_json::to_string(&response)?;
             writeln!(stream, "{}", json_response)?;
         }
@@ -198,24 +201,24 @@ fn handle_client(
             writeln!(stream, "{{\"error\": \"Unknown command\"}}")?;
         }
     }
-    
+
     Ok(())
 }
 
 fn generate_status_response(
-    recent_records: Arc<Mutex<Vec<ActivityRecord>>>, 
+    recent_records: Arc<Mutex<Vec<ActivityRecord>>>,
     compression_stats: Arc<Mutex<Option<CompressionInfo>>>,
-    socket_path: PathBuf
+    socket_path: PathBuf,
 ) -> Result<MonitorResponse> {
     let records = recent_records.lock().unwrap();
     let compression = compression_stats.lock().unwrap();
-    
+
     let memory_mb = get_current_process_memory();
     let cpu_percent = get_current_process_cpu();
     let data_file_size_mb = get_data_file_size(socket_path.parent().unwrap());
-    
+
     let recent_apps = build_app_tree(&records);
-    
+
     let compression_info = compression.clone().unwrap_or(CompressionInfo {
         events_in_ring_buffer: 0,
         compact_events_stored: 0,
@@ -230,7 +233,7 @@ fn generate_status_response(
         records_collection_memory_mb: 0.0,
         activities_collection_memory_mb: 0.0,
     });
-    
+
     Ok(MonitorResponse {
         daemon_status: "running".to_string(),
         memory_mb,
@@ -249,13 +252,13 @@ fn build_app_tree(records: &[ActivityRecord]) -> Vec<ActivityApp> {
     for record in records.iter().rev().take(50) {
         if let Some(focus_info) = &record.focus_info {
             let app_key = format!("{}_{}", focus_info.pid, focus_info.process_start_time);
-            
+
             let duration = if let Some(end_time) = record.end_time {
                 (end_time - record.start_time).num_seconds() as u64
             } else {
                 0
             };
-            
+
             let (app, window_map) = app_map.entry(app_key).or_insert_with(|| {
                 (
                     ActivityApp {
@@ -269,9 +272,9 @@ fn build_app_tree(records: &[ActivityRecord]) -> Vec<ActivityApp> {
                     HashMap::new(),
                 )
             });
-            
+
             app.total_duration_secs += duration;
-            
+
             if !focus_info.window_title.is_empty() {
                 // Check if we've already seen this window_id
                 if let Some(index) = window_map.get(&focus_info.window_id) {
@@ -283,7 +286,11 @@ fn build_app_tree(records: &[ActivityRecord]) -> Vec<ActivityApp> {
                     let new_window = ActivityWindow {
                         window_id: focus_info.window_id.clone(),
                         window_title: focus_info.window_title.clone(),
-                        last_active: record.start_time.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string(),
+                        last_active: record
+                            .start_time
+                            .with_timezone(&chrono::Local)
+                            .format("%Y-%m-%d %H:%M:%S")
+                            .to_string(),
                         duration_seconds: duration,
                     };
                     app.windows.push(new_window);
@@ -293,25 +300,29 @@ fn build_app_tree(records: &[ActivityRecord]) -> Vec<ActivityApp> {
             }
         }
     }
-    
-    let mut apps: Vec<ActivityApp> = app_map.into_values().map(|(mut app, _)| {
-        app.total_duration_pretty = pretty_format_duration(app.total_duration_secs);
-        app
-    }).collect();
+
+    let mut apps: Vec<ActivityApp> = app_map
+        .into_values()
+        .map(|(mut app, _)| {
+            app.total_duration_pretty = pretty_format_duration(app.total_duration_secs);
+            app
+        })
+        .collect();
 
     apps.sort_by(|a, b| b.total_duration_secs.cmp(&a.total_duration_secs));
     apps.truncate(5);
-    
+
     for app in &mut apps {
-        app.windows.sort_by(|a, b| b.last_active.cmp(&a.last_active));
+        app.windows
+            .sort_by(|a, b| b.last_active.cmp(&a.last_active));
         app.windows.truncate(5);
     }
-    
+
     apps
 }
 
 use once_cell::sync::Lazy;
-use sysinfo::{System, Pid};
+use sysinfo::{Pid, System};
 
 static SYSTEM: Lazy<Mutex<System>> = Lazy::new(|| Mutex::new(System::new()));
 
@@ -319,7 +330,7 @@ fn get_current_process_memory() -> f64 {
     let mut system = SYSTEM.lock().unwrap();
     let current_pid = std::process::id();
     system.refresh_process(Pid::from(current_pid as usize));
-    
+
     if let Some(process) = system.process(Pid::from(current_pid as usize)) {
         process.memory() as f64 / 1024.0 / 1024.0
     } else {
@@ -331,7 +342,7 @@ fn get_current_process_cpu() -> f64 {
     let mut system = SYSTEM.lock().unwrap();
     let current_pid = std::process::id();
     system.refresh_process(Pid::from(current_pid as usize));
-    
+
     if let Some(process) = system.process(Pid::from(current_pid as usize)) {
         process.cpu_usage() as f64
     } else {
@@ -347,7 +358,7 @@ fn get_data_file_size(data_dir: &std::path::Path) -> f64 {
             .map(|m| m.len() as f64 / 1024.0 / 1024.0)
             .unwrap_or(0.0);
     }
-    
+
     // Fall back to JSON file
     let json_file = data_dir.join("data.json");
     if json_file.exists() {

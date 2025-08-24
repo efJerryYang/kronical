@@ -6,7 +6,6 @@ mod socket_server;
 mod storage;
 mod storage_backend;
 mod simple_sqlite_storage;
-mod compact_sqlite_storage;
 mod compression;
 mod monitor_ui;
 
@@ -31,7 +30,6 @@ use std::thread;
 use std::time::Duration;
 use std::io::{self, Write};
 use crate::simple_sqlite_storage::SimpleSqliteStorage;
-use crate::compact_sqlite_storage::CompactSqliteStorage;
 use crate::storage_backend::StorageBackend;
 
 #[derive(Parser)]
@@ -49,11 +47,9 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    Start {
-        #[arg(long)]
-        save_raw: bool,
-    },
+    Start,
     Stop,
+    Restart,
     Status,
     Monitor,
 }
@@ -84,7 +80,7 @@ fn expand_path(path: &str) -> PathBuf {
     }
 }
 
-fn start_daemon(data_file: PathBuf, save_raw: bool) -> Result<()> {
+fn start_daemon(data_file: PathBuf) -> Result<()> {
     let pid_file = data_file.parent().unwrap().join("chronicle.pid");
     
     if let Some(existing_pid) = read_pid_file(&pid_file)? {
@@ -104,17 +100,14 @@ fn start_daemon(data_file: PathBuf, save_raw: bool) -> Result<()> {
     info!("Data file: {:?}", data_file);
     info!("PID file: {:?}", pid_file);
     
-    let data_store: Box<dyn StorageBackend> = if save_raw {
-        Box::new(SimpleSqliteStorage::new(&data_file).context("Failed to initialize Simple SQLite data store for raw events")?)
-    } else {
-        let compact_db_path = data_file.with_extension("cdb");
-        Box::new(CompactSqliteStorage::new(&compact_db_path).context("Failed to initialize Compact SQLite data store")?)
-    };
+    let data_store: Box<dyn StorageBackend> = Box::new(
+        SimpleSqliteStorage::new(&data_file).context("Failed to initialize SQLite data store")?
+    );
     
     let coordinator = EventCoordinator::new();
     
     info!("Chronicle will run on MAIN THREAD (required by macOS hooks)");
-    let result = coordinator.start_main_thread(data_store, pid_file.clone(), save_raw);
+    let result = coordinator.start_main_thread(data_store, pid_file.clone());
     
     let _ = std::fs::remove_file(&pid_file);
     
@@ -200,6 +193,19 @@ fn stop_daemon(data_file: PathBuf) -> Result<()> {
     }
     
     Ok(())
+}
+
+fn restart_daemon(data_file: PathBuf) -> Result<()> {
+    println!("Restarting Chronicle daemon...");
+
+    // Note: stop_daemon has handled the waiting, we don't need to wait again
+    // and we should not encounter any Err in such case, if any, unexpected
+    // behavior we'd better yield.
+    if let Err(e) = stop_daemon(data_file.clone()) {
+        panic!("Unexpected error when stopping daemon: {}", e);
+    }
+
+    start_daemon(data_file)
 }
 
 fn monitor_realtime(data_file: PathBuf) -> Result<()> {
@@ -366,8 +372,9 @@ fn main() {
     let data_file = expand_path(&cli.data_file);
 
     let result = match cli.command {
-        Commands::Start { save_raw } => start_daemon(data_file, save_raw),
+        Commands::Start => start_daemon(data_file),
         Commands::Stop => stop_daemon(data_file),
+        Commands::Restart => restart_daemon(data_file),
         Commands::Status => get_status(data_file),
         Commands::Monitor => monitor_realtime(data_file)
     };

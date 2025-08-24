@@ -55,8 +55,11 @@ impl RecordProcessor {
         if let Some(ref record) = self.current_record {
             let record_duration = Utc::now().signed_duration_since(record.start_time);
             if record_duration > chrono::Duration::minutes(5) {
-                log::info!("Auto-completing long-running record #{} after {} minutes", 
-                    record.record_id, record_duration.num_minutes());
+                log::info!(
+                    "Auto-completing long-running record #{} after {} minutes",
+                    record.record_id,
+                    record_duration.num_minutes()
+                );
                 if let Some(completed) = self.force_complete_current_record() {
                     new_records.push(completed);
                 }
@@ -64,28 +67,33 @@ impl RecordProcessor {
         }
 
         for event in events {
-            log::info!("Processing event #{}: {} at {}", 
-                event.event_id(), event.event_type(), event.timestamp());
+            log::info!(
+                "Processing event #{}: {} at {}",
+                event.event_id(),
+                event.event_type(),
+                event.timestamp()
+            );
 
             let completed_record = match &event {
-                RawEvent::KeyboardInput { event_id, .. } => {
-                    self.handle_keyboard_event(*event_id)
-                }
-                RawEvent::MouseInput { event_id, .. } => {
-                    self.handle_mouse_event(*event_id)
-                }
-                RawEvent::WindowFocusChange { event_id, focus_info, .. } => {
-                    self.handle_focus_change(*event_id, focus_info.clone())
-                }
+                RawEvent::KeyboardInput { event_id, .. } => self.handle_keyboard_event(*event_id),
+                RawEvent::MouseInput { event_id, .. } => self.handle_mouse_event(*event_id),
+                RawEvent::WindowFocusChange {
+                    event_id,
+                    focus_info,
+                    ..
+                } => self.handle_focus_change(*event_id, focus_info.clone()),
             };
 
             if let Some(record) = completed_record {
-                log::info!("Record #{}: {} completed after {} events from {} to {}", 
-                    record.record_id, 
-                    format!("{:?}", record.state), 
+                log::info!(
+                    "Record #{}: {} completed after {} events from {} to {}",
+                    record.record_id,
+                    format!("{:?}", record.state),
                     record.event_count,
                     record.start_time.format("%H:%M:%S%.3f"),
-                    record.end_time.map(|t| t.format("%H:%M:%S%.3f").to_string())
+                    record
+                        .end_time
+                        .map(|t| t.format("%H:%M:%S%.3f").to_string())
                         .unwrap_or_else(|| "ongoing".to_string())
                 );
                 new_records.push(record);
@@ -117,7 +125,10 @@ impl RecordProcessor {
             triggering_events: Vec::new(),
         });
         self.next_record_id += 1;
-        log::info!("Started new record #{}", self.current_record.as_ref().unwrap().record_id);
+        log::info!(
+            "Started new record #{}",
+            self.current_record.as_ref().unwrap().record_id
+        );
     }
 
     pub fn check_timeouts(&mut self) -> Option<ActivityRecord> {
@@ -127,13 +138,17 @@ impl RecordProcessor {
 
         let target_state = match self.current_state {
             ActivityState::Active if time_since_keyboard >= self.active_timeout => {
-                log::info!("Timeout: Active -> Passive ({}s since keyboard)", 
-                    time_since_keyboard.as_secs());
+                log::info!(
+                    "Timeout: Active -> Passive ({}s since keyboard)",
+                    time_since_keyboard.as_secs()
+                );
                 Some(ActivityState::Passive)
             }
             ActivityState::Passive if time_since_activity >= self.passive_timeout => {
-                log::info!("Timeout: Passive -> Inactive ({}s since activity)", 
-                    time_since_activity.as_secs());
+                log::info!(
+                    "Timeout: Passive -> Inactive ({}s since activity)",
+                    time_since_activity.as_secs()
+                );
                 Some(ActivityState::Inactive)
             }
             _ => None,
@@ -142,8 +157,11 @@ impl RecordProcessor {
         if let Some(new_state) = target_state {
             let completed = self.transition_to_state(new_state, None);
             if let Some(ref record) = completed {
-                log::info!("Timeout record #{}: {:?} completed", 
-                    record.record_id, record.state);
+                log::info!(
+                    "Timeout record #{}: {:?} completed",
+                    record.record_id,
+                    record.state
+                );
             }
             completed
         } else {
@@ -155,11 +173,11 @@ impl RecordProcessor {
         let now = Instant::now();
         self.last_activity = now;
         self.last_keyboard_activity = now;
-        
+
         if self.current_record.is_none() {
             self.start_new_record(self.current_focus.clone());
         }
-        
+
         log::info!("Keyboard event -> transitioning to Active");
         let completed = self.transition_to_state(ActivityState::Active, Some(event_id));
         self.add_event_to_current_record(event_id);
@@ -169,31 +187,42 @@ impl RecordProcessor {
     fn handle_mouse_event(&mut self, event_id: u64) -> Option<ActivityRecord> {
         let now = Instant::now();
         self.last_activity = now;
-        
+
         if self.current_record.is_none() {
             self.start_new_record(self.current_focus.clone());
         }
-        
-        let target_state = if now.duration_since(self.last_keyboard_activity) < self.active_timeout {
+
+        let target_state = if now.duration_since(self.last_keyboard_activity) < self.active_timeout
+        {
             ActivityState::Active
         } else {
             ActivityState::Passive
         };
-        
+
         log::info!("Mouse event -> transitioning to {:?}", target_state);
         let completed = self.transition_to_state(target_state, Some(event_id));
         self.add_event_to_current_record(event_id);
         completed
     }
 
-    fn handle_focus_change(&mut self, event_id: u64, focus_info: WindowFocusInfo) -> Option<ActivityRecord> {
-        log::info!("Focus change: '{}' in {} (PID {}, WinID {}, Start {})", 
-            focus_info.window_title, focus_info.app_name, focus_info.pid, focus_info.window_id, focus_info.process_start_time);
+    fn handle_focus_change(
+        &mut self,
+        event_id: u64,
+        focus_info: WindowFocusInfo,
+    ) -> Option<ActivityRecord> {
+        log::info!(
+            "Focus change: '{}' in {} (PID {}, WinID {}, Start {})",
+            focus_info.window_title,
+            focus_info.app_name,
+            focus_info.pid,
+            focus_info.window_id,
+            focus_info.process_start_time
+        );
 
         let is_same_window = self.current_focus.as_ref().map_or(false, |current| {
-            current.pid == focus_info.pid &&
-            current.process_start_time == focus_info.process_start_time &&
-            current.window_id == focus_info.window_id
+            current.pid == focus_info.pid
+                && current.process_start_time == focus_info.process_start_time
+                && current.window_id == focus_info.window_id
         });
 
         self.current_focus = Some(focus_info.clone());
@@ -211,26 +240,38 @@ impl RecordProcessor {
             let completed_record = if let Some(current) = self.current_record.take() {
                 let mut completed = current;
                 completed.end_time = Some(Utc::now());
-                log::info!("Focus change completed record #{}: {:?} with {} events", 
-                    completed.record_id, completed.state, completed.event_count);
+                log::info!(
+                    "Focus change completed record #{}: {:?} with {} events",
+                    completed.record_id,
+                    completed.state,
+                    completed.event_count
+                );
                 Some(completed)
             } else {
                 None
             };
-            
+
             self.start_new_record(Some(focus_info));
             self.add_event_to_current_record(event_id);
             completed_record
         }
     }
 
-    fn transition_to_state(&mut self, new_state: ActivityState, triggering_event: Option<u64>) -> Option<ActivityRecord> {
+    fn transition_to_state(
+        &mut self,
+        new_state: ActivityState,
+        triggering_event: Option<u64>,
+    ) -> Option<ActivityRecord> {
         if self.current_state == new_state {
             return None;
         }
 
-        log::info!("State transition: {:?} -> {:?}", self.current_state, new_state);
-        
+        log::info!(
+            "State transition: {:?} -> {:?}",
+            self.current_state,
+            new_state
+        );
+
         let now_utc = Utc::now();
         let completed_record = self.finalize_current_record(now_utc);
 
@@ -250,9 +291,13 @@ impl RecordProcessor {
             triggering_events,
         });
 
-        log::info!("Record #{}: Started {:?} state at {}", 
-            self.next_record_id, new_state, now_utc.format("%H:%M:%S%.3f"));
-        
+        log::info!(
+            "Record #{}: Started {:?} state at {}",
+            self.next_record_id,
+            new_state,
+            now_utc.format("%H:%M:%S%.3f")
+        );
+
         self.next_record_id += 1;
         completed_record
     }
@@ -263,8 +308,12 @@ impl RecordProcessor {
             if !record.triggering_events.contains(&event_id) {
                 record.triggering_events.push(event_id);
             }
-            log::info!("Added event #{} to record #{} (total events: {})", 
-                event_id, record.record_id, record.event_count);
+            log::info!(
+                "Added event #{} to record #{} (total events: {})",
+                event_id,
+                record.record_id,
+                record.event_count
+            );
         }
     }
 
@@ -280,8 +329,11 @@ impl RecordProcessor {
     pub fn finalize_all(&mut self) -> Option<ActivityRecord> {
         let final_record = self.finalize_current_record(Utc::now());
         if let Some(ref record) = final_record {
-            log::info!("Final record #{}: {:?} finalized", 
-                record.record_id, record.state);
+            log::info!(
+                "Final record #{}: {:?} finalized",
+                record.record_id,
+                record.state
+            );
         }
         final_record
     }
@@ -291,8 +343,8 @@ impl RecordProcessor {
     }
 
     pub fn current_record_info(&self) -> Option<(u64, ActivityState, DateTime<Utc>, u32)> {
-        self.current_record.as_ref().map(|r| {
-            (r.record_id, r.state, r.start_time, r.event_count)
-        })
+        self.current_record
+            .as_ref()
+            .map(|r| (r.record_id, r.state, r.start_time, r.event_count))
     }
 }

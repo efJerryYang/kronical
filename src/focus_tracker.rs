@@ -90,7 +90,10 @@ impl FocusEventWrapper {
     }
 
     pub fn handle_app_change(&self, pid: i32, app_name: String) {
-        info!("FocusEventWrapper: App change to {} (PID: {})", app_name, pid);
+        info!(
+            "FocusEventWrapper: App change to {} (PID: {})",
+            app_name, pid
+        );
 
         let mut state = self.current_state.lock().unwrap();
         let now = Instant::now();
@@ -172,7 +175,10 @@ impl FocusEventWrapper {
                 }
             }
             Err(e) => {
-                error!("FocusEventWrapper: Could not get active window on title change: {:?}", e);
+                error!(
+                    "FocusEventWrapper: Could not get active window on title change: {:?}",
+                    e
+                );
             }
         }
 
@@ -214,9 +220,11 @@ impl FocusEventWrapper {
         let state = self.current_state.lock().unwrap();
         if state.is_complete() {
             let focus_info = state.to_window_focus_info();
-            info!("FocusEventWrapper: Force emitting current focus: {} -> {}", 
-                focus_info.app_name, focus_info.window_title);
-            
+            info!(
+                "FocusEventWrapper: Force emitting current focus: {} -> {}",
+                focus_info.app_name, focus_info.window_title
+            );
+
             // Release the lock before calling the callback
             drop(state);
             self.callback.on_focus_change(focus_info);

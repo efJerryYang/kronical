@@ -2,10 +2,10 @@ use crate::events::RawEvent;
 use crate::records::ActivityRecord;
 use crate::storage_backend::StorageBackend;
 use anyhow::{Context, Result};
-use rusqlite::{Connection, params};
+use rusqlite::{params, Connection};
 use serde_json;
 use std::path::{Path, PathBuf};
-use std::sync::{mpsc};
+use std::sync::mpsc;
 use std::thread;
 
 pub enum StorageCommand {
@@ -23,7 +23,7 @@ pub struct SimpleSqliteStorage {
 impl SimpleSqliteStorage {
     pub fn new<P: AsRef<Path>>(db_path: P) -> Result<Self> {
         let db_path = db_path.as_ref().to_path_buf();
-        
+
         if let Some(parent) = db_path.parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create directory: {:?}", parent))?;
@@ -31,9 +31,9 @@ impl SimpleSqliteStorage {
 
         let conn = Connection::open(&db_path)?;
         Self::init_db(&conn)?;
-        
+
         let (sender, receiver) = mpsc::channel();
-        
+
         let db_path_clone = db_path.clone();
         let writer_thread = thread::spawn(move || {
             Self::background_writer(db_path_clone, receiver);
@@ -80,10 +80,20 @@ impl SimpleSqliteStorage {
             let result = match command {
                 StorageCommand::RawEvent(event) => {
                     let data = serde_json::to_string(&event).unwrap();
-                    tx.execute("INSERT INTO raw_events (timestamp, event_type, data) VALUES (?, ?, ?)", params![event.timestamp().to_rfc3339(), event.event_type().to_string(), data])
+                    tx.execute(
+                        "INSERT INTO raw_events (timestamp, event_type, data) VALUES (?, ?, ?)",
+                        params![
+                            event.timestamp().to_rfc3339(),
+                            event.event_type().to_string(),
+                            data
+                        ],
+                    )
                 }
                 StorageCommand::Record(record) => {
-                    let focus_info_json = record.focus_info.as_ref().map(|fi| serde_json::to_string(fi).unwrap());
+                    let focus_info_json = record
+                        .focus_info
+                        .as_ref()
+                        .map(|fi| serde_json::to_string(fi).unwrap());
                     tx.execute("INSERT INTO activity_records (start_time, end_time, state, focus_info) VALUES (?, ?, ?, ?)", params![record.start_time.to_rfc3339(), record.end_time.map(|t| t.to_rfc3339()), format!("{:?}", record.state), focus_info_json])
                 }
                 StorageCommand::Shutdown => break,
@@ -103,20 +113,23 @@ impl SimpleSqliteStorage {
         }
         let _ = tx.commit();
     }
-
 }
 
 impl StorageBackend for SimpleSqliteStorage {
     fn add_events(&mut self, events: Vec<RawEvent>) -> Result<()> {
         for event in events {
-            self.sender.send(StorageCommand::RawEvent(event)).context("Failed to send raw event to writer")?;
+            self.sender
+                .send(StorageCommand::RawEvent(event))
+                .context("Failed to send raw event to writer")?;
         }
         Ok(())
     }
 
     fn add_records(&mut self, new_records: Vec<ActivityRecord>) -> Result<()> {
         for record in new_records {
-            self.sender.send(StorageCommand::Record(record.clone())).context("Failed to send record to writer")?;
+            self.sender
+                .send(StorageCommand::Record(record.clone()))
+                .context("Failed to send record to writer")?;
         }
         Ok(())
     }

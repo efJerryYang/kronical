@@ -1,17 +1,13 @@
-use crate::{
-    events::RawEvent,
-    records::ActivityRecord,
-    storage_backend::StorageBackend
-};
+use crate::{events::RawEvent, records::ActivityRecord, storage_backend::StorageBackend};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use size_of::{SizeOf};
+use size_of::SizeOf;
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
-use sysinfo::{System, Pid};
+use sysinfo::{Pid, System};
 
 #[derive(Debug, Serialize, Deserialize, SizeOf)]
 pub struct EventsAndRecordsExport {
@@ -53,13 +49,13 @@ impl JsonStorage {
     pub fn new<P: AsRef<Path>>(data_file: P) -> Result<Self> {
         let data_file = data_file.as_ref().to_path_buf();
         log::info!("Initializing DataStore with file: {:?}", data_file);
-        
+
         if let Some(parent) = data_file.parent() {
             log::info!("Creating directory: {:?}", parent);
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create data directory: {:?}", parent))?;
         }
-        
+
         let mut store = Self {
             data_file,
             events: Vec::new(),
@@ -67,25 +63,33 @@ impl JsonStorage {
             record_index: BTreeMap::new(),
             event_index: BTreeMap::new(),
         };
-        
-        store.load_data()
+
+        store
+            .load_data()
             .with_context(|| "Failed to load existing data during DataStore initialization")?;
-        
+
         log::info!("DataStore initialized successfully");
         Ok(store)
     }
 
     pub fn add_events(&mut self, events: Vec<RawEvent>) -> Result<()> {
         for event in events {
-            log::info!("Adding event #{}: {} at {}", 
-                event.event_id(), event.event_type(), event.timestamp());
+            log::info!(
+                "Adding event #{}: {} at {}",
+                event.event_id(),
+                event.event_type(),
+                event.timestamp()
+            );
             let index = self.events.len();
             self.event_index.insert(event.timestamp(), index);
             self.events.push(event);
         }
         let result = self.save_data();
         if result.is_ok() {
-            log::info!("Events saved successfully, total events: {}", self.events.len());
+            log::info!(
+                "Events saved successfully, total events: {}",
+                self.events.len()
+            );
         } else {
             log::error!("Failed to save events: {:?}", result);
         }
@@ -94,32 +98,33 @@ impl JsonStorage {
 
     pub fn add_records(&mut self, records: Vec<ActivityRecord>) -> Result<()> {
         for record in records {
-            log::info!("Adding record #{}: {:?} at {}", 
-                record.record_id, record.state, record.start_time);
+            log::info!(
+                "Adding record #{}: {:?} at {}",
+                record.record_id,
+                record.state,
+                record.start_time
+            );
             let index = self.records.len();
             self.record_index.insert(record.start_time, index);
             self.records.push(record);
         }
         let result = self.save_data();
         if result.is_ok() {
-            log::info!("Records saved successfully, total records: {}", self.records.len());
+            log::info!(
+                "Records saved successfully, total records: {}",
+                self.records.len()
+            );
         } else {
             log::error!("Failed to save records: {:?}", result);
         }
         result
     }
 
-    pub fn get_events_in_range(
-        &self,
-        start: DateTime<Utc>,
-        end: DateTime<Utc>,
-    ) -> Vec<&RawEvent> {
+    pub fn get_events_in_range(&self, start: DateTime<Utc>, end: DateTime<Utc>) -> Vec<&RawEvent> {
         self.event_index
             .range(start..=end)
             .map(|(_, &index)| &self.events[index])
-            .filter(|event| {
-                event.timestamp() >= start && event.timestamp() <= end
-            })
+            .filter(|event| event.timestamp() >= start && event.timestamp() <= end)
             .collect()
     }
 
@@ -132,8 +137,8 @@ impl JsonStorage {
             .range(start..=end)
             .map(|(_, &index)| &self.records[index])
             .filter(|record| {
-                record.start_time >= start && 
-                (record.end_time.is_none() || record.end_time.unwrap() <= end)
+                record.start_time >= start
+                    && (record.end_time.is_none() || record.end_time.unwrap() <= end)
             })
             .collect()
     }
@@ -166,18 +171,16 @@ impl JsonStorage {
     pub fn get_system_info(&self) -> SystemInfo {
         let mut system = System::new_all();
         system.refresh_all();
-        
+
         let current_pid = sysinfo::get_current_pid().unwrap_or(Pid::from(0));
         let process = system.process(current_pid);
-        
+
         let memory_usage_mb = process
-            .map(|p| p.memory() / 1024 / 1024) // Convert bytes to MB  
+            .map(|p| p.memory() / 1024 / 1024) // Convert bytes to MB
             .unwrap_or(0);
-            
-        let cpu_usage_percent = process
-            .map(|p| p.cpu_usage())
-            .unwrap_or(0.0);
-        
+
+        let cpu_usage_percent = process.map(|p| p.cpu_usage()).unwrap_or(0.0);
+
         let data_file_size_mb = if self.data_file.exists() {
             std::fs::metadata(&self.data_file)
                 .map(|m| m.len() as f64 / 1024.0 / 1024.0)
@@ -185,25 +188,25 @@ impl JsonStorage {
         } else {
             0.0
         };
-        
+
         SystemInfo {
             memory_usage_mb,
             cpu_usage_percent,
             data_file_size_mb,
         }
     }
-    
+
     pub fn get_records_collection_memory_usage_mb(&self) -> f32 {
         let total_records_size = self.records.size_of().total_bytes();
         let index_size = self.record_index.size_of().total_bytes();
-            
+
         (total_records_size + index_size) as f32 / 1024.0 / 1024.0
     }
-    
+
     pub fn get_events_collection_memory_usage_mb(&self) -> f32 {
         let total_events_size = self.events.size_of().total_bytes();
         let index_size = self.event_index.size_of().total_bytes();
-            
+
         (total_events_size + index_size) as f32 / 1024.0 / 1024.0
     }
 
@@ -216,26 +219,27 @@ impl JsonStorage {
 
         let file = File::create(output_path.as_ref())
             .with_context(|| format!("Failed to create export file: {:?}", output_path.as_ref()))?;
-        
+
         let writer = BufWriter::new(file);
-        serde_json::to_writer_pretty(writer, &data)
-            .context("Failed to serialize activity data")?;
+        serde_json::to_writer_pretty(writer, &data).context("Failed to serialize activity data")?;
 
         Ok(())
     }
 
-
     fn load_data(&mut self) -> Result<()> {
         if !self.data_file.exists() {
-            log::info!("Data file {:?} does not exist, starting with empty data", self.data_file);
+            log::info!(
+                "Data file {:?} does not exist, starting with empty data",
+                self.data_file
+            );
             return Ok(());
         }
 
         log::info!("Loading data from file: {:?}", self.data_file);
-        
+
         let file = File::open(&self.data_file)
             .with_context(|| format!("Failed to open data file: {:?}", self.data_file))?;
-        
+
         let reader = BufReader::new(file);
         let data: EventsAndRecordsExport = serde_json::from_reader(reader)
             .with_context(|| {
@@ -244,9 +248,12 @@ impl JsonStorage {
                 format!("Failed to parse JSON data file: {:?}. The file format may be incompatible with the current version.", self.data_file)
             })?;
 
-        log::info!("Successfully loaded {} events and {} records from data file", 
-            data.events.len(), data.records.len());
-        
+        log::info!(
+            "Successfully loaded {} events and {} records from data file",
+            data.events.len(),
+            data.records.len()
+        );
+
         self.events = data.events;
         self.records = data.records;
         self.rebuild_indices();
@@ -285,7 +292,7 @@ impl JsonStorage {
         for (i, event) in self.events.iter().enumerate() {
             self.event_index.insert(event.timestamp(), i);
         }
-        
+
         self.record_index.clear();
         for (i, record) in self.records.iter().enumerate() {
             self.record_index.insert(record.start_time, i);
