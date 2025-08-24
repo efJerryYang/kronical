@@ -30,7 +30,8 @@ impl ChronicleEventHandler {
         let callback = Arc::new(FocusCallback {
             sender: sender.clone(),
         });
-        let focus_wrapper = FocusEventWrapper::new(callback);
+        // Enable polling with 2 second interval for title change detection
+        let focus_wrapper = FocusEventWrapper::new(callback, Duration::from_secs(2));
 
         Self {
             sender,

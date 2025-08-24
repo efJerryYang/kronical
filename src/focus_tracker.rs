@@ -2,7 +2,9 @@ use crate::events::WindowFocusInfo;
 use active_win_pos_rs::get_active_window;
 use log::{error, info, warn};
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 use sysinfo::{Pid, System};
 
@@ -59,15 +61,31 @@ pub struct FocusEventWrapper {
     current_state: Arc<Mutex<FocusState>>,
     callback: Arc<dyn FocusChangeCallback + Send + Sync>,
     pid_cache: Arc<Mutex<HashMap<i32, u64>>>,
+    poll_interval: Duration,
+    should_stop_polling: Arc<AtomicBool>,
+    last_titles: Arc<Mutex<HashMap<String, String>>>, // window_id -> last_title
 }
 
 impl FocusEventWrapper {
-    pub fn new(callback: Arc<dyn FocusChangeCallback + Send + Sync>) -> Self {
-        Self {
+    pub fn new(
+        callback: Arc<dyn FocusChangeCallback + Send + Sync>,
+        poll_interval: Duration,
+    ) -> Self {
+        let wrapper = Self {
             current_state: Arc::new(Mutex::new(FocusState::new())),
             callback,
             pid_cache: Arc::new(Mutex::new(HashMap::new())),
+            poll_interval,
+            should_stop_polling: Arc::new(AtomicBool::new(false)),
+            last_titles: Arc::new(Mutex::new(HashMap::new())),
+        };
+
+        // Start polling thread if interval is positive
+        if poll_interval.as_millis() > 0 {
+            wrapper.start_polling();
         }
+
+        wrapper
     }
 
     fn get_process_start_time(&self, pid: i32) -> u64 {
@@ -232,6 +250,58 @@ impl FocusEventWrapper {
             self.callback.on_focus_change(focus_info);
         }
     }
+
+    fn start_polling(&self) {
+        let poll_interval = self.poll_interval;
+        let should_stop = Arc::clone(&self.should_stop_polling);
+        let last_titles = Arc::clone(&self.last_titles);
+        let focus_wrapper = self.clone();
+
+        thread::spawn(move || {
+            info!(
+                "Starting window title polling with interval: {:?}",
+                poll_interval
+            );
+
+            while !should_stop.load(Ordering::Relaxed) {
+                thread::sleep(poll_interval);
+
+                if should_stop.load(Ordering::Relaxed) {
+                    break;
+                }
+
+                match get_active_window() {
+                    Ok(active_window) => {
+                        let window_id = active_window.window_id;
+                        let current_title = active_window.title;
+
+                        let mut titles = last_titles.lock().unwrap();
+                        if let Some(last_title) = titles.get(&window_id) {
+                            if last_title != &current_title {
+                                info!(
+                                    "Polling detected title change for window {}: '{}' -> '{}'",
+                                    window_id, last_title, current_title
+                                );
+                                focus_wrapper.handle_window_change(current_title.clone());
+                            }
+                        }
+
+                        // Update stored title
+                        titles.insert(window_id, current_title);
+                    }
+                    Err(e) => {
+                        error!("Failed to get active window during polling: {:?}", e);
+                    }
+                }
+            }
+
+            info!("Window title polling stopped");
+        });
+    }
+
+    pub fn stop_polling(&self) {
+        self.should_stop_polling.store(true, Ordering::Relaxed);
+    }
 }
 
 impl Clone for FocusEventWrapper {
@@ -240,6 +310,9 @@ impl Clone for FocusEventWrapper {
             current_state: Arc::clone(&self.current_state),
             callback: Arc::clone(&self.callback),
             pid_cache: Arc::clone(&self.pid_cache),
+            poll_interval: self.poll_interval,
+            should_stop_polling: Arc::clone(&self.should_stop_polling),
+            last_titles: Arc::clone(&self.last_titles),
         }
     }
 }
