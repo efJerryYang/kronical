@@ -1,11 +1,10 @@
-use crate::coordinator::get_global_system;
 use crate::events::WindowFocusInfo;
 use active_win_pos_rs::get_active_window;
 use log::{error, info, warn};
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use sysinfo::Pid;
+use sysinfo::{Pid, System};
 
 #[derive(Debug, Clone)]
 pub struct FocusState {
@@ -77,7 +76,7 @@ impl FocusEventWrapper {
             return *start_time;
         }
 
-        let mut system = get_global_system().lock().unwrap();
+        let mut system = System::new();
         system.refresh_processes_specifics(
             sysinfo::ProcessesToUpdate::Some(&[Pid::from(pid as usize)]),
             false,

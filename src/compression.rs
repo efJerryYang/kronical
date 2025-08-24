@@ -27,13 +27,6 @@ impl StringInterner {
             id
         })
     }
-
-    pub fn memory_usage_bytes(&self) -> usize {
-        self.strings.iter().map(|s| s.len()).sum::<usize>()
-            + (self.strings.len() * std::mem::size_of::<String>())
-            + (self.lookup.len()
-                * (std::mem::size_of::<String>() + std::mem::size_of::<StringId>()))
-    }
 }
 
 pub trait EventCompressor {
@@ -624,58 +617,4 @@ impl CompressionEngine {
         Ok((raw_events, compact_events))
     }
 
-    pub fn get_memory_usage(&self) -> CompressionMemoryUsage {
-        let string_table_bytes = self
-            .focus_processor
-            .get_string_interner()
-            .memory_usage_bytes();
-
-        CompressionMemoryUsage {
-            compact_events_bytes: self.total_compact_events_bytes,
-            string_table_bytes,
-            total_compact_events: self.total_compact_events,
-        }
-    }
-
-    pub fn get_compression_info(
-        &self,
-        raw_events_processed: usize,
-        raw_events_memory_bytes: usize,
-    ) -> crate::socket_server::CompressionInfo {
-        let memory_usage = self.get_memory_usage();
-
-        let compact_ratio = if self.total_compact_events > 0 {
-            raw_events_processed as f32 / self.total_compact_events as f32
-        } else {
-            1.0
-        };
-
-        let memory_efficiency = if memory_usage.compact_events_bytes > 0 {
-            raw_events_memory_bytes as f32 / memory_usage.compact_events_bytes as f32
-        } else {
-            1.0
-        };
-
-        crate::socket_server::CompressionInfo {
-            events_in_ring_buffer: raw_events_processed,
-            compact_events_stored: self.total_compact_events,
-            event_compression_ratio: compact_ratio,
-            memory_compression_ratio: memory_efficiency,
-            bytes_saved_kb: 0,      // Not needed
-            ring_buffer_size_kb: 0, // Not needed
-            compact_storage_size_kb: memory_usage.compact_events_bytes / 1024,
-            string_table_size_kb: memory_usage.string_table_bytes / 1024,
-            raw_events_memory_mb: raw_events_memory_bytes as f32 / 1024.0 / 1024.0,
-            compact_events_memory_mb: memory_usage.compact_events_bytes as f32 / 1024.0 / 1024.0,
-            records_collection_memory_mb: 0.0, // Will be filled by coordinator
-            activities_collection_memory_mb: 0.0, // Will be filled by coordinator
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct CompressionMemoryUsage {
-    pub compact_events_bytes: usize,
-    pub string_table_bytes: usize,
-    pub total_compact_events: usize,
 }

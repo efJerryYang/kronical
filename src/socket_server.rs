@@ -1,4 +1,3 @@
-use crate::coordinator::get_global_system;
 use crate::records::ActivityRecord;
 use anyhow::Result;
 use log::{error, info};
@@ -9,8 +8,6 @@ use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
-use sysinfo::ProcessRefreshKind;
-use sysinfo::{Pid, ProcessesToUpdate};
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ActivityWindow {
@@ -60,34 +57,15 @@ pub struct ActivityApp {
 #[derive(Debug, Serialize, Deserialize)]
 pub struct MonitorResponse {
     pub daemon_status: String,
-    pub memory_mb: f64,
-    pub cpu_percent: f64,
     pub data_file_size_mb: f64,
+    pub data_directory: String,
     pub recent_apps: Vec<ActivityApp>,
-    pub compression_stats: CompressionInfo,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompressionInfo {
-    pub events_in_ring_buffer: usize,
-    pub compact_events_stored: usize,
-    pub event_compression_ratio: f32,
-    pub memory_compression_ratio: f32,
-    pub bytes_saved_kb: usize,
-    pub ring_buffer_size_kb: usize,
-    pub compact_storage_size_kb: usize,
-    pub string_table_size_kb: usize,
-    pub raw_events_memory_mb: f32,
-    pub compact_events_memory_mb: f32,
-    pub records_collection_memory_mb: f32,
-    pub activities_collection_memory_mb: f32,
 }
 
 pub struct SocketServer {
     socket_path: PathBuf,
     notification_socket_path: PathBuf,
     recent_records: Arc<Mutex<Vec<ActivityRecord>>>,
-    compression_stats: Arc<Mutex<Option<CompressionInfo>>>,
     notification_clients: Arc<Mutex<Vec<UnixStream>>>,
 }
 
@@ -98,7 +76,6 @@ impl SocketServer {
             socket_path,
             notification_socket_path,
             recent_records: Arc::new(Mutex::new(Vec::new())),
-            compression_stats: Arc::new(Mutex::new(None)),
             notification_clients: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -116,12 +93,6 @@ impl SocketServer {
         *recent = records;
         info!("Updated socket server with {} records", recent.len());
         self.notify_clients();
-    }
-
-    pub fn update_compression_stats(&self, stats: CompressionInfo) {
-        let mut compression = self.compression_stats.lock().unwrap();
-        *compression = Some(stats);
-        info!("Updated socket server with compression stats");
     }
 
     pub fn start(&self) -> Result<()> {
@@ -151,7 +122,6 @@ impl SocketServer {
         });
 
         let recent_records = Arc::clone(&self.recent_records);
-        let compression_stats = Arc::clone(&self.compression_stats);
         let socket_path = self.socket_path.clone();
 
         thread::spawn(move || {
@@ -159,11 +129,9 @@ impl SocketServer {
                 match stream {
                     Ok(stream) => {
                         let records = Arc::clone(&recent_records);
-                        let stats = Arc::clone(&compression_stats);
                         let socket_path_clone = socket_path.clone();
                         thread::spawn(move || {
-                            if let Err(e) = handle_client(stream, records, stats, socket_path_clone)
-                            {
+                            if let Err(e) = handle_client(stream, records, socket_path_clone) {
                                 error!("Error handling client: {}", e);
                             }
                         });
@@ -182,7 +150,6 @@ impl SocketServer {
 fn handle_client(
     mut stream: UnixStream,
     recent_records: Arc<Mutex<Vec<ActivityRecord>>>,
-    compression_stats: Arc<Mutex<Option<CompressionInfo>>>,
     socket_path: PathBuf,
 ) -> Result<()> {
     let mut reader = BufReader::new(&stream);
@@ -195,8 +162,7 @@ fn handle_client(
 
     match command {
         "status" => {
-            let response =
-                generate_status_response(recent_records, compression_stats, socket_path)?;
+            let response = generate_status_response(recent_records, socket_path)?;
             let json_response = serde_json::to_string(&response)?;
             writeln!(stream, "{}", json_response)?;
         }
@@ -210,40 +176,18 @@ fn handle_client(
 
 fn generate_status_response(
     recent_records: Arc<Mutex<Vec<ActivityRecord>>>,
-    compression_stats: Arc<Mutex<Option<CompressionInfo>>>,
     socket_path: PathBuf,
 ) -> Result<MonitorResponse> {
     let records = recent_records.lock().unwrap();
-    let compression = compression_stats.lock().unwrap();
-
-    let memory_mb = get_current_process_memory();
-    let cpu_percent = get_current_process_cpu();
-    let data_file_size_mb = get_data_file_size(socket_path.parent().unwrap());
-
+    let data_dir = socket_path.parent().unwrap();
+    let data_file_size_mb = get_data_file_size(data_dir);
     let recent_apps = build_app_tree(&records);
-
-    let compression_info = compression.clone().unwrap_or(CompressionInfo {
-        events_in_ring_buffer: 0,
-        compact_events_stored: 0,
-        event_compression_ratio: 1.0,
-        memory_compression_ratio: 1.0,
-        bytes_saved_kb: 0,
-        ring_buffer_size_kb: 0,
-        compact_storage_size_kb: 0,
-        string_table_size_kb: 0,
-        raw_events_memory_mb: 0.0,
-        compact_events_memory_mb: 0.0,
-        records_collection_memory_mb: 0.0,
-        activities_collection_memory_mb: 0.0,
-    });
 
     Ok(MonitorResponse {
         daemon_status: "running".to_string(),
-        memory_mb,
-        cpu_percent,
         data_file_size_mb,
+        data_directory: data_dir.to_string_lossy().to_string(),
         recent_apps,
-        compression_stats: compression_info,
     })
 }
 
@@ -322,54 +266,6 @@ fn build_app_tree(records: &[ActivityRecord]) -> Vec<ActivityApp> {
     }
 
     apps
-}
-
-fn get_current_process_memory() -> f64 {
-    let mut system = get_global_system().lock().unwrap();
-    let current_pid = std::process::id();
-
-    // Refresh only the current process for memory
-    system.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[Pid::from(current_pid as usize)]),
-        false,
-        ProcessRefreshKind::nothing().with_memory(),
-    );
-
-    if let Some(process) = system.process(Pid::from(current_pid as usize)) {
-        // Use resident memory (RSS) which is what most system monitors show
-        process.memory() as f64 / 1024.0 / 1024.0
-    } else {
-        0.0
-    }
-}
-
-fn get_current_process_cpu() -> f64 {
-    let mut system = get_global_system().lock().unwrap();
-    let current_pid = std::process::id();
-
-    // For CPU usage, we need to refresh the process and wait a bit
-    // to get meaningful measurements
-    system.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[Pid::from(current_pid as usize)]),
-        false,
-        ProcessRefreshKind::nothing().with_cpu(),
-    );
-
-    // Small delay to allow CPU usage calculation
-    std::thread::sleep(std::time::Duration::from_millis(100));
-
-    // Refresh again to get updated CPU usage
-    system.refresh_processes_specifics(
-        ProcessesToUpdate::Some(&[Pid::from(current_pid as usize)]),
-        false,
-        ProcessRefreshKind::nothing().with_cpu(),
-    );
-
-    if let Some(process) = system.process(Pid::from(current_pid as usize)) {
-        process.cpu_usage() as f64
-    } else {
-        0.0
-    }
 }
 
 fn get_data_file_size(data_dir: &std::path::Path) -> f64 {

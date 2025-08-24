@@ -9,7 +9,6 @@ mod socket_server;
 mod storage;
 mod storage_backend;
 
-use crate::coordinator::get_global_system;
 use crate::simple_sqlite_storage::SimpleSqliteStorage;
 use crate::storage_backend::StorageBackend;
 use anyhow::{Context, Result};
@@ -35,7 +34,7 @@ use std::path::PathBuf;
 use std::process;
 use std::thread;
 use std::time::Duration;
-use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate};
+use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -132,38 +131,12 @@ fn get_status(data_file: PathBuf) -> Result<()> {
     match query_daemon_via_socket(&data_file) {
         Ok(response) => {
             println!("Chronicle Daemon:");
-            println!(
-                "  Status: {}\tMemory: {:>7.4} MB\tCPU: {:>7.4}%",
-                response.daemon_status, response.memory_mb, response.cpu_percent
-            );
+            println!("  Status: {}", response.daemon_status);
 
-            println!("\nEvent Compression:");
-            println!(
-                "  Raw/Compact: {} / {}\t(Ratio: {:.2}x)",
-                response.compression_stats.events_in_ring_buffer,
-                response.compression_stats.compact_events_stored,
-                response.compression_stats.event_compression_ratio
-            );
-            println!(
-                "  Memory: {:.2}MB / {:.2}MB\t(Ratio: {:.2}x)",
-                response.compression_stats.raw_events_memory_mb,
-                response.compression_stats.compact_events_memory_mb,
-                response.compression_stats.memory_compression_ratio
-            );
-
-            println!("\nData Structure Memory Usage:");
-            println!(
-                "  Compact Events: {:.4} MB",
-                response.compression_stats.compact_events_memory_mb
-            );
-            println!(
-                "  Records:        {:.4} MB",
-                response.compression_stats.records_collection_memory_mb
-            );
-            println!(
-                "  Activities:     {:.4} MB",
-                response.compression_stats.activities_collection_memory_mb
-            );
+            let pid_file = data_file.parent().unwrap().join("chronicle.pid");
+            if let Ok(Some(pid)) = read_pid_file(&pid_file) {
+                println!("  PID: {}", pid);
+            }
 
             println!("\nStorage:");
             println!("  Data file: {:.4} MB", response.data_file_size_mb);
@@ -391,7 +364,7 @@ fn write_pid_file(pid_file: &PathBuf) -> Result<()> {
 }
 
 fn is_process_running(pid: u32) -> bool {
-    let mut system = get_global_system().lock().unwrap();
+    let mut system = System::new();
     system.refresh_processes_specifics(
         ProcessesToUpdate::Some(&[Pid::from(pid as usize)]),
         false,

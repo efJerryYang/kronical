@@ -7,20 +7,12 @@ use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter};
 use std::path::{Path, PathBuf};
-use sysinfo::{Pid, System};
 
 #[derive(Debug, Serialize, Deserialize, SizeOf)]
 pub struct EventsAndRecordsExport {
     pub events: Vec<RawEvent>,
     pub records: Vec<ActivityRecord>,
     pub last_updated: DateTime<Utc>,
-}
-
-#[derive(Debug)]
-pub struct SystemInfo {
-    pub memory_usage_mb: u64,
-    pub cpu_usage_percent: f32,
-    pub data_file_size_mb: f64,
 }
 
 pub struct JsonStorage {
@@ -166,34 +158,6 @@ impl JsonStorage {
 
     pub fn record_count(&self) -> usize {
         self.records.len()
-    }
-
-    pub fn get_system_info(&self) -> SystemInfo {
-        let mut system = System::new_all();
-        system.refresh_all();
-
-        let current_pid = sysinfo::get_current_pid().unwrap_or(Pid::from(0));
-        let process = system.process(current_pid);
-
-        let memory_usage_mb = process
-            .map(|p| p.memory() / 1024 / 1024) // Convert bytes to MB
-            .unwrap_or(0);
-
-        let cpu_usage_percent = process.map(|p| p.cpu_usage()).unwrap_or(0.0);
-
-        let data_file_size_mb = if self.data_file.exists() {
-            std::fs::metadata(&self.data_file)
-                .map(|m| m.len() as f64 / 1024.0 / 1024.0)
-                .unwrap_or(0.0)
-        } else {
-            0.0
-        };
-
-        SystemInfo {
-            memory_usage_mb,
-            cpu_usage_percent,
-            data_file_size_mb,
-        }
     }
 
     pub fn get_records_collection_memory_usage_mb(&self) -> f32 {

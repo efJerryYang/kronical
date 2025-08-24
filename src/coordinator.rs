@@ -6,24 +6,12 @@ use crate::socket_server::SocketServer;
 use crate::storage_backend::StorageBackend;
 use anyhow::Result;
 use log::{error, info};
-use once_cell::sync::Lazy;
 use std::collections::VecDeque;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use sysinfo::System;
 use uiohook_rs::{EventHandler, Uiohook, UiohookEvent};
 use winshift::{FocusChangeHandler, MonitoringMode, WindowFocusHook, WindowHookConfig};
-
-static GLOBAL_SYSTEM: Lazy<Mutex<System>> = Lazy::new(|| {
-    let mut system = System::new_all();
-    system.refresh_all();
-    Mutex::new(system)
-});
-
-pub fn get_global_system() -> &'static Mutex<System> {
-    &GLOBAL_SYSTEM
-}
 
 #[derive(Debug, Clone)]
 pub enum ChronicleEvent {
@@ -184,15 +172,11 @@ impl EventCoordinator {
             let mut store = data_store;
             let socket_server_clone = Arc::clone(&socket_server);
             let mut pending_raw_events = Vec::new();
-            let mut raw_events_memory_bytes: usize = 0;
-            let mut total_raw_events_processed: usize = 0;
-            let mut total_raw_events_memory_bytes: usize = 0;
             let mut recent_records: VecDeque<ActivityRecord> = VecDeque::with_capacity(100);
 
             thread::spawn(move || {
-                info!("Step B: Background data processing thread started with trait-based compression");
+                info!("Step B: Background data processing thread started");
                 let mut event_count = 0;
-                let mut last_metric_update = std::time::Instant::now();
 
                 loop {
                     match receiver.recv_timeout(Duration::from_millis(50)) {
@@ -205,26 +189,11 @@ impl EventCoordinator {
                             info!("Step 4: Processing event #{}: {:?}", event_count, event);
 
                             if let Ok(raw_event) = Self::convert_chronicle_to_raw(event) {
-                                let event_memory = std::mem::size_of::<RawEvent>()
-                                    + match &raw_event {
-                                        RawEvent::WindowFocusChange { focus_info, .. } => {
-                                            focus_info.app_name.len()
-                                                + focus_info.window_title.len()
-                                        }
-                                        RawEvent::KeyboardInput { data, .. } => {
-                                            data.modifiers.iter().map(|s| s.len()).sum::<usize>()
-                                                + data
-                                                    .key_char
-                                                    .map_or(0, |_| std::mem::size_of::<char>())
-                                        }
-                                        _ => 0,
-                                    };
-                                raw_events_memory_bytes += event_memory;
-                                total_raw_events_memory_bytes += event_memory;
-
                                 pending_raw_events.push(raw_event);
-                                info!("Step 5a: Added raw event to pending batch (total: {}, memory: {}KB)", 
-                                    pending_raw_events.len(), raw_events_memory_bytes / 1024);
+                                info!(
+                                    "Step 5a: Added raw event to pending batch (total: {})",
+                                    pending_raw_events.len()
+                                );
                             }
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => {
@@ -235,7 +204,6 @@ impl EventCoordinator {
                                 );
 
                                 let raw_events_to_process = std::mem::take(&mut pending_raw_events);
-                                total_raw_events_processed += raw_events_to_process.len();
 
                                 let new_records =
                                     record_processor.process_events(raw_events_to_process.clone());
@@ -279,32 +247,6 @@ impl EventCoordinator {
                                         error!("Step 5b: Failed to compress events: {}", e);
                                     }
                                 }
-                                raw_events_memory_bytes = 0;
-                            }
-
-                            if last_metric_update.elapsed() >= Duration::from_secs(1) {
-                                let records_memory_mb = recent_records
-                                    .iter()
-                                    .map(|r| std::mem::size_of_val(r))
-                                    .sum::<usize>()
-                                    as f32
-                                    / 1024.0
-                                    / 1024.0;
-                                let mut compression_info = compression_engine.get_compression_info(
-                                    total_raw_events_processed,
-                                    total_raw_events_memory_bytes,
-                                );
-                                compression_info.records_collection_memory_mb = records_memory_mb;
-                                socket_server_clone.update_compression_stats(compression_info);
-                                last_metric_update = std::time::Instant::now();
-                            }
-
-                            if event_count % 200 == 0 && event_count > 0 {
-                                let memory_usage = compression_engine.get_memory_usage();
-                                info!("Compression status: {} total compact events, Memory: {}KB compact + {}KB strings", 
-                                    memory_usage.total_compact_events,
-                                    memory_usage.compact_events_bytes / 1024,
-                                    memory_usage.string_table_bytes / 1024);
                             }
                         }
                         Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -330,20 +272,6 @@ impl EventCoordinator {
                         } else {
                             socket_server_clone
                                 .update_records(recent_records.iter().cloned().collect());
-
-                            let records_memory_mb = recent_records
-                                .iter()
-                                .map(|r| std::mem::size_of_val(r))
-                                .sum::<usize>()
-                                as f32
-                                / 1024.0
-                                / 1024.0;
-                            let mut compression_info = compression_engine.get_compression_info(
-                                total_raw_events_processed,
-                                total_raw_events_memory_bytes,
-                            );
-                            compression_info.records_collection_memory_mb = records_memory_mb;
-                            socket_server_clone.update_compression_stats(compression_info);
                         }
                     }
                 }
