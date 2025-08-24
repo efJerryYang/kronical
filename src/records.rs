@@ -2,6 +2,7 @@ use crate::events::{RawEvent, WindowFocusInfo};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use size_of::SizeOf;
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, SizeOf)]
@@ -20,6 +21,27 @@ pub struct ActivityRecord {
     pub focus_info: Option<WindowFocusInfo>,
     pub event_count: u32,
     pub triggering_events: Vec<u64>,
+}
+
+#[derive(Debug, Clone)]
+pub struct WindowActivity {
+    pub window_id: String,
+    pub window_title: String,
+    pub duration_seconds: u64,
+    pub first_seen: DateTime<Utc>,
+    pub last_seen: DateTime<Utc>,
+    pub record_count: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct AggregatedActivity {
+    pub app_name: String,
+    pub pid: i32,
+    pub process_start_time: u64,
+    pub windows: HashMap<String, WindowActivity>,
+    pub total_duration_seconds: u64,
+    pub first_seen: DateTime<Utc>,
+    pub last_seen: DateTime<Utc>,
 }
 
 pub struct RecordProcessor {
@@ -347,4 +369,59 @@ impl RecordProcessor {
             .as_ref()
             .map(|r| (r.record_id, r.state, r.start_time, r.event_count))
     }
+}
+
+pub fn aggregate_activities(records: &[ActivityRecord]) -> Vec<AggregatedActivity> {
+    let mut app_map: HashMap<String, AggregatedActivity> = HashMap::new();
+
+    for record in records {
+        if let Some(focus_info) = &record.focus_info {
+            let app_key = format!("{}_{}", focus_info.pid, focus_info.process_start_time);
+
+            let duration = if let Some(end_time) = record.end_time {
+                (end_time - record.start_time).num_seconds() as u64
+            } else {
+                0
+            };
+
+            let aggregated = app_map
+                .entry(app_key.clone())
+                .or_insert_with(|| AggregatedActivity {
+                    app_name: focus_info.app_name.clone(),
+                    pid: focus_info.pid,
+                    process_start_time: focus_info.process_start_time,
+                    windows: HashMap::new(),
+                    total_duration_seconds: 0,
+                    first_seen: record.start_time,
+                    last_seen: record.start_time,
+                });
+
+            aggregated.total_duration_seconds += duration;
+            aggregated.first_seen = aggregated.first_seen.min(record.start_time);
+            aggregated.last_seen = aggregated.last_seen.max(record.start_time);
+
+            if !focus_info.window_title.is_empty() && !focus_info.window_id.is_empty() {
+                let window_activity = aggregated
+                    .windows
+                    .entry(focus_info.window_id.clone())
+                    .or_insert_with(|| WindowActivity {
+                        window_id: focus_info.window_id.clone(),
+                        window_title: focus_info.window_title.clone(),
+                        duration_seconds: 0,
+                        first_seen: record.start_time,
+                        last_seen: record.start_time,
+                        record_count: 0,
+                    });
+
+                window_activity.duration_seconds += duration;
+                window_activity.first_seen = window_activity.first_seen.min(record.start_time);
+                window_activity.last_seen = window_activity.last_seen.max(record.start_time);
+                window_activity.record_count += 1;
+            }
+        }
+    }
+
+    let mut apps: Vec<AggregatedActivity> = app_map.into_values().collect();
+    apps.sort_by(|a, b| b.total_duration_seconds.cmp(&a.total_duration_seconds));
+    apps
 }

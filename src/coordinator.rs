@@ -6,7 +6,6 @@ use crate::socket_server::SocketServer;
 use crate::storage_backend::StorageBackend;
 use anyhow::Result;
 use log::{error, info};
-use std::collections::VecDeque;
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -172,7 +171,7 @@ impl EventCoordinator {
             let mut store = data_store;
             let socket_server_clone = Arc::clone(&socket_server);
             let mut pending_raw_events = Vec::new();
-            let mut recent_records: VecDeque<ActivityRecord> = VecDeque::with_capacity(100);
+            let mut recent_records: Vec<ActivityRecord> = Vec::new();
 
             thread::spawn(move || {
                 info!("Step B: Background data processing thread started");
@@ -211,10 +210,7 @@ impl EventCoordinator {
                                     info!("Step 5c: Generated {} new records", new_records.len());
 
                                     for record in new_records.iter() {
-                                        if recent_records.len() == 100 {
-                                            recent_records.pop_front();
-                                        }
-                                        recent_records.push_back(record.clone());
+                                        recent_records.push(record.clone());
                                     }
 
                                     if let Err(e) = store.add_records(new_records) {
@@ -262,10 +258,7 @@ impl EventCoordinator {
                             timeout_record.state
                         );
 
-                        if recent_records.len() == 100 {
-                            recent_records.pop_front();
-                        }
-                        recent_records.push_back(timeout_record.clone());
+                        recent_records.push(timeout_record.clone());
 
                         if let Err(e) = store.add_records(vec![timeout_record.clone()]) {
                             error!("Step T: Failed to store timeout record: {}", e);

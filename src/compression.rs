@@ -616,5 +616,4 @@ impl CompressionEngine {
 
         Ok((raw_events, compact_events))
     }
-
 }

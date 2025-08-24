@@ -6,6 +6,33 @@ use ratatui::{
 };
 use std::path::PathBuf;
 
+fn pretty_format_duration(seconds: u64) -> String {
+    if seconds == 0 {
+        return "0s".to_string();
+    }
+
+    let days = seconds / (24 * 3600);
+    let hours = (seconds % (24 * 3600)) / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let secs = seconds % 60;
+
+    let mut result = String::new();
+    if days > 0 {
+        result.push_str(&format!("{}d", days));
+    }
+    if hours > 0 {
+        result.push_str(&format!("{}h", hours));
+    }
+    if minutes > 0 {
+        result.push_str(&format!("{}m", minutes));
+    }
+    if secs > 0 || result.is_empty() {
+        result.push_str(&format!("{}s", secs));
+    }
+
+    result
+}
+
 pub fn ui(frame: &mut Frame, response: &MonitorResponse) {
     let main_layout = Layout::default()
         .direction(Direction::Vertical)
@@ -97,22 +124,31 @@ fn draw_recent_activity(frame: &mut Frame, area: Rect, recent_apps: &[ActivityAp
             let window_items: Vec<ListItem> = app
                 .windows
                 .iter()
-                .map(|window| {
-                    ListItem::new(Line::from(vec![
-                        Span::raw("  └─ "),
-                        Span::styled(
-                            format!("[{}] ", window.window_id),
-                            Style::default().fg(Color::Yellow),
-                        ),
-                        Span::styled(
-                            format!("{} ", window.window_title),
-                            Style::default().fg(Color::White),
-                        ),
-                        Span::styled(
-                            format!("[{}]", window.last_active),
-                            Style::default().fg(Color::DarkGray),
-                        ),
-                    ]))
+                .flat_map(|window| {
+                    let window_duration_pretty = pretty_format_duration(window.duration_seconds);
+                    vec![
+                        ListItem::new(Line::from(vec![
+                            Span::raw("  └─ "),
+                            Span::styled(
+                                format!(
+                                    "[wid: {}, duration: {}] ",
+                                    window.window_id, window_duration_pretty
+                                ),
+                                Style::default().fg(Color::Yellow),
+                            ),
+                            Span::styled(
+                                format!("{}", window.last_active),
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                        ])),
+                        ListItem::new(Line::from(vec![
+                            Span::raw("      "),
+                            Span::styled(
+                                window.window_title.clone(),
+                                Style::default().fg(Color::White),
+                            ),
+                        ])),
+                    ]
                 })
                 .collect();
 

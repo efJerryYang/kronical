@@ -1,4 +1,4 @@
-use crate::records::ActivityRecord;
+use crate::records::{aggregate_activities, ActivityRecord};
 use anyhow::Result;
 use log::{error, info};
 use serde::{Deserialize, Serialize};
@@ -194,78 +194,44 @@ fn generate_status_response(
 fn build_app_tree(records: &[ActivityRecord]) -> Vec<ActivityApp> {
     // The outer key is the unique process identifier (pid + start_time).
     // The inner tuple holds the final ActivityApp and a map from window_id to its index in the windows vector.
-    let mut app_map: HashMap<String, (ActivityApp, HashMap<String, usize>)> = HashMap::new();
+    let aggregated = aggregate_activities(records);
 
-    for record in records.iter().rev().take(50) {
-        if let Some(focus_info) = &record.focus_info {
-            let app_key = format!("{}_{}", focus_info.pid, focus_info.process_start_time);
-
-            let duration = if let Some(end_time) = record.end_time {
-                (end_time - record.start_time).num_seconds() as u64
-            } else {
-                0
-            };
-
-            let (app, window_map) = app_map.entry(app_key).or_insert_with(|| {
-                (
-                    ActivityApp {
-                        app_name: focus_info.app_name.clone(),
-                        pid: focus_info.pid,
-                        process_start_time: focus_info.process_start_time,
-                        windows: Vec::new(),
-                        total_duration_secs: 0,
-                        total_duration_pretty: "0s".to_string(),
-                    },
-                    HashMap::new(),
-                )
-            });
-
-            app.total_duration_secs += duration;
-
-            if !focus_info.window_title.is_empty() {
-                // Check if we've already seen this window_id
-                if let Some(index) = window_map.get(&focus_info.window_id) {
-                    // Yes, just add to its duration
-                    app.windows[*index].duration_seconds += duration;
-                } else {
-                    // No, this is the first time we see this window (iterating backwards in time).
-                    // This means this record has the most recent title and last_active time.
-                    let new_window = ActivityWindow {
-                        window_id: focus_info.window_id.clone(),
-                        window_title: focus_info.window_title.clone(),
-                        last_active: record
-                            .start_time
+    aggregated
+        .into_iter()
+        .map(|agg| {
+            let mut windows: Vec<ActivityWindow> = agg
+                .windows
+                .into_values()
+                .map(|window| ActivityWindow {
+                    window_id: window.window_id,
+                    window_title: window.window_title,
+                    last_active: format!(
+                        "[{} - {}]",
+                        window
+                            .first_seen
+                            .with_timezone(&chrono::Local)
+                            .format("%Y-%m-%d %H:%M:%S"),
+                        window
+                            .last_seen
                             .with_timezone(&chrono::Local)
                             .format("%Y-%m-%d %H:%M:%S")
-                            .to_string(),
-                        duration_seconds: duration,
-                    };
-                    app.windows.push(new_window);
-                    let new_index = app.windows.len() - 1;
-                    window_map.insert(focus_info.window_id.clone(), new_index);
-                }
+                    ),
+                    duration_seconds: window.duration_seconds,
+                })
+                .collect();
+
+            windows.sort_by(|a, b| b.duration_seconds.cmp(&a.duration_seconds));
+
+            ActivityApp {
+                app_name: agg.app_name,
+                pid: agg.pid,
+                process_start_time: agg.process_start_time,
+                windows,
+                total_duration_secs: agg.total_duration_seconds,
+                total_duration_pretty: pretty_format_duration(agg.total_duration_seconds),
             }
-        }
-    }
-
-    let mut apps: Vec<ActivityApp> = app_map
-        .into_values()
-        .map(|(mut app, _)| {
-            app.total_duration_pretty = pretty_format_duration(app.total_duration_secs);
-            app
         })
-        .collect();
-
-    apps.sort_by(|a, b| b.total_duration_secs.cmp(&a.total_duration_secs));
-    apps.truncate(5);
-
-    for app in &mut apps {
-        app.windows
-            .sort_by(|a, b| b.last_active.cmp(&a.last_active));
-        app.windows.truncate(5);
-    }
-
-    apps
+        .collect()
 }
 
 fn get_data_file_size(data_dir: &std::path::Path) -> f64 {
