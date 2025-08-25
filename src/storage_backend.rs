@@ -1,6 +1,6 @@
+use crate::compression::CompactEvent;
 use crate::events::RawEvent;
 use crate::records::ActivityRecord;
-use crate::compression::CompactEvent;
 use anyhow::Result;
 
 pub trait StorageBackend: Send + Sync {

@@ -10,15 +10,6 @@ license = "MIT"
 name = "chronicle"
 path = "src/main.rs"
 
-[dev-dependencies]
-criterion = { version = "0.4", features = ["html_reports"] }
-tokio = { version = "1", features = ["full"] }
-
-[[bench]]
-name = "sqlite_storage"
-path = "benches/sqlite_storage_bench.rs"
-harness = false
-
 [dependencies]
 winshift = { path = "../vendor/winshift-rs" }
 uiohook-rs = { path = "../vendor/uiohook-rs" }
@@ -34,7 +25,7 @@ log = "0.4"
 env_logger = "0.11"
 anyhow = "1.0"
 dirs = "5.0"
-sysinfo = "0.30"
+sysinfo = "0.35"
 libc = "0.2"
 ringbuf = "0.4"
 tokio = { version = "1.0", features = ["full"] }
@@ -44,3 +35,4 @@ size-of = { version = "0.1", features = ["derive", "std", "chrono"] }
 once_cell = "1.19"
 ratatui = { version = "0.29.0", features = ["crossterm"] }
 crossterm = "0.29.0"
+config = "0.13"
