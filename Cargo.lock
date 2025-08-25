@@ -27,6 +27,8 @@ dependencies = [
 [[package]]
 name = "active-win-pos-rs"
 version = "0.9.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b376311b66ae164d60150395ade1b382584d25be0c5ac2d837b8eb2e549ca224"
 dependencies = [
  "appkit-nsworkspace-bindings",
  "core-foundation 0.9.4",
@@ -163,6 +165,8 @@ checksum = "b0674a1ddeecb70197781e945de4b3b8ffb61fa939a5597bcf48503737663100"
 [[package]]
 name = "appkit-nsworkspace-bindings"
 version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "062382938604cfa02c03689ab75af0e7eb79175ba0d0b2bcfad18f5190702dd7"
 dependencies = [
  "bindgen 0.68.1",
  "objc",
@@ -2129,6 +2133,8 @@ checksum = "2896d95c02a80c6d6a5d6e953d479f5ddf2dfdb6a244441010e373ac0fb88971"
 [[package]]
 name = "uiohook-rs"
 version = "0.2.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "81fc0e1178f4390ad3d066a33c2ea93af2bc83fe063ea423732b0ae87e720af3"
 dependencies = [
  "bindgen 0.69.5",
  "cc",
@@ -2706,6 +2712,8 @@ checksum = "271414315aff87387382ec3d271b52d7ae78726f5d44ac98b4f4030c91880486"
 [[package]]
 name = "winshift"
 version = "0.0.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "6d374e0018cd2e3c3b1e5817aba0d39112c1f324efdc4835fe602f3ac53a3974"
 dependencies = [
  "accessibility",
  "accessibility-sys",

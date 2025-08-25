@@ -11,9 +11,9 @@ name = "chronicle"
 path = "src/main.rs"
 
 [dependencies]
-winshift = { path = "../vendor/winshift-rs" }
-uiohook-rs = { path = "../vendor/uiohook-rs" }
-active-win-pos-rs = { path = "../vendor/active-win-pos-rs" }
+winshift = "0.0.2"
+uiohook-rs = "0.2"
+active-win-pos-rs = "0.9"
 clap = { version = "4.4", features = ["derive"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
