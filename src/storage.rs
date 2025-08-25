@@ -1,6 +1,7 @@
 use crate::{events::RawEvent, records::ActivityRecord, storage_backend::StorageBackend};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
 use size_of::SizeOf;
 use std::collections::BTreeMap;
@@ -40,10 +41,10 @@ impl StorageBackend for JsonStorage {
 impl JsonStorage {
     pub fn new<P: AsRef<Path>>(data_file: P) -> Result<Self> {
         let data_file = data_file.as_ref().to_path_buf();
-        log::info!("Initializing DataStore with file: {:?}", data_file);
+        info!("Initializing DataStore with file: {:?}", data_file);
 
         if let Some(parent) = data_file.parent() {
-            log::info!("Creating directory: {:?}", parent);
+            debug!("Creating directory: {:?}", parent);
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("Failed to create data directory: {:?}", parent))?;
         }
@@ -60,13 +61,13 @@ impl JsonStorage {
             .load_data()
             .with_context(|| "Failed to load existing data during DataStore initialization")?;
 
-        log::info!("DataStore initialized successfully");
+        info!("DataStore initialized successfully");
         Ok(store)
     }
 
     pub fn add_events(&mut self, events: Vec<RawEvent>) -> Result<()> {
         for event in events {
-            log::info!(
+            debug!(
                 "Adding event #{}: {} at {}",
                 event.event_id(),
                 event.event_type(),
@@ -78,19 +79,19 @@ impl JsonStorage {
         }
         let result = self.save_data();
         if result.is_ok() {
-            log::info!(
+            debug!(
                 "Events saved successfully, total events: {}",
                 self.events.len()
             );
         } else {
-            log::error!("Failed to save events: {:?}", result);
+            error!("Failed to save events: {:?}", result);
         }
         result
     }
 
     pub fn add_records(&mut self, records: Vec<ActivityRecord>) -> Result<()> {
         for record in records {
-            log::info!(
+            info!(
                 "Adding record #{}: {:?} at {}",
                 record.record_id,
                 record.state,
@@ -102,12 +103,12 @@ impl JsonStorage {
         }
         let result = self.save_data();
         if result.is_ok() {
-            log::info!(
+            info!(
                 "Records saved successfully, total records: {}",
                 self.records.len()
             );
         } else {
-            log::error!("Failed to save records: {:?}", result);
+            error!("Failed to save records: {:?}", result);
         }
         result
     }
@@ -192,14 +193,14 @@ impl JsonStorage {
 
     fn load_data(&mut self) -> Result<()> {
         if !self.data_file.exists() {
-            log::info!(
+            info!(
                 "Data file {:?} does not exist, starting with empty data",
                 self.data_file
             );
             return Ok(());
         }
 
-        log::info!("Loading data from file: {:?}", self.data_file);
+        info!("Loading data from file: {:?}", self.data_file);
 
         let file = File::open(&self.data_file)
             .with_context(|| format!("Failed to open data file: {:?}", self.data_file))?;
@@ -207,12 +208,12 @@ impl JsonStorage {
         let reader = BufReader::new(file);
         let data: EventsAndRecordsExport = serde_json::from_reader(reader)
             .with_context(|| {
-                log::error!("JSON parsing failed for file: {:?}", self.data_file);
-                log::error!("Expected structure: EventsAndRecordsExport with 'events', 'records', and 'last_updated' fields");
+                error!("JSON parsing failed for file: {:?}", self.data_file);
+                error!("Expected structure: EventsAndRecordsExport with 'events', 'records', and 'last_updated' fields");
                 format!("Failed to parse JSON data file: {:?}. The file format may be incompatible with the current version.", self.data_file)
             })?;
 
-        log::info!(
+        info!(
             "Successfully loaded {} events and {} records from data file",
             data.events.len(),
             data.records.len()

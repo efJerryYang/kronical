@@ -5,7 +5,7 @@ use crate::records::{ActivityRecord, RecordProcessor};
 use crate::socket_server::SocketServer;
 use crate::storage_backend::StorageBackend;
 use anyhow::Result;
-use log::{error, info};
+use log::{debug, error, info, trace};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -59,46 +59,46 @@ impl FocusChangeCallback for FocusCallback {
 
 impl EventHandler for ChronicleEventHandler {
     fn handle_event(&self, event: &UiohookEvent) {
-        info!("Step 1: UIohook event received: {:?}", event);
+        trace!("UIohook event received: {:?}", event);
         let chronicle_event = match event {
             UiohookEvent::Keyboard(_) => {
-                info!("Step 2: Keyboard event detected");
+                trace!("Keyboard event detected");
                 ChronicleEvent::KeyboardInput
             }
             UiohookEvent::Mouse(_) => {
-                info!("Step 2: Mouse event detected");
+                trace!("Mouse event detected");
                 ChronicleEvent::MouseInput
             }
             UiohookEvent::Wheel(_) => {
-                info!("Step 2: Wheel event detected");
+                trace!("Wheel event detected");
                 ChronicleEvent::MouseInput
             }
             UiohookEvent::HookEnabled => {
-                info!("Step 2: UIohook enabled");
+                debug!("UIohook enabled");
                 return;
             }
             UiohookEvent::HookDisabled => {
-                info!("Step 2: UIohook disabled");
+                debug!("UIohook disabled");
                 return;
             }
         };
 
         if let Err(e) = self.sender.send(chronicle_event) {
-            error!("Step 3: Failed to send input event: {}", e);
+            error!("Failed to send input event: {}", e);
         } else {
-            info!("Step 3: Event sent to background thread successfully");
+            trace!("Event sent to background thread successfully");
         }
     }
 }
 
 impl FocusChangeHandler for ChronicleEventHandler {
     fn on_app_change(&self, pid: i32, app_name: String) {
-        info!("Step 1: App changed: {} (PID: {})", app_name, pid);
+        debug!("App changed: {} (PID: {})", app_name, pid);
         self.focus_wrapper.handle_app_change(pid, app_name);
     }
 
     fn on_window_change(&self, window_title: String) {
-        info!("Step 1: Window changed: {}", window_title);
+        debug!("Window changed: {}", window_title);
         self.focus_wrapper.handle_window_change(window_title);
     }
 }
@@ -175,31 +175,31 @@ impl EventCoordinator {
             let mut recent_records: Vec<ActivityRecord> = Vec::new();
 
             thread::spawn(move || {
-                info!("Step B: Background data processing thread started");
+                info!("Background data processing thread started");
                 let mut event_count = 0;
 
                 loop {
                     match receiver.recv_timeout(Duration::from_millis(50)) {
                         Ok(ChronicleEvent::Shutdown) => {
-                            info!("Step Z: Shutdown signal received, finalizing");
+                            info!("Shutdown signal received, finalizing");
                             break;
                         }
                         Ok(event) => {
                             event_count += 1;
-                            info!("Step 4: Processing event #{}: {:?}", event_count, event);
+                            debug!("Processing event #{}: {:?}", event_count, event);
 
                             if let Ok(raw_event) = Self::convert_chronicle_to_raw(event) {
                                 pending_raw_events.push(raw_event);
-                                info!(
-                                    "Step 5a: Added raw event to pending batch (total: {})",
+                                trace!(
+                                    "Added raw event to pending batch (total: {})",
                                     pending_raw_events.len()
                                 );
                             }
                         }
                         Err(mpsc::RecvTimeoutError::Timeout) => {
                             if !pending_raw_events.is_empty() {
-                                info!(
-                                    "Step 5b: Processing {} pending raw events",
+                                debug!(
+                                    "Processing {} pending raw events",
                                     pending_raw_events.len()
                                 );
 
@@ -208,16 +208,16 @@ impl EventCoordinator {
                                 let new_records =
                                     record_processor.process_events(raw_events_to_process.clone());
                                 if !new_records.is_empty() {
-                                    info!("Step 5c: Generated {} new records", new_records.len());
+                                    info!("Generated {} new records", new_records.len());
 
                                     for record in new_records.iter() {
                                         recent_records.push(record.clone());
                                     }
 
                                     if let Err(e) = store.add_records(new_records) {
-                                        error!("Step 5c: Failed to store records: {}", e);
+                                        error!("Failed to store records: {}", e);
                                     } else {
-                                        info!("Step 5c: Records stored successfully");
+                                        debug!("Records stored successfully");
                                         socket_server_clone.update_records(
                                             recent_records.iter().cloned().collect(),
                                         );
@@ -226,43 +226,37 @@ impl EventCoordinator {
 
                                 match compression_engine.compress_events(raw_events_to_process) {
                                     Ok((processed_events, compact_events)) => {
-                                        info!(
-                                            "Step 5b: Compressed into {} compact events",
+                                        debug!(
+                                            "Compressed into {} compact events",
                                             compact_events.len()
                                         );
 
                                         if !processed_events.is_empty() {
                                             if let Err(e) = store.add_events(processed_events) {
-                                                error!(
-                                                    "Step 5b: Failed to store raw events: {}",
-                                                    e
-                                                );
+                                                error!("Failed to store raw events: {}", e);
                                             }
                                         }
                                     }
                                     Err(e) => {
-                                        error!("Step 5b: Failed to compress events: {}", e);
+                                        error!("Failed to compress events: {}", e);
                                     }
                                 }
                             }
                         }
                         Err(mpsc::RecvTimeoutError::Disconnected) => {
-                            info!("Step Z: Channel disconnected, exiting");
+                            info!("Channel disconnected, exiting");
                             break;
                         }
                     }
 
-                    // Step 3: Check for timeouts
+                    // Check for timeouts
                     if let Some(timeout_record) = record_processor.check_timeouts() {
-                        info!(
-                            "Step T: Timeout detected, storing record: {:?}",
-                            timeout_record.state
-                        );
+                        info!("Timeout detected, storing record: {:?}", timeout_record.state);
 
                         recent_records.push(timeout_record.clone());
 
                         if let Err(e) = store.add_records(vec![timeout_record.clone()]) {
-                            error!("Step T: Failed to store timeout record: {}", e);
+                            error!("Failed to store timeout record: {}", e);
                         } else {
                             socket_server_clone
                                 .update_records(recent_records.iter().cloned().collect());
@@ -272,13 +266,13 @@ impl EventCoordinator {
 
                 // Finalize
                 if let Some(final_record) = record_processor.finalize_all() {
-                    info!("Step Z: Storing final record: {:?}", final_record.state);
+                    info!("Storing final record: {:?}", final_record.state);
                     if let Err(e) = store.add_records(vec![final_record]) {
-                        error!("Step Z: Failed to store final record: {}", e);
+                        error!("Failed to store final record: {}", e);
                     }
                 }
 
-                info!("Step Z: Background thread completed");
+                info!("Background thread completed");
             })
         };
 

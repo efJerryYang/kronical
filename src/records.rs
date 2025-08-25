@@ -1,5 +1,6 @@
 use crate::events::{RawEvent, WindowFocusInfo};
 use chrono::{DateTime, Utc};
+use log::{debug, info};
 use serde::{Deserialize, Serialize};
 use size_of::SizeOf;
 use std::collections::HashMap;
@@ -77,7 +78,7 @@ impl RecordProcessor {
         if let Some(ref record) = self.current_record {
             let record_duration = Utc::now().signed_duration_since(record.start_time);
             if record_duration > chrono::Duration::minutes(5) {
-                log::info!(
+                info!(
                     "Auto-completing long-running record #{} after {} minutes",
                     record.record_id,
                     record_duration.num_minutes()
@@ -89,7 +90,7 @@ impl RecordProcessor {
         }
 
         for event in events {
-            log::info!(
+            debug!(
                 "Processing event #{}: {} at {}",
                 event.event_id(),
                 event.event_type(),
@@ -107,7 +108,7 @@ impl RecordProcessor {
             };
 
             if let Some(record) = completed_record {
-                log::info!(
+                info!(
                     "Record #{}: {} completed after {} events from {} to {}",
                     record.record_id,
                     format!("{:?}", record.state),
@@ -147,7 +148,7 @@ impl RecordProcessor {
             triggering_events: Vec::new(),
         });
         self.next_record_id += 1;
-        log::info!(
+        info!(
             "Started new record #{}",
             self.current_record.as_ref().unwrap().record_id
         );
@@ -160,14 +161,14 @@ impl RecordProcessor {
 
         let target_state = match self.current_state {
             ActivityState::Active if time_since_keyboard >= self.active_timeout => {
-                log::info!(
+                debug!(
                     "Timeout: Active -> Passive ({}s since keyboard)",
                     time_since_keyboard.as_secs()
                 );
                 Some(ActivityState::Passive)
             }
             ActivityState::Passive if time_since_activity >= self.passive_timeout => {
-                log::info!(
+                debug!(
                     "Timeout: Passive -> Inactive ({}s since activity)",
                     time_since_activity.as_secs()
                 );
@@ -179,7 +180,7 @@ impl RecordProcessor {
         if let Some(new_state) = target_state {
             let completed = self.transition_to_state(new_state, None);
             if let Some(ref record) = completed {
-                log::info!(
+                info!(
                     "Timeout record #{}: {:?} completed",
                     record.record_id,
                     record.state
@@ -200,7 +201,7 @@ impl RecordProcessor {
             self.start_new_record(self.current_focus.clone());
         }
 
-        log::info!("Keyboard event -> transitioning to Active");
+        debug!("Keyboard event -> transitioning to Active");
         let completed = self.transition_to_state(ActivityState::Active, Some(event_id));
         self.add_event_to_current_record(event_id);
         completed
@@ -221,7 +222,7 @@ impl RecordProcessor {
             ActivityState::Passive
         };
 
-        log::info!("Mouse event -> transitioning to {:?}", target_state);
+        debug!("Mouse event -> transitioning to {:?}", target_state);
         let completed = self.transition_to_state(target_state, Some(event_id));
         self.add_event_to_current_record(event_id);
         completed
@@ -232,7 +233,7 @@ impl RecordProcessor {
         event_id: u64,
         focus_info: WindowFocusInfo,
     ) -> Option<ActivityRecord> {
-        log::info!(
+        info!(
             "Focus change: '{}' in {} (PID {}, WinID {}, Start {})",
             focus_info.window_title,
             focus_info.app_name,
@@ -250,19 +251,31 @@ impl RecordProcessor {
         self.current_focus = Some(focus_info.clone());
 
         if is_same_window {
-            // It's the same window, just a title change. Update the current record.
-            if let Some(ref mut record) = self.current_record {
-                log::info!("Updating title for existing record #{}", record.record_id);
-                record.focus_info = Some(focus_info);
-                self.add_event_to_current_record(event_id);
-            }
-            None // No record was completed
+            // It's the same window, just a title change. Complete the current record and start a new one
+            // to ensure the UI gets updated with the new title.
+            let completed_record = if let Some(current) = self.current_record.take() {
+                let mut completed = current;
+                completed.end_time = Some(Utc::now());
+                info!(
+                    "Title change completed record #{}: {:?} with {} events",
+                    completed.record_id,
+                    completed.state,
+                    completed.event_count
+                );
+                Some(completed)
+            } else {
+                None
+            };
+
+            self.start_new_record(Some(focus_info));
+            self.add_event_to_current_record(event_id);
+            completed_record
         } else {
             // It's a different window. Complete the old record and start a new one.
             let completed_record = if let Some(current) = self.current_record.take() {
                 let mut completed = current;
                 completed.end_time = Some(Utc::now());
-                log::info!(
+                info!(
                     "Focus change completed record #{}: {:?} with {} events",
                     completed.record_id,
                     completed.state,
@@ -288,7 +301,7 @@ impl RecordProcessor {
             return None;
         }
 
-        log::info!(
+        debug!(
             "State transition: {:?} -> {:?}",
             self.current_state,
             new_state
@@ -313,7 +326,7 @@ impl RecordProcessor {
             triggering_events,
         });
 
-        log::info!(
+        debug!(
             "Record #{}: Started {:?} state at {}",
             self.next_record_id,
             new_state,
@@ -330,7 +343,7 @@ impl RecordProcessor {
             if !record.triggering_events.contains(&event_id) {
                 record.triggering_events.push(event_id);
             }
-            log::info!(
+            debug!(
                 "Added event #{} to record #{} (total events: {})",
                 event_id,
                 record.record_id,
@@ -351,7 +364,7 @@ impl RecordProcessor {
     pub fn finalize_all(&mut self) -> Option<ActivityRecord> {
         let final_record = self.finalize_current_record(Utc::now());
         if let Some(ref record) = final_record {
-            log::info!(
+            info!(
                 "Final record #{}: {:?} finalized",
                 record.record_id,
                 record.state
@@ -413,6 +426,8 @@ pub fn aggregate_activities(records: &[ActivityRecord]) -> Vec<AggregatedActivit
                         record_count: 0,
                     });
 
+                // Always update the window title to ensure UI shows the latest title
+                window_activity.window_title = focus_info.window_title.clone();
                 window_activity.duration_seconds += duration;
                 window_activity.first_seen = window_activity.first_seen.min(record.start_time);
                 window_activity.last_seen = window_activity.last_seen.max(record.start_time);

@@ -1,4 +1,5 @@
 mod compression;
+mod config;
 mod coordinator;
 mod events;
 mod focus_tracker;
@@ -9,6 +10,7 @@ mod socket_server;
 mod storage;
 mod storage_backend;
 
+use crate::config::AppConfig;
 use crate::simple_sqlite_storage::SimpleSqliteStorage;
 use crate::storage_backend::StorageBackend;
 use anyhow::{Context, Result};
@@ -19,7 +21,7 @@ use crossterm::{
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use log::{error, info};
+use log::{debug, error, info, trace, warn};
 use ratatui::prelude::Backend;
 use ratatui::prelude::CrosstermBackend;
 use ratatui::widgets::Block;
@@ -41,9 +43,6 @@ use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 struct Cli {
     #[command(subcommand)]
     command: Commands,
-
-    #[arg(long, default_value = "~/.chronicle/data.db")]
-    data_file: String,
 
     #[arg(long, short, action = clap::ArgAction::Count)]
     verbose: u8,
@@ -71,16 +70,11 @@ fn setup_logging(verbose: u8) {
         .init();
 }
 
-fn expand_path(path: &str) -> PathBuf {
-    if path.starts_with("~/") {
-        if let Some(home) = dirs::home_dir() {
-            home.join(&path[2..])
-        } else {
-            PathBuf::from(path)
-        }
-    } else {
-        PathBuf::from(path)
+fn ensure_workspace_dir(workspace_dir: &PathBuf) -> Result<()> {
+    if !workspace_dir.exists() {
+        std::fs::create_dir_all(workspace_dir).context("Failed to create workspace directory")?;
     }
+    Ok(())
 }
 
 fn start_daemon(data_file: PathBuf) -> Result<()> {
@@ -377,7 +371,22 @@ fn main() {
     let cli = Cli::parse();
     setup_logging(cli.verbose);
 
-    let data_file = expand_path(&cli.data_file);
+    // Load configuration
+    let config = match AppConfig::load() {
+        Ok(config) => config,
+        Err(e) => {
+            error!("Failed to load configuration: {}", e);
+            process::exit(1);
+        }
+    };
+
+    // Ensure workspace directory exists
+    if let Err(e) = ensure_workspace_dir(&config.workspace_dir) {
+        error!("Failed to create workspace directory: {}", e);
+        process::exit(1);
+    }
+
+    let data_file = config.workspace_dir.join("data.db");
 
     let result = match cli.command {
         Commands::Start => start_daemon(data_file),

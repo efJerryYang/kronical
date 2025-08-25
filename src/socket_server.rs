@@ -2,7 +2,6 @@ use crate::records::{aggregate_activities, ActivityRecord};
 use anyhow::Result;
 use log::{error, info};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
