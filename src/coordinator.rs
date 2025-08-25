@@ -1,3 +1,4 @@
+use crate::aggregation_manager::AggregationManager;
 use crate::compression::CompressionEngine;
 use crate::events::{KeyboardEventData, MouseEventData, MousePosition, RawEvent, WindowFocusInfo};
 use crate::focus_tracker::{FocusChangeCallback, FocusEventWrapper};
@@ -172,7 +173,7 @@ impl EventCoordinator {
             let mut store = data_store;
             let socket_server_clone = Arc::clone(&socket_server);
             let mut pending_raw_events = Vec::new();
-            let mut recent_records: Vec<ActivityRecord> = Vec::new();
+            let mut aggregation_manager = AggregationManager::new();
 
             thread::spawn(move || {
                 info!("Background data processing thread started");
@@ -210,16 +211,18 @@ impl EventCoordinator {
                                 if !new_records.is_empty() {
                                     info!("Generated {} new records", new_records.len());
 
-                                    for record in new_records.iter() {
-                                        recent_records.push(record.clone());
+                                    // Update aggregation with new records
+                                    for record in &new_records {
+                                        aggregation_manager.update_with_record(record);
                                     }
 
                                     if let Err(e) = store.add_records(new_records) {
                                         error!("Failed to store records: {}", e);
                                     } else {
                                         debug!("Records stored successfully");
-                                        socket_server_clone.update_records(
-                                            recent_records.iter().cloned().collect(),
+                                        // Update socket server with aggregated data
+                                        socket_server_clone.update_aggregated_data(
+                                            aggregation_manager.get_aggregated_activities(),
                                         );
                                     }
                                 }
@@ -251,15 +254,20 @@ impl EventCoordinator {
 
                     // Check for timeouts
                     if let Some(timeout_record) = record_processor.check_timeouts() {
-                        info!("Timeout detected, storing record: {:?}", timeout_record.state);
+                        info!(
+                            "Timeout detected, storing record: {:?}",
+                            timeout_record.state
+                        );
 
-                        recent_records.push(timeout_record.clone());
+                        // Update aggregation with timeout record
+                        aggregation_manager.update_with_record(&timeout_record);
 
                         if let Err(e) = store.add_records(vec![timeout_record.clone()]) {
                             error!("Failed to store timeout record: {}", e);
                         } else {
-                            socket_server_clone
-                                .update_records(recent_records.iter().cloned().collect());
+                            socket_server_clone.update_aggregated_data(
+                                aggregation_manager.get_aggregated_activities(),
+                            );
                         }
                     }
                 }
@@ -267,8 +275,14 @@ impl EventCoordinator {
                 // Finalize
                 if let Some(final_record) = record_processor.finalize_all() {
                     info!("Storing final record: {:?}", final_record.state);
-                    if let Err(e) = store.add_records(vec![final_record]) {
+                    if let Err(e) = store.add_records(vec![final_record.clone()]) {
                         error!("Failed to store final record: {}", e);
+                    } else {
+                        // Update aggregation with final record
+                        aggregation_manager.update_with_record(&final_record);
+                        socket_server_clone.update_aggregated_data(
+                            aggregation_manager.get_aggregated_activities(),
+                        );
                     }
                 }
 
