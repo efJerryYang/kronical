@@ -1,4 +1,4 @@
-use crate::records::{aggregate_activities, ActivityRecord};
+use crate::records::{aggregate_activities, ActivityRecord, AggregatedActivity};
 use anyhow::Result;
 use log::{error, info};
 use serde::{Deserialize, Serialize};
@@ -65,6 +65,7 @@ pub struct SocketServer {
     socket_path: PathBuf,
     notification_socket_path: PathBuf,
     recent_records: Arc<Mutex<Vec<ActivityRecord>>>,
+    aggregated_activities: Arc<Mutex<Vec<AggregatedActivity>>>,
     notification_clients: Arc<Mutex<Vec<UnixStream>>>,
 }
 
@@ -75,6 +76,7 @@ impl SocketServer {
             socket_path,
             notification_socket_path,
             recent_records: Arc::new(Mutex::new(Vec::new())),
+            aggregated_activities: Arc::new(Mutex::new(Vec::new())),
             notification_clients: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -91,6 +93,16 @@ impl SocketServer {
         let mut recent = self.recent_records.lock().unwrap();
         *recent = records;
         info!("Updated socket server with {} records", recent.len());
+        self.notify_clients();
+    }
+
+    pub fn update_aggregated_data(&self, aggregated_activities: Vec<AggregatedActivity>) {
+        let mut aggregated = self.aggregated_activities.lock().unwrap();
+        *aggregated = aggregated_activities;
+        info!(
+            "Updated socket server with {} aggregated activities",
+            aggregated.len()
+        );
         self.notify_clients();
     }
 
@@ -121,6 +133,7 @@ impl SocketServer {
         });
 
         let recent_records = Arc::clone(&self.recent_records);
+        let aggregated_activities = Arc::clone(&self.aggregated_activities);
         let socket_path = self.socket_path.clone();
 
         thread::spawn(move || {
@@ -128,9 +141,12 @@ impl SocketServer {
                 match stream {
                     Ok(stream) => {
                         let records = Arc::clone(&recent_records);
+                        let aggregated = Arc::clone(&aggregated_activities);
                         let socket_path_clone = socket_path.clone();
                         thread::spawn(move || {
-                            if let Err(e) = handle_client(stream, records, socket_path_clone) {
+                            if let Err(e) =
+                                handle_client(stream, records, aggregated, socket_path_clone)
+                            {
                                 error!("Error handling client: {}", e);
                             }
                         });
@@ -148,7 +164,8 @@ impl SocketServer {
 
 fn handle_client(
     mut stream: UnixStream,
-    recent_records: Arc<Mutex<Vec<ActivityRecord>>>,
+    _recent_records: Arc<Mutex<Vec<ActivityRecord>>>,
+    aggregated_activities: Arc<Mutex<Vec<AggregatedActivity>>>,
     socket_path: PathBuf,
 ) -> Result<()> {
     let mut reader = BufReader::new(&stream);
@@ -161,7 +178,8 @@ fn handle_client(
 
     match command {
         "status" => {
-            let response = generate_status_response(recent_records, socket_path)?;
+            let aggregated = aggregated_activities.lock().unwrap();
+            let response = generate_status_response(&aggregated, socket_path)?;
             let json_response = serde_json::to_string(&response)?;
             writeln!(stream, "{}", json_response)?;
         }
@@ -174,13 +192,12 @@ fn handle_client(
 }
 
 fn generate_status_response(
-    recent_records: Arc<Mutex<Vec<ActivityRecord>>>,
+    aggregated_activities: &[AggregatedActivity],
     socket_path: PathBuf,
 ) -> Result<MonitorResponse> {
-    let records = recent_records.lock().unwrap();
     let data_dir = socket_path.parent().unwrap();
     let data_file_size_mb = get_data_file_size(data_dir);
-    let recent_apps = build_app_tree(&records);
+    let recent_apps = build_app_tree(aggregated_activities);
 
     Ok(MonitorResponse {
         daemon_status: "running".to_string(),
@@ -190,20 +207,19 @@ fn generate_status_response(
     })
 }
 
-fn build_app_tree(records: &[ActivityRecord]) -> Vec<ActivityApp> {
+fn build_app_tree(aggregated_activities: &[AggregatedActivity]) -> Vec<ActivityApp> {
     // The outer key is the unique process identifier (pid + start_time).
     // The inner tuple holds the final ActivityApp and a map from window_id to its index in the windows vector.
-    let aggregated = aggregate_activities(records);
 
-    aggregated
-        .into_iter()
+    aggregated_activities
+        .iter()
         .map(|agg| {
             let mut windows: Vec<ActivityWindow> = agg
                 .windows
-                .into_values()
+                .values()
                 .map(|window| ActivityWindow {
-                    window_id: window.window_id,
-                    window_title: window.window_title,
+                    window_id: window.window_id.clone(),
+                    window_title: window.window_title.clone(),
                     last_active: format!(
                         "[{} - {}]",
                         window
@@ -222,7 +238,7 @@ fn build_app_tree(records: &[ActivityRecord]) -> Vec<ActivityApp> {
             windows.sort_by(|a, b| b.duration_seconds.cmp(&a.duration_seconds));
 
             ActivityApp {
-                app_name: agg.app_name,
+                app_name: agg.app_name.clone(),
                 pid: agg.pid,
                 process_start_time: agg.process_start_time,
                 windows,

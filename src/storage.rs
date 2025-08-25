@@ -93,9 +93,7 @@ impl JsonStorage {
         for record in records {
             info!(
                 "Adding record #{}: {:?} at {}",
-                record.record_id,
-                record.state,
-                record.start_time
+                record.record_id, record.state, record.start_time
             );
             let index = self.records.len();
             self.record_index.insert(record.start_time, index);

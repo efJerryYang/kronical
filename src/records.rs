@@ -182,8 +182,7 @@ impl RecordProcessor {
             if let Some(ref record) = completed {
                 info!(
                     "Timeout record #{}: {:?} completed",
-                    record.record_id,
-                    record.state
+                    record.record_id, record.state
                 );
             }
             completed
@@ -258,9 +257,7 @@ impl RecordProcessor {
                 completed.end_time = Some(Utc::now());
                 info!(
                     "Title change completed record #{}: {:?} with {} events",
-                    completed.record_id,
-                    completed.state,
-                    completed.event_count
+                    completed.record_id, completed.state, completed.event_count
                 );
                 Some(completed)
             } else {
@@ -277,9 +274,7 @@ impl RecordProcessor {
                 completed.end_time = Some(Utc::now());
                 info!(
                     "Focus change completed record #{}: {:?} with {} events",
-                    completed.record_id,
-                    completed.state,
-                    completed.event_count
+                    completed.record_id, completed.state, completed.event_count
                 );
                 Some(completed)
             } else {
@@ -303,8 +298,7 @@ impl RecordProcessor {
 
         debug!(
             "State transition: {:?} -> {:?}",
-            self.current_state,
-            new_state
+            self.current_state, new_state
         );
 
         let now_utc = Utc::now();
@@ -345,9 +339,7 @@ impl RecordProcessor {
             }
             debug!(
                 "Added event #{} to record #{} (total events: {})",
-                event_id,
-                record.record_id,
-                record.event_count
+                event_id, record.record_id, record.event_count
             );
         }
     }
@@ -366,8 +358,7 @@ impl RecordProcessor {
         if let Some(ref record) = final_record {
             info!(
                 "Final record #{}: {:?} finalized",
-                record.record_id,
-                record.state
+                record.record_id, record.state
             );
         }
         final_record

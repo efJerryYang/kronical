@@ -1,3 +1,4 @@
+mod aggregation_manager;
 mod compression;
 mod config;
 mod coordinator;

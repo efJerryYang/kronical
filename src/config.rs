@@ -16,9 +16,7 @@ impl Default for AppConfig {
             panic!("Failed to determine home directory")
         };
 
-        Self {
-            workspace_dir,
-        }
+        Self { workspace_dir }
     }
 }
 
