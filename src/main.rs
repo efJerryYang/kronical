@@ -148,7 +148,14 @@ fn get_status(data_file: PathBuf) -> Result<()> {
                     );
                     for window in app.windows {
                         if !window.window_title.is_empty() {
-                            println!("    └─ {} ({})", window.window_title, window.last_active);
+                            println!(
+                                "    └─ {} [{}]",
+                                window.window_title,
+                                window
+                                    .last_seen
+                                    .with_timezone(&chrono::Local)
+                                    .format("%Y-%m-%d %H:%M:%S")
+                            );
                         }
                     }
                 }

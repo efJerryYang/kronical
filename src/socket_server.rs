@@ -12,7 +12,7 @@ use std::thread;
 pub struct ActivityWindow {
     pub window_id: String,
     pub window_title: String,
-    pub last_active: String,
+    pub last_seen: chrono::DateTime<chrono::Utc>,
     pub duration_seconds: u64,
 }
 
@@ -220,22 +220,12 @@ fn build_app_tree(aggregated_activities: &[AggregatedActivity]) -> Vec<ActivityA
                 .map(|window| ActivityWindow {
                     window_id: window.window_id.clone(),
                     window_title: window.window_title.clone(),
-                    last_active: format!(
-                        "[{} - {}]",
-                        window
-                            .first_seen
-                            .with_timezone(&chrono::Local)
-                            .format("%Y-%m-%d %H:%M:%S"),
-                        window
-                            .last_seen
-                            .with_timezone(&chrono::Local)
-                            .format("%Y-%m-%d %H:%M:%S")
-                    ),
+                    last_seen: window.last_seen,
                     duration_seconds: window.duration_seconds,
                 })
                 .collect();
 
-            windows.sort_by(|a, b| b.duration_seconds.cmp(&a.duration_seconds));
+            windows.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
 
             ActivityApp {
                 app_name: agg.app_name.clone(),

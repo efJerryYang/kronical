@@ -65,7 +65,7 @@ impl AggregationManager {
     pub fn get_aggregated_activities(&self) -> Vec<AggregatedActivity> {
         let mut apps: Vec<AggregatedActivity> =
             self.aggregated_activities.values().cloned().collect();
-        apps.sort_by(|a, b| b.total_duration_seconds.cmp(&a.total_duration_seconds));
+        apps.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
         apps
     }
 

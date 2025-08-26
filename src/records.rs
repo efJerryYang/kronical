@@ -428,6 +428,6 @@ pub fn aggregate_activities(records: &[ActivityRecord]) -> Vec<AggregatedActivit
     }
 
     let mut apps: Vec<AggregatedActivity> = app_map.into_values().collect();
-    apps.sort_by(|a, b| b.total_duration_seconds.cmp(&a.total_duration_seconds));
+    apps.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
     apps
 }
