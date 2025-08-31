@@ -1,4 +1,4 @@
-use crate::events::{MousePosition, RawEvent};
+use crate::daemon::events::{MousePosition, RawEvent};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -335,7 +335,7 @@ impl EventCompressor for MouseTrajectoryCompressor {
             if let Some((last_time, last_pos)) = current_path.last() {
                 let time_gap = (timestamp - *last_time).num_milliseconds();
                 let distance = self.calculate_distance(last_pos, &position);
-                let type_changed = current_type.map_or(false, |t| t != trajectory_type);
+                let type_changed = current_type.is_some_and(|t| t != trajectory_type);
 
                 if time_gap > self.max_gap_ms || distance < self.min_distance || type_changed {
                     // Finalize current trajectory

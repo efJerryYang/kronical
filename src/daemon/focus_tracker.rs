@@ -1,5 +1,6 @@
-use crate::events::WindowFocusInfo;
+use crate::daemon::events::WindowFocusInfo;
 use active_win_pos_rs::get_active_window;
+use chrono::{DateTime, Utc};
 use log::{error, info, warn};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -14,6 +15,7 @@ pub struct FocusState {
     pub pid: i32,
     pub window_title: String,
     pub window_id: String,
+    pub window_instance_start: DateTime<Utc>,
     pub process_start_time: u64,
     pub last_app_update: Instant,
     pub last_window_update: Instant,
@@ -26,6 +28,7 @@ impl FocusState {
             pid: 0,
             window_title: String::new(),
             window_id: String::new(),
+            window_instance_start: Utc::now(),
             process_start_time: 0,
             last_app_update: Instant::now(),
             last_window_update: Instant::now(),
@@ -47,6 +50,7 @@ impl FocusState {
             app_name: self.app_name.clone(),
             window_title: self.window_title.clone(),
             window_id: self.window_id.clone(),
+            window_instance_start: self.window_instance_start,
             window_position: None,
             window_size: None,
         }
@@ -80,7 +84,6 @@ impl FocusEventWrapper {
             last_titles: Arc::new(Mutex::new(HashMap::new())),
         };
 
-        // Start polling thread if interval is positive
         if poll_interval.as_millis() > 0 {
             wrapper.start_polling();
         }
@@ -126,12 +129,16 @@ impl FocusEventWrapper {
         state.app_name = app_name;
         state.pid = pid;
         state.process_start_time = self.get_process_start_time(pid);
+        state.window_instance_start = Utc::now();
         state.last_app_update = now;
 
         match get_active_window() {
             Ok(active_window) => {
                 if active_window.process_id as i32 == pid {
                     state.window_title = active_window.title;
+                    if state.window_id != active_window.window_id {
+                        state.window_instance_start = Utc::now();
+                    }
                     state.window_id = active_window.window_id;
                     state.last_window_update = now;
 
@@ -191,6 +198,9 @@ impl FocusEventWrapper {
         match get_active_window() {
             Ok(active_window) => {
                 if active_window.process_id as i32 == state.pid {
+                    if state.window_id != active_window.window_id {
+                        state.window_instance_start = Utc::now();
+                    }
                     state.window_id = active_window.window_id;
                 }
             }
@@ -223,31 +233,6 @@ impl FocusEventWrapper {
                 "FocusEventWrapper: Window change but state is incomplete: app={}, pid={}, window={}",
                 state.app_name, state.pid, state.window_title
             );
-        }
-    }
-
-    pub fn get_current_state(&self) -> Option<WindowFocusInfo> {
-        let state = self.current_state.lock().unwrap();
-        if state.is_complete() {
-            Some(state.to_window_focus_info())
-        } else {
-            None
-        }
-    }
-
-    // Force emit current state if complete (useful for initialization)
-    pub fn force_emit_current(&self) {
-        let state = self.current_state.lock().unwrap();
-        if state.is_complete() {
-            let focus_info = state.to_window_focus_info();
-            info!(
-                "FocusEventWrapper: Force emitting current focus: {} -> {}",
-                focus_info.app_name, focus_info.window_title
-            );
-
-            // Release the lock before calling the callback
-            drop(state);
-            self.callback.on_focus_change(focus_info);
         }
     }
 
@@ -286,7 +271,6 @@ impl FocusEventWrapper {
                             }
                         }
 
-                        // Update stored title
                         titles.insert(window_id, current_title);
                     }
                     Err(e) => {
@@ -297,10 +281,6 @@ impl FocusEventWrapper {
 
             info!("Window title polling stopped");
         });
-    }
-
-    pub fn stop_polling(&self) {
-        self.should_stop_polling.store(true, Ordering::Relaxed);
     }
 }
 

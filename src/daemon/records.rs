@@ -1,9 +1,9 @@
-use crate::events::{RawEvent, WindowFocusInfo};
+use crate::daemon::events::{RawEvent, WindowFocusInfo};
+use crate::util::maps::{HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use log::{debug, info};
 use serde::{Deserialize, Serialize};
 use size_of::SizeOf;
-use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, SizeOf)]
@@ -39,7 +39,18 @@ pub struct AggregatedActivity {
     pub app_name: String,
     pub pid: i32,
     pub process_start_time: u64,
-    pub windows: HashMap<String, WindowActivity>,
+    pub windows: HashMap<u32, WindowActivity>,
+    pub ephemeral_groups: HashMap<String, EphemeralGroup>,
+    pub total_duration_seconds: u64,
+    pub first_seen: DateTime<Utc>,
+    pub last_seen: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct EphemeralGroup {
+    pub title_key: String,
+    pub distinct_ids: HashSet<u32>,
+    pub occurrence_count: u32,
     pub total_duration_seconds: u64,
     pub first_seen: DateTime<Utc>,
     pub last_seen: DateTime<Utc>,
@@ -241,10 +252,11 @@ impl RecordProcessor {
             focus_info.process_start_time
         );
 
-        let is_same_window = self.current_focus.as_ref().map_or(false, |current| {
+        let is_same_window = self.current_focus.as_ref().is_some_and(|current| {
             current.pid == focus_info.pid
                 && current.process_start_time == focus_info.process_start_time
                 && current.window_id == focus_info.window_id
+                && current.window_instance_start == focus_info.window_instance_start
         });
 
         self.current_focus = Some(focus_info.clone());
@@ -375,54 +387,126 @@ impl RecordProcessor {
     }
 }
 
-pub fn aggregate_activities(records: &[ActivityRecord]) -> Vec<AggregatedActivity> {
-    let mut app_map: HashMap<String, AggregatedActivity> = HashMap::new();
+// Aggregate only the portion of records overlapping [since, now].
+pub fn aggregate_activities_since(
+    records: &[ActivityRecord],
+    since: DateTime<Utc>,
+    now: DateTime<Utc>,
+    short_thresh_secs: u64,
+    ephemeral_min_distinct_ids: usize,
+    max_windows_per_app: usize,
+) -> Vec<AggregatedActivity> {
+    let mut app_map: HashMap<(u32, u64), AggregatedActivity> = HashMap::new();
+    let mut interner = WindowIdInterner::new();
 
     for record in records {
         if let Some(focus_info) = &record.focus_info {
-            let app_key = format!("{}_{}", focus_info.pid, focus_info.process_start_time);
-
-            let duration = if let Some(end_time) = record.end_time {
-                (end_time - record.start_time).num_seconds() as u64
-            } else {
-                0
-            };
+            let app_key = (focus_info.pid as u32, focus_info.process_start_time);
+            let rec_start = record.start_time.max(since);
+            let rec_end = record.end_time.unwrap_or(now);
+            if rec_end <= since {
+                continue;
+            }
+            let dur = (rec_end - rec_start).num_seconds();
+            if dur <= 0 {
+                continue;
+            }
+            let duration = dur as u64;
 
             let aggregated = app_map
-                .entry(app_key.clone())
+                .entry(app_key)
                 .or_insert_with(|| AggregatedActivity {
                     app_name: focus_info.app_name.clone(),
                     pid: focus_info.pid,
                     process_start_time: focus_info.process_start_time,
                     windows: HashMap::new(),
+                    ephemeral_groups: HashMap::new(),
                     total_duration_seconds: 0,
-                    first_seen: record.start_time,
-                    last_seen: record.start_time,
+                    first_seen: rec_start,
+                    last_seen: rec_end,
                 });
 
             aggregated.total_duration_seconds += duration;
-            aggregated.first_seen = aggregated.first_seen.min(record.start_time);
-            aggregated.last_seen = aggregated.last_seen.max(record.start_time);
+            aggregated.first_seen = aggregated.first_seen.min(rec_start);
+            aggregated.last_seen = aggregated.last_seen.max(rec_end);
 
             if !focus_info.window_title.is_empty() && !focus_info.window_id.is_empty() {
-                let window_activity = aggregated
-                    .windows
-                    .entry(focus_info.window_id.clone())
-                    .or_insert_with(|| WindowActivity {
-                        window_id: focus_info.window_id.clone(),
-                        window_title: focus_info.window_title.clone(),
-                        duration_seconds: 0,
-                        first_seen: record.start_time,
-                        last_seen: record.start_time,
-                        record_count: 0,
-                    });
+                let wid_id = interner.intern(&focus_info.window_id);
+                let window_activity =
+                    aggregated
+                        .windows
+                        .entry(wid_id)
+                        .or_insert_with(|| WindowActivity {
+                            window_id: focus_info.window_id.clone(),
+                            window_title: focus_info.window_title.clone(),
+                            duration_seconds: 0,
+                            first_seen: rec_start,
+                            last_seen: rec_end,
+                            record_count: 0,
+                        });
 
-                // Always update the window title to ensure UI shows the latest title
                 window_activity.window_title = focus_info.window_title.clone();
                 window_activity.duration_seconds += duration;
-                window_activity.first_seen = window_activity.first_seen.min(record.start_time);
-                window_activity.last_seen = window_activity.last_seen.max(record.start_time);
+                window_activity.first_seen = window_activity.first_seen.min(rec_start);
+                window_activity.last_seen = window_activity.last_seen.max(rec_end);
                 window_activity.record_count += 1;
+            }
+        }
+    }
+
+    // Build ephemeral groups (short-lived windows) per app for the since-window aggregation.
+    for agg in app_map.values_mut() {
+        // First pass: collect short-lived windows and stage groups without mutating lanes yet.
+        let mut staged: HashMap<String, EphemeralGroup> = HashMap::new();
+        let mut group_members: HashMap<String, Vec<u32>> = HashMap::new();
+
+        for (id, w) in agg.windows.iter() {
+            if w.duration_seconds < short_thresh_secs {
+                let title_key = normalize_title(&w.window_title);
+                let entry = staged
+                    .entry(title_key.clone())
+                    .or_insert_with(|| EphemeralGroup {
+                        title_key: title_key.clone(),
+                        distinct_ids: HashSet::new(),
+                        occurrence_count: 0,
+                        total_duration_seconds: 0,
+                        first_seen: w.first_seen,
+                        last_seen: w.last_seen,
+                    });
+                entry.distinct_ids.insert(*id);
+                entry.occurrence_count += 1;
+                entry.total_duration_seconds += w.duration_seconds;
+                entry.first_seen = entry.first_seen.min(w.first_seen);
+                entry.last_seen = entry.last_seen.max(w.last_seen);
+
+                group_members.entry(title_key).or_default().push(*id);
+            }
+        }
+
+        // Keep groups meeting the distinct-ID threshold and remove their members from the normal lane
+        for (title_key, group) in staged.into_iter() {
+            if group.distinct_ids.len() >= ephemeral_min_distinct_ids {
+                agg.ephemeral_groups.insert(title_key.clone(), group);
+                if let Some(members) = group_members.get(&title_key) {
+                    for id in members.iter() {
+                        agg.windows.remove(id);
+                    }
+                }
+            }
+        }
+
+        // LRU trim: keep most recent windows by last_seen
+        if max_windows_per_app > 0 && agg.windows.len() > max_windows_per_app {
+            let mut win_vec: Vec<(u32, WindowActivity)> =
+                agg.windows.iter().map(|(k, v)| (*k, v.clone())).collect();
+            win_vec.sort_by(|a, b| b.1.last_seen.cmp(&a.1.last_seen));
+            agg.windows.clear();
+            for (i, (k, v)) in win_vec.into_iter().enumerate() {
+                if i < max_windows_per_app {
+                    agg.windows.insert(k, v);
+                } else {
+                    break;
+                }
             }
         }
     }
@@ -430,4 +514,29 @@ pub fn aggregate_activities(records: &[ActivityRecord]) -> Vec<AggregatedActivit
     let mut apps: Vec<AggregatedActivity> = app_map.into_values().collect();
     apps.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
     apps
+}
+fn normalize_title(s: &str) -> String {
+    s.trim().to_lowercase()
+}
+
+struct WindowIdInterner {
+    map: HashMap<String, u32>,
+    next: u32,
+}
+impl WindowIdInterner {
+    fn new() -> Self {
+        Self {
+            map: HashMap::new(),
+            next: 1,
+        }
+    }
+    fn intern(&mut self, s: &str) -> u32 {
+        if let Some(&id) = self.map.get(s) {
+            return id;
+        }
+        let id = self.next;
+        self.map.insert(s.to_string(), id);
+        self.next = self.next.saturating_add(1);
+        id
+    }
 }

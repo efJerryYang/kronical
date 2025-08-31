@@ -1,13 +1,12 @@
-use crate::aggregation_manager::AggregationManager;
-use crate::compression::CompressionEngine;
-use crate::events::{KeyboardEventData, MouseEventData, MousePosition, RawEvent, WindowFocusInfo};
-use crate::focus_tracker::{FocusChangeCallback, FocusEventWrapper};
-use crate::records::{ActivityRecord, RecordProcessor};
-use crate::socket_server::SocketServer;
-use crate::storage_backend::StorageBackend;
+use crate::daemon::compression::CompressionEngine;
+use crate::daemon::events::{KeyboardEventData, MouseEventData, MousePosition, WindowFocusInfo};
+use crate::daemon::focus_tracker::{FocusChangeCallback, FocusEventWrapper};
+use crate::daemon::records::{aggregate_activities_since, ActivityRecord, RecordProcessor};
+use crate::daemon::socket_server::SocketServer;
+use crate::storage::StorageBackend;
 use anyhow::Result;
 use log::{debug, error, info, trace};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
 use uiohook_rs::{EventHandler, Uiohook, UiohookEvent};
@@ -31,7 +30,6 @@ impl ChronicleEventHandler {
         let callback = Arc::new(FocusCallback {
             sender: sender.clone(),
         });
-        // Enable polling with 2 second interval for title change detection
         let focus_wrapper = FocusEventWrapper::new(callback, Duration::from_secs(2));
 
         Self {
@@ -104,15 +102,36 @@ impl FocusChangeHandler for ChronicleEventHandler {
     }
 }
 
-pub struct EventCoordinator;
+pub struct EventCoordinator {
+    retention_minutes: u64,
+    ephemeral_max_duration_secs: u64,
+    ephemeral_min_distinct_ids: usize,
+    max_windows_per_app: usize,
+    ephemeral_app_max_duration_secs: u64,
+    ephemeral_app_min_distinct_procs: usize,
+}
 
 impl EventCoordinator {
-    pub fn new() -> Self {
-        Self
+    pub fn new(
+        retention_minutes: u64,
+        ephemeral_max_duration_secs: u64,
+        ephemeral_min_distinct_ids: usize,
+        max_windows_per_app: usize,
+        ephemeral_app_max_duration_secs: u64,
+        ephemeral_app_min_distinct_procs: usize,
+    ) -> Self {
+        Self {
+            retention_minutes,
+            ephemeral_max_duration_secs,
+            ephemeral_min_distinct_ids,
+            max_windows_per_app,
+            ephemeral_app_max_duration_secs,
+            ephemeral_app_min_distinct_procs,
+        }
     }
 
-    fn convert_chronicle_to_raw(event: ChronicleEvent) -> Result<crate::events::RawEvent> {
-        use crate::events::RawEvent;
+    fn convert_chronicle_to_raw(event: ChronicleEvent) -> Result<crate::daemon::events::RawEvent> {
+        use crate::daemon::events::RawEvent;
         use chrono::Utc;
 
         let now = Utc::now();
@@ -159,7 +178,11 @@ impl EventCoordinator {
         let (sender, receiver) = mpsc::channel();
 
         let socket_path = pid_file.parent().unwrap().join("chronicle.sock");
-        let socket_server = Arc::new(SocketServer::new(socket_path));
+        let socket_server = Arc::new(SocketServer::new(
+            socket_path,
+            self.ephemeral_app_max_duration_secs,
+            self.ephemeral_app_min_distinct_procs,
+        ));
 
         if let Err(e) = socket_server.start() {
             error!("Failed to start socket server: {}", e);
@@ -173,16 +196,81 @@ impl EventCoordinator {
             let mut store = data_store;
             let socket_server_clone = Arc::clone(&socket_server);
             let mut pending_raw_events = Vec::new();
-            let mut aggregation_manager = AggregationManager::new();
+            let mut recent_records: std::collections::VecDeque<ActivityRecord> =
+                std::collections::VecDeque::new();
+            let retention = chrono::Duration::minutes(self.retention_minutes as i64);
+            let eph_max = self.ephemeral_max_duration_secs;
+            let eph_min = self.ephemeral_min_distinct_ids;
+            let max_windows = self.max_windows_per_app;
 
             thread::spawn(move || {
                 info!("Background data processing thread started");
                 let mut event_count = 0;
+                let now0 = chrono::Utc::now();
+                let since0 = now0 - retention;
+                match store.fetch_records_since(since0) {
+                    Ok(mut recs) => {
+                        for r in recs.drain(..) {
+                            recent_records.push_back(r);
+                        }
+                        let records_vec: Vec<ActivityRecord> =
+                            recent_records.iter().cloned().collect();
+                        let agg = aggregate_activities_since(
+                            &records_vec,
+                            since0,
+                            now0,
+                            eph_max,
+                            eph_min,
+                            max_windows,
+                        );
+                        socket_server_clone.update_aggregated_data(agg);
+                        info!(
+                            "Hydrated {} records from DB since {}",
+                            recent_records.len(),
+                            since0
+                        );
+                    }
+                    Err(e) => error!("Failed to hydrate records from DB: {}", e),
+                }
 
                 loop {
                     match receiver.recv_timeout(Duration::from_millis(50)) {
                         Ok(ChronicleEvent::Shutdown) => {
-                            info!("Shutdown signal received, finalizing");
+                            info!(
+                                "Shutdown signal received, flushing pending events and finalizing"
+                            );
+                            if !pending_raw_events.is_empty() {
+                                let raw_events_to_process = std::mem::take(&mut pending_raw_events);
+                                let new_records =
+                                    record_processor.process_events(raw_events_to_process.clone());
+                                if !new_records.is_empty() {
+                                    let _ = store.add_records(new_records.clone());
+                                    for r in new_records {
+                                        recent_records.push_back(r);
+                                    }
+                                }
+                                let now = chrono::Utc::now();
+                                let since = now - retention;
+                                while let Some(front) = recent_records.front() {
+                                    let end = front.end_time.unwrap_or(now);
+                                    if end < since {
+                                        recent_records.pop_front();
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                let records_vec: Vec<ActivityRecord> =
+                                    recent_records.iter().cloned().collect();
+                                let agg = aggregate_activities_since(
+                                    &records_vec,
+                                    since,
+                                    now,
+                                    eph_max,
+                                    eph_min,
+                                    max_windows,
+                                );
+                                socket_server_clone.update_aggregated_data(agg);
+                            }
                             break;
                         }
                         Ok(event) => {
@@ -210,20 +298,12 @@ impl EventCoordinator {
                                     record_processor.process_events(raw_events_to_process.clone());
                                 if !new_records.is_empty() {
                                     info!("Generated {} new records", new_records.len());
-
-                                    // Update aggregation with new records
-                                    for record in &new_records {
-                                        aggregation_manager.update_with_record(record);
+                                    if let Err(e) = store.add_records(new_records.clone()) {
+                                        error!("Failed to store records: {}", e);
                                     }
 
-                                    if let Err(e) = store.add_records(new_records) {
-                                        error!("Failed to store records: {}", e);
-                                    } else {
-                                        debug!("Records stored successfully");
-                                        // Update socket server with aggregated data
-                                        socket_server_clone.update_aggregated_data(
-                                            aggregation_manager.get_aggregated_activities(),
-                                        );
+                                    for r in new_records.into_iter() {
+                                        recent_records.push_back(r);
                                     }
                                 }
 
@@ -244,6 +324,27 @@ impl EventCoordinator {
                                         error!("Failed to compress events: {}", e);
                                     }
                                 }
+                                let now = chrono::Utc::now();
+                                let since = now - retention;
+                                while let Some(front) = recent_records.front() {
+                                    let end = front.end_time.unwrap_or(now);
+                                    if end < since {
+                                        recent_records.pop_front();
+                                    } else {
+                                        break;
+                                    }
+                                }
+                                let records_vec: Vec<ActivityRecord> =
+                                    recent_records.iter().cloned().collect();
+                                let agg = aggregate_activities_since(
+                                    &records_vec,
+                                    since,
+                                    now,
+                                    eph_max,
+                                    eph_min,
+                                    max_windows,
+                                );
+                                socket_server_clone.update_aggregated_data(agg);
                             }
                         }
                         Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -252,45 +353,73 @@ impl EventCoordinator {
                         }
                     }
 
-                    // Check for timeouts
                     if let Some(timeout_record) = record_processor.check_timeouts() {
                         info!(
                             "Timeout detected, storing record: {:?}",
                             timeout_record.state
                         );
-
-                        // Update aggregation with timeout record
-                        aggregation_manager.update_with_record(&timeout_record);
-
                         if let Err(e) = store.add_records(vec![timeout_record.clone()]) {
                             error!("Failed to store timeout record: {}", e);
-                        } else {
-                            socket_server_clone.update_aggregated_data(
-                                aggregation_manager.get_aggregated_activities(),
-                            );
                         }
+
+                        recent_records.push_back(timeout_record);
+                        let now = chrono::Utc::now();
+                        let since = now - retention;
+                        while let Some(front) = recent_records.front() {
+                            let end = front.end_time.unwrap_or(now);
+                            if end < since {
+                                recent_records.pop_front();
+                            } else {
+                                break;
+                            }
+                        }
+                        let records_vec: Vec<ActivityRecord> =
+                            recent_records.iter().cloned().collect();
+                        let agg = aggregate_activities_since(
+                            &records_vec,
+                            since,
+                            now,
+                            eph_max,
+                            eph_min,
+                            max_windows,
+                        );
+                        socket_server_clone.update_aggregated_data(agg);
                     }
                 }
 
-                // Finalize
                 if let Some(final_record) = record_processor.finalize_all() {
                     info!("Storing final record: {:?}", final_record.state);
                     if let Err(e) = store.add_records(vec![final_record.clone()]) {
                         error!("Failed to store final record: {}", e);
-                    } else {
-                        // Update aggregation with final record
-                        aggregation_manager.update_with_record(&final_record);
-                        socket_server_clone.update_aggregated_data(
-                            aggregation_manager.get_aggregated_activities(),
-                        );
                     }
+
+                    recent_records.push_back(final_record);
+                    let now = chrono::Utc::now();
+                    let since = now - retention;
+                    while let Some(front) = recent_records.front() {
+                        let end = front.end_time.unwrap_or(now);
+                        if end < since {
+                            recent_records.pop_front();
+                        } else {
+                            break;
+                        }
+                    }
+                    let records_vec: Vec<ActivityRecord> = recent_records.iter().cloned().collect();
+                    let agg = aggregate_activities_since(
+                        &records_vec,
+                        since,
+                        now,
+                        eph_max,
+                        eph_min,
+                        max_windows,
+                    );
+                    socket_server_clone.update_aggregated_data(agg);
                 }
 
                 info!("Background thread completed");
             })
         };
 
-        // Setup signal handling
         let shutdown_sender = sender.clone();
         let pid_file_cleanup = pid_file.clone();
         ctrlc::set_handler(move || {
@@ -311,13 +440,11 @@ impl EventCoordinator {
             let _ = std::fs::remove_file(&pid_file_cleanup);
         })?;
 
-        // MAIN THREAD: Setup both hooks with shared event handler
         let handler = ChronicleEventHandler::new(sender);
 
         info!("Step M1: Setting up UIohook on main thread");
         let uiohook = Uiohook::new(handler.clone());
 
-        // Start UIohook (this sets up but may not block on macOS)
         if let Err(e) = uiohook.run() {
             error!("Step M1: UIohook failed: {}", e);
             return Err(e.into());
@@ -332,14 +459,12 @@ impl EventCoordinator {
             },
         );
 
-        // This will block the main thread with CFRunLoop
         info!("Step M2: Starting window hook (this will block main thread)");
         if let Err(e) = window_hook.run() {
             error!("Step M2: Window hook failed: {}", e);
         }
         info!("Step M2: Window hook completed");
 
-        // Cleanup
         info!("Step C: Cleaning up UIohook");
         if let Err(e) = uiohook.stop() {
             error!("Step C: Failed to stop UIohook: {}", e);
@@ -355,7 +480,6 @@ impl EventCoordinator {
     }
 }
 
-// Clone implementation for ChronicleEventHandler
 impl Clone for ChronicleEventHandler {
     fn clone(&self) -> Self {
         Self {

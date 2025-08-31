@@ -1,4 +1,4 @@
-use crate::socket_server::{ActivityApp, MonitorResponse};
+use crate::daemon::socket_server::{ActivityApp, MonitorResponse};
 use anyhow::{Context, Result};
 use ratatui::{
     prelude::*,
@@ -94,7 +94,7 @@ fn draw_daemon_stats(frame: &mut Frame, area: Rect, response: &MonitorResponse) 
 
     let pid_file = PathBuf::from(&response.data_directory).join("chronicle.pid");
     let pid = read_pid_file(&pid_file)
-        .unwrap_or_else(|_| None)
+        .unwrap_or(None)
         .map(|p| p.to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
@@ -135,6 +135,10 @@ fn draw_recent_activity(frame: &mut Frame, area: Rect, recent_apps: &[ActivityAp
         return;
     }
 
+    // Use ~80% of width to reduce crowding
+    let approx_width = ((area.width as f32) * 0.8) as usize;
+    let content_width = approx_width.max(20);
+
     let items: Vec<ListItem> = recent_apps
         .iter()
         .flat_map(|app| {
@@ -159,7 +163,6 @@ fn draw_recent_activity(frame: &mut Frame, area: Rect, recent_apps: &[ActivityAp
                     let window_duration_pretty = pretty_format_duration(window.duration_seconds);
                     let mut window_lines = Vec::new();
 
-                    // Window info line
                     window_lines.push(ListItem::new(Line::from(vec![
                         Span::raw("  └─ "),
                         Span::styled(
@@ -171,7 +174,11 @@ fn draw_recent_activity(frame: &mut Frame, area: Rect, recent_apps: &[ActivityAp
                         ),
                         Span::styled(
                             format!(
-                                "[{}]",
+                                "[{}, {}]",
+                                window
+                                    .first_seen
+                                    .with_timezone(&chrono::Local)
+                                    .format("%Y-%m-%d %H:%M:%S"),
                                 window
                                     .last_seen
                                     .with_timezone(&chrono::Local)
@@ -181,13 +188,26 @@ fn draw_recent_activity(frame: &mut Frame, area: Rect, recent_apps: &[ActivityAp
                         ),
                     ])));
 
-                    // Window title lines with wrapping
-                    let wrapped_title = wrap_text(&window.window_title, 60); // 60 chars max width
+                    // Wrapped window title with continuation marker
+                    let wrap_width_first = content_width.saturating_sub(8); // account for prefix
+                    let mut wrapped_title = wrap_text(&window.window_title, wrap_width_first);
+                    let is_wrapped = wrapped_title.len() > 1;
+                    if is_wrapped {
+                        if let Some(first) = wrapped_title.first_mut() {
+                            if first.len() < wrap_width_first {
+                                first.push_str(" …");
+                            }
+                        }
+                    }
                     for (i, line) in wrapped_title.iter().enumerate() {
-                        let prefix = if i == 0 { "      " } else { "        " };
+                        let (prefix, color) = if window.is_group {
+                            (if i == 0 { "      " } else { "      ↳ " }, Color::Magenta)
+                        } else {
+                            (if i == 0 { "      " } else { "      ↳ " }, Color::White)
+                        };
                         window_lines.push(ListItem::new(Line::from(vec![
                             Span::raw(prefix),
-                            Span::styled(line.clone(), Style::default().fg(Color::White)),
+                            Span::styled(line.clone(), Style::default().fg(color)),
                         ])));
                     }
 
@@ -196,7 +216,7 @@ fn draw_recent_activity(frame: &mut Frame, area: Rect, recent_apps: &[ActivityAp
                 .collect();
 
             app_items.extend(window_items);
-            app_items.push(ListItem::new(Line::from(" "))); // spacer
+            app_items.push(ListItem::new(Line::from(" ")));
             app_items
         })
         .collect();

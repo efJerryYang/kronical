@@ -6,6 +6,12 @@ use std::path::PathBuf;
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
     pub workspace_dir: PathBuf,
+    pub retention_minutes: u64,
+    pub ephemeral_max_duration_secs: u64,
+    pub ephemeral_min_distinct_ids: usize,
+    pub max_windows_per_app: usize,
+    pub ephemeral_app_max_duration_secs: u64,
+    pub ephemeral_app_min_distinct_procs: usize,
 }
 
 impl Default for AppConfig {
@@ -16,7 +22,15 @@ impl Default for AppConfig {
             panic!("Failed to determine home directory")
         };
 
-        Self { workspace_dir }
+        Self {
+            workspace_dir,
+            retention_minutes: 10,
+            ephemeral_max_duration_secs: 60,
+            ephemeral_min_distinct_ids: 3,
+            max_windows_per_app: 30,
+            ephemeral_app_max_duration_secs: 60,
+            ephemeral_app_min_distinct_procs: 3,
+        }
     }
 }
 
@@ -27,7 +41,13 @@ impl AppConfig {
 
         let mut builder = Config::builder()
             .set_default("workspace_dir", workspace_dir.to_str().unwrap())?
-            .set_default("polling_interval_seconds", 2)?;
+            .set_default("polling_interval_seconds", 2)?
+            .set_default("retention_minutes", 10)?
+            .set_default("ephemeral_max_duration_secs", 60)?
+            .set_default("ephemeral_min_distinct_ids", 3)?
+            .set_default("max_windows_per_app", 30)?
+            .set_default("ephemeral_app_max_duration_secs", 60)?
+            .set_default("ephemeral_app_min_distinct_procs", 3)?;
 
         // Load config file if it exists
         if config_path.exists() {
