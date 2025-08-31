@@ -1,6 +1,6 @@
 use crate::daemon::records::AggregatedActivity;
 use anyhow::Result;
-use log::{error, info};
+use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -97,7 +97,7 @@ impl SocketServer {
     pub fn update_aggregated_data(&self, aggregated_activities: Vec<AggregatedActivity>) {
         let mut aggregated = self.aggregated_activities.lock().unwrap();
         *aggregated = aggregated_activities;
-        info!(
+        debug!(
             "Updated socket server with {} aggregated activities",
             aggregated.len()
         );
@@ -182,7 +182,7 @@ fn handle_client(
     reader.read_line(&mut line)?;
     let command = line.trim();
 
-    info!("Received command: {}", command);
+    debug!("Received command: {}", command);
 
     match command {
         "status" => {
