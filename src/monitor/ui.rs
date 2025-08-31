@@ -94,7 +94,7 @@ fn draw_daemon_stats(frame: &mut Frame, area: Rect, response: &MonitorResponse) 
 
     let pid_file = PathBuf::from(&response.data_directory).join("chronicle.pid");
     let pid = read_pid_file(&pid_file)
-        .unwrap_or(None)
+        .unwrap_or_default()
         .map(|p| p.to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
