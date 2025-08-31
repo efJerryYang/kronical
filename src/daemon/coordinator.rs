@@ -28,11 +28,20 @@ pub struct ChronicleEventHandler {
 }
 
 impl ChronicleEventHandler {
-    fn new(sender: mpsc::Sender<ChronicleEvent>, caps: FocusCacheCaps) -> Self {
+    fn new(
+        sender: mpsc::Sender<ChronicleEvent>,
+        caps: FocusCacheCaps,
+        poll_handle: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    ) -> Self {
         let callback = Arc::new(FocusCallback {
             sender: sender.clone(),
         });
-        let focus_wrapper = FocusEventWrapper::new(callback, Duration::from_secs(2), caps);
+        let focus_wrapper = FocusEventWrapper::new(
+            callback,
+            Duration::from_secs(2),
+            caps,
+            std::sync::Arc::clone(&poll_handle),
+        );
 
         Self {
             sender,
@@ -106,6 +115,8 @@ impl FocusChangeHandler for ChronicleEventHandler {
 
 pub struct EventCoordinator {
     retention_minutes: u64,
+    active_grace_secs: u64,
+    idle_threshold_secs: u64,
     ephemeral_max_duration_secs: u64,
     ephemeral_min_distinct_ids: usize,
     max_windows_per_app: usize,
@@ -120,6 +131,8 @@ pub struct EventCoordinator {
 impl EventCoordinator {
     pub fn new(
         retention_minutes: u64,
+        active_grace_secs: u64,
+        idle_threshold_secs: u64,
         ephemeral_max_duration_secs: u64,
         ephemeral_min_distinct_ids: usize,
         max_windows_per_app: usize,
@@ -132,6 +145,8 @@ impl EventCoordinator {
     ) -> Self {
         Self {
             retention_minutes,
+            active_grace_secs,
+            idle_threshold_secs,
             ephemeral_max_duration_secs,
             ephemeral_min_distinct_ids,
             max_windows_per_app,
@@ -204,10 +219,12 @@ impl EventCoordinator {
             info!("Socket server started successfully");
         }
 
+        let poll_handle_arc = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(2000));
         let data_thread = {
             let mut compression_engine =
                 CompressionEngine::with_focus_cap(self.focus_interner_max_strings);
-            let mut record_processor = RecordProcessor::new();
+            let mut record_processor =
+                RecordProcessor::with_thresholds(self.active_grace_secs, self.idle_threshold_secs);
             let mut adapter = EventAdapter::new();
             let mut lock_deriver = LockDeriver::new();
             let mut store = data_store;
@@ -220,6 +237,7 @@ impl EventCoordinator {
             let eph_min = self.ephemeral_min_distinct_ids;
             let max_windows = self.max_windows_per_app;
 
+            let poll_handle_arc2 = std::sync::Arc::clone(&poll_handle_arc);
             thread::spawn(move || {
                 info!("Background data processing thread started");
                 let mut event_count = 0;
@@ -260,12 +278,9 @@ impl EventCoordinator {
                                 let raw_events_to_process = std::mem::take(&mut pending_raw_events);
                                 // Adapt to EventEnvelope + derive lock boundaries (scaffold for future pipeline)
                                 let envelopes = adapter.adapt_batch(&raw_events_to_process);
-                                let envelopes_with_lock = lock_deriver.derive(&envelopes);
-
-                                let envelopes = adapter.adapt_batch(&raw_events_to_process);
-                                let envelopes_with_lock = lock_deriver.derive(&envelopes);
+                                let _envelopes_with_lock = lock_deriver.derive(&envelopes);
                                 let new_records = record_processor
-                                    .process_events(raw_events_to_process.clone());
+                                    .process_envelopes(_envelopes_with_lock.clone());
                                 if !new_records.is_empty() {
                                     let _ = store.add_records(new_records.clone());
                                     for r in new_records {
@@ -293,6 +308,14 @@ impl EventCoordinator {
                                     max_windows,
                                 );
                                 socket_server_clone.update_aggregated_data(agg);
+                                // State-aware polling cadence
+                                let ms = match record_processor.current_state() {
+                                    crate::daemon::records::ActivityState::Active => 2000,
+                                    crate::daemon::records::ActivityState::Passive => 10000,
+                                    crate::daemon::records::ActivityState::Inactive => 20000,
+                                    crate::daemon::records::ActivityState::Locked => 30000,
+                                };
+                                poll_handle_arc2.store(ms, std::sync::atomic::Ordering::Relaxed);
                             }
                             break;
                         }
@@ -319,10 +342,14 @@ impl EventCoordinator {
 
                                 // Adapt to EventEnvelope + derive lock boundaries (scaffold for future pipeline)
                                 let envelopes = adapter.adapt_batch(&raw_events_to_process);
-                                let envelopes_with_lock = lock_deriver.derive(&envelopes);
+                                let _envelopes_with_lock = lock_deriver.derive(&envelopes);
 
+                                // Persist envelopes for replay diagnostics
+                                if let Err(e) = store.add_envelopes(_envelopes_with_lock.clone()) {
+                                    error!("Failed to store envelopes: {}", e);
+                                }
                                 let new_records = record_processor
-                                    .process_events(raw_events_to_process.clone());
+                                    .process_envelopes(_envelopes_with_lock.clone());
                                 if !new_records.is_empty() {
                                     info!("Generated {} new records", new_records.len());
                                     if let Err(e) = store.add_records(new_records.clone()) {
@@ -334,7 +361,9 @@ impl EventCoordinator {
                                     }
                                 }
 
-                                match compression_engine.compress_events(raw_events_to_process.clone()) {
+                                match compression_engine
+                                    .compress_events(raw_events_to_process.clone())
+                                {
                                     Ok((processed_events, compact_events)) => {
                                         debug!(
                                             "Compressed into {} compact events",
@@ -343,14 +372,24 @@ impl EventCoordinator {
 
                                         if !processed_events.is_empty() {
                                             // Suppress input events during Locked period using derived envelopes
-                                            use crate::daemon::event_model::{EventKind, SignalKind};
-                                            let mut suppress: std::collections::HashSet<u64> = std::collections::HashSet::new();
+                                            use crate::daemon::event_model::{
+                                                EventKind, SignalKind,
+                                            };
+                                            let mut suppress: std::collections::HashSet<u64> =
+                                                std::collections::HashSet::new();
                                             let mut locked = false;
-                                            for env in &envelopes_with_lock {
+                                            for env in &_envelopes_with_lock {
                                                 match &env.kind {
-                                                    EventKind::Signal(SignalKind::LockStart) => locked = true,
-                                                    EventKind::Signal(SignalKind::LockEnd) => locked = false,
-                                                    EventKind::Signal(SignalKind::KeyboardInput | SignalKind::MouseInput) if locked => {
+                                                    EventKind::Signal(SignalKind::LockStart) => {
+                                                        locked = true
+                                                    }
+                                                    EventKind::Signal(SignalKind::LockEnd) => {
+                                                        locked = false
+                                                    }
+                                                    EventKind::Signal(
+                                                        SignalKind::KeyboardInput
+                                                        | SignalKind::MouseInput,
+                                                    ) if locked => {
                                                         suppress.insert(env.id);
                                                     }
                                                     _ => {}
@@ -394,6 +433,14 @@ impl EventCoordinator {
                                     max_windows,
                                 );
                                 socket_server_clone.update_aggregated_data(agg);
+                                // State-aware polling cadence
+                                let ms = match record_processor.current_state() {
+                                    crate::daemon::records::ActivityState::Active => 2000,
+                                    crate::daemon::records::ActivityState::Passive => 10000,
+                                    crate::daemon::records::ActivityState::Inactive => 20000,
+                                    crate::daemon::records::ActivityState::Locked => 30000,
+                                };
+                                poll_handle_arc2.store(ms, std::sync::atomic::Ordering::Relaxed);
                             }
                         }
                         Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -433,6 +480,13 @@ impl EventCoordinator {
                             max_windows,
                         );
                         socket_server_clone.update_aggregated_data(agg);
+                        let ms = match record_processor.current_state() {
+                            crate::daemon::records::ActivityState::Active => 2000,
+                            crate::daemon::records::ActivityState::Passive => 10000,
+                            crate::daemon::records::ActivityState::Inactive => 20000,
+                            crate::daemon::records::ActivityState::Locked => 30000,
+                        };
+                        poll_handle_arc2.store(ms, std::sync::atomic::Ordering::Relaxed);
                     }
                 }
 
@@ -489,6 +543,7 @@ impl EventCoordinator {
             let _ = std::fs::remove_file(&pid_file_cleanup);
         })?;
 
+        // poll_handle_arc already created earlier; reuse it for the handler
         let handler = ChronicleEventHandler::new(
             sender,
             FocusCacheCaps {
@@ -496,6 +551,7 @@ impl EventCoordinator {
                 title_cache_capacity: self.title_cache_capacity,
                 title_cache_ttl_secs: self.title_cache_ttl_secs,
             },
+            std::sync::Arc::clone(&poll_handle_arc),
         );
 
         info!("Step M1: Setting up UIohook on main thread");

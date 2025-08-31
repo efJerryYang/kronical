@@ -29,6 +29,7 @@ impl<K: Eq + Hash + Clone, V: Clone> LruCache<K, V> {
     }
 
     pub fn len(&self) -> usize {
+        #[allow(dead_code)]
         self.map.len()
     }
 

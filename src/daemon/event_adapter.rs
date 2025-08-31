@@ -1,6 +1,8 @@
 use chrono::{DateTime, Utc};
 
-use crate::daemon::event_model::{EventEnvelope, EventKind, EventPayload, EventSource, HintKind, SignalKind};
+use crate::daemon::event_model::{
+    EventEnvelope, EventKind, EventPayload, EventSource, HintKind, SignalKind,
+};
 use crate::daemon::events::{RawEvent, WindowFocusInfo};
 
 pub struct EventAdapter {
@@ -16,7 +18,11 @@ impl EventAdapter {
         let mut out = Vec::with_capacity(raw.len());
         for e in raw.iter() {
             match e {
-                RawEvent::KeyboardInput { timestamp, event_id, data } => {
+                RawEvent::KeyboardInput {
+                    timestamp,
+                    event_id,
+                    data,
+                } => {
                     out.push(EventEnvelope {
                         id: *event_id,
                         timestamp: *timestamp,
@@ -28,7 +34,11 @@ impl EventAdapter {
                         sensitive: false,
                     });
                 }
-                RawEvent::MouseInput { timestamp, event_id, data } => {
+                RawEvent::MouseInput {
+                    timestamp,
+                    event_id,
+                    data,
+                } => {
                     out.push(EventEnvelope {
                         id: *event_id,
                         timestamp: *timestamp,
@@ -40,7 +50,11 @@ impl EventAdapter {
                         sensitive: false,
                     });
                 }
-                RawEvent::WindowFocusChange { timestamp, event_id, focus_info } => {
+                RawEvent::WindowFocusChange {
+                    timestamp,
+                    event_id,
+                    focus_info,
+                } => {
                     let now: DateTime<Utc> = *timestamp;
                     let current = focus_info.clone();
                     let mut emitted = false;
@@ -78,7 +92,10 @@ impl EventAdapter {
                                 timestamp: now,
                                 source: EventSource::Polling,
                                 kind: EventKind::Hint(HintKind::TitleChanged),
-                                payload: EventPayload::Title { window_id: current.window_id.clone(), title: current.window_title.clone() },
+                                payload: EventPayload::Title {
+                                    window_id: current.window_id.clone(),
+                                    title: current.window_title.clone(),
+                                },
                                 derived: false,
                                 polling: true,
                                 sensitive: false,
@@ -109,4 +126,3 @@ impl EventAdapter {
         out
     }
 }
-

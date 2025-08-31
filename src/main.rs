@@ -97,6 +97,8 @@ fn start_daemon(data_file: PathBuf, app_config: AppConfig) -> Result<()> {
 
     let coordinator = EventCoordinator::new(
         app_config.retention_minutes,
+        app_config.active_grace_secs,
+        app_config.idle_threshold_secs,
         app_config.ephemeral_max_duration_secs,
         app_config.ephemeral_min_distinct_ids,
         app_config.max_windows_per_app,

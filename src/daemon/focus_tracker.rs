@@ -3,7 +3,7 @@ use crate::util::lru::LruCache;
 use active_win_pos_rs::get_active_window;
 use chrono::{DateTime, Utc};
 use log::{error, info, warn};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -72,7 +72,7 @@ pub struct FocusEventWrapper {
     current_state: Arc<Mutex<FocusState>>,
     callback: Arc<dyn FocusChangeCallback + Send + Sync>,
     pid_cache: Arc<Mutex<LruCache<i32, u64>>>,
-    poll_interval: Duration,
+    poll_ms: Arc<AtomicU64>,
     should_stop_polling: Arc<AtomicBool>,
     last_titles: Arc<Mutex<LruCache<String, String>>>, // window_id -> last_title (LRU-capped)
 }
@@ -82,12 +82,16 @@ impl FocusEventWrapper {
         callback: Arc<dyn FocusChangeCallback + Send + Sync>,
         poll_interval: Duration,
         caps: FocusCacheCaps,
+        poll_handle: Arc<AtomicU64>,
     ) -> Self {
         let wrapper = Self {
             current_state: Arc::new(Mutex::new(FocusState::new())),
             callback,
             pid_cache: Arc::new(Mutex::new(LruCache::with_capacity(caps.pid_cache_capacity))),
-            poll_interval,
+            poll_ms: {
+                poll_handle.store(poll_interval.as_millis() as u64, Ordering::Relaxed);
+                poll_handle
+            },
             should_stop_polling: Arc::new(AtomicBool::new(false)),
             last_titles: Arc::new(Mutex::new(if caps.title_cache_ttl_secs > 0 {
                 LruCache::with_capacity_and_ttl(
@@ -252,19 +256,18 @@ impl FocusEventWrapper {
     }
 
     fn start_polling(&self) {
-        let poll_interval = self.poll_interval;
+        let poll_ms = Arc::clone(&self.poll_ms);
         let should_stop = Arc::clone(&self.should_stop_polling);
         let last_titles = Arc::clone(&self.last_titles);
         let focus_wrapper = self.clone();
 
         thread::spawn(move || {
-            info!(
-                "Starting window title polling with interval: {:?}",
-                poll_interval
-            );
+            info!("Starting window title polling with dynamic interval");
 
             while !should_stop.load(Ordering::Relaxed) {
-                thread::sleep(poll_interval);
+                let ms = poll_ms.load(Ordering::Relaxed);
+                let ms = if ms == 0 { 2000 } else { ms };
+                thread::sleep(Duration::from_millis(ms));
 
                 if should_stop.load(Ordering::Relaxed) {
                     break;
@@ -297,6 +300,8 @@ impl FocusEventWrapper {
             info!("Window title polling stopped");
         });
     }
+
+    // dynamic polling via self.poll_ms updated externally
 }
 
 impl Clone for FocusEventWrapper {
@@ -305,7 +310,7 @@ impl Clone for FocusEventWrapper {
             current_state: Arc::clone(&self.current_state),
             callback: Arc::clone(&self.callback),
             pid_cache: Arc::clone(&self.pid_cache),
-            poll_interval: self.poll_interval,
+            poll_ms: Arc::clone(&self.poll_ms),
             should_stop_polling: Arc::clone(&self.should_stop_polling),
             last_titles: Arc::clone(&self.last_titles),
         }

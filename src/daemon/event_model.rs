@@ -60,6 +60,7 @@ pub struct EventEnvelope {
     pub sensitive: bool,
 }
 
+#[allow(dead_code)]
 impl EventEnvelope {
     pub fn is_signal(&self) -> bool {
         matches!(self.kind, EventKind::Signal(_))
@@ -70,11 +71,13 @@ impl EventEnvelope {
 }
 
 // A producer provides events from some source (hook, poller, or derived)
+#[allow(dead_code)]
 pub trait EventProducer {
     fn poll(&mut self) -> Vec<EventEnvelope>;
 }
 
 // A deriver consumes upstream envelopes and may produce derived envelopes (e.g., LockStart/End)
+#[allow(dead_code)]
 pub trait EventDeriver {
     fn derive(&mut self, input: &[EventEnvelope]) -> Vec<EventEnvelope>;
 }
@@ -89,11 +92,13 @@ pub enum SplitReason {
 }
 
 // Decides whether an event should split the current record
+#[allow(dead_code)]
 pub trait SplitPolicy {
     fn split_reason(&self, event: &EventEnvelope) -> Option<SplitReason>;
 }
 
 pub struct DefaultSplitPolicy;
+#[allow(dead_code)]
 impl SplitPolicy for DefaultSplitPolicy {
     fn split_reason(&self, event: &EventEnvelope) -> Option<SplitReason> {
         match &event.kind {
@@ -113,6 +118,7 @@ pub struct StateTransition {
     pub to: ActivityState,
 }
 
+#[allow(dead_code)]
 pub trait StateEngine {
     fn current(&self) -> ActivityState;
     fn on_signal(&mut self, event: &EventEnvelope, now: DateTime<Utc>) -> Option<StateTransition>;
@@ -127,6 +133,7 @@ pub struct DefaultStateEngine {
     locked: bool,
 }
 
+#[allow(dead_code)]
 impl DefaultStateEngine {
     pub fn new(now: DateTime<Utc>, active_grace_secs: i64, idle_threshold_secs: i64) -> Self {
         Self {
@@ -154,7 +161,9 @@ impl DefaultStateEngine {
 }
 
 impl StateEngine for DefaultStateEngine {
-    fn current(&self) -> ActivityState { self.current }
+    fn current(&self) -> ActivityState {
+        self.current
+    }
 
     fn on_signal(&mut self, event: &EventEnvelope, now: DateTime<Utc>) -> Option<StateTransition> {
         match event.kind {
@@ -162,7 +171,10 @@ impl StateEngine for DefaultStateEngine {
                 self.locked = true;
                 let from = self.current;
                 self.current = ActivityState::Inactive; // we’ll map this to Locked in the record layer
-                return Some(StateTransition { from, to: self.current });
+                return Some(StateTransition {
+                    from,
+                    to: self.current,
+                });
             }
             EventKind::Signal(SignalKind::LockEnd) => {
                 self.locked = false;
@@ -187,7 +199,9 @@ impl StateEngine for DefaultStateEngine {
     }
 
     fn on_tick(&mut self, now: DateTime<Utc>) -> Option<StateTransition> {
-        if self.locked { return None; }
+        if self.locked {
+            return None;
+        }
         let from = self.current;
         let to = self.compute(now);
         if to != from {
@@ -198,4 +212,3 @@ impl StateEngine for DefaultStateEngine {
         }
     }
 }
-

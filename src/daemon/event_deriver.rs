@@ -5,7 +5,9 @@ pub struct LockDeriver {
 }
 
 impl LockDeriver {
-    pub fn new() -> Self { Self { locked: false } }
+    pub fn new() -> Self {
+        Self { locked: false }
+    }
 
     pub fn derive(&mut self, input: &[EventEnvelope]) -> Vec<EventEnvelope> {
         let mut out = Vec::with_capacity(input.len());
@@ -17,7 +19,9 @@ impl LockDeriver {
                         // Only derive lock boundaries around focus changes
                         // Determine app name via Focus payload if present
                         let is_login = match &e.payload {
-                            EventPayload::Focus(fi) => fi.app_name.eq_ignore_ascii_case("loginwindow"),
+                            EventPayload::Focus(fi) => {
+                                fi.app_name.eq_ignore_ascii_case("loginwindow")
+                            }
                             _ => false,
                         };
                         if is_login && !self.locked {
@@ -27,7 +31,9 @@ impl LockDeriver {
                                 timestamp: e.timestamp,
                                 source: EventSource::Derived,
                                 kind: EventKind::Signal(SignalKind::LockStart),
-                                payload: EventPayload::Lock { reason: "loginwindow".to_string() },
+                                payload: EventPayload::Lock {
+                                    reason: "loginwindow".to_string(),
+                                },
                                 derived: true,
                                 polling: false,
                                 sensitive: false,
@@ -41,7 +47,9 @@ impl LockDeriver {
                                 timestamp: e.timestamp,
                                 source: EventSource::Derived,
                                 kind: EventKind::Signal(SignalKind::LockEnd),
-                                payload: EventPayload::Lock { reason: "unlock".to_string() },
+                                payload: EventPayload::Lock {
+                                    reason: "unlock".to_string(),
+                                },
                                 derived: true,
                                 polling: false,
                                 sensitive: false,
@@ -62,4 +70,3 @@ impl LockDeriver {
         out
     }
 }
-

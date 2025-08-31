@@ -1,3 +1,6 @@
+use crate::daemon::event_model::{
+    EventEnvelope, EventKind, EventPayload, EventSource, HintKind, SignalKind,
+};
 use crate::daemon::events::RawEvent;
 use crate::daemon::records::ActivityRecord;
 use crate::storage::StorageBackend;
@@ -12,6 +15,7 @@ use std::thread;
 pub enum StorageCommand {
     RawEvent(RawEvent),
     Record(ActivityRecord),
+    Envelope(EventEnvelope),
     Shutdown,
 }
 
@@ -60,6 +64,18 @@ impl SqliteStorage {
                 data TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_raw_events_timestamp ON raw_events(timestamp);
+            CREATE TABLE IF NOT EXISTS raw_envelopes (
+                id INTEGER PRIMARY KEY,
+                event_id INTEGER,
+                timestamp TEXT NOT NULL,
+                source TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                payload TEXT,
+                derived INTEGER NOT NULL,
+                polling INTEGER NOT NULL,
+                sensitive INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_raw_envelopes_timestamp ON raw_envelopes(timestamp);
             CREATE TABLE IF NOT EXISTS activity_records (
                 id INTEGER PRIMARY KEY,
                 start_time TEXT NOT NULL,
@@ -96,6 +112,51 @@ impl SqliteStorage {
                         .as_ref()
                         .map(|fi| serde_json::to_string(fi).unwrap());
                     tx.execute("INSERT INTO activity_records (start_time, end_time, state, focus_info) VALUES (?, ?, ?, ?)", params![record.start_time.to_rfc3339(), record.end_time.map(|t| t.to_rfc3339()), format!("{:?}", record.state), focus_info_json])
+                }
+                StorageCommand::Envelope(env) => {
+                    let source = match env.source {
+                        EventSource::Hook => "hook",
+                        EventSource::Derived => "derived",
+                        EventSource::Polling => "polling",
+                    };
+                    let kind = match &env.kind {
+                        EventKind::Signal(sk) => match sk {
+                            SignalKind::KeyboardInput => "signal:keyboard",
+                            SignalKind::MouseInput => "signal:mouse",
+                            SignalKind::AppChanged => "signal:app_changed",
+                            SignalKind::WindowChanged => "signal:window_changed",
+                            SignalKind::LockStart => "signal:lock_start",
+                            SignalKind::LockEnd => "signal:lock_end",
+                        },
+                        EventKind::Hint(hk) => match hk {
+                            HintKind::TitleChanged => "hint:title_changed",
+                            HintKind::PositionChanged => "hint:position",
+                            HintKind::SizeChanged => "hint:size",
+                        },
+                    };
+                    let payload_json = match &env.payload {
+                        EventPayload::Keyboard(k) => serde_json::to_string(k).ok(),
+                        EventPayload::Mouse(m) => serde_json::to_string(m).ok(),
+                        EventPayload::Focus(f) => serde_json::to_string(f).ok(),
+                        EventPayload::Lock { reason } => serde_json::to_string(reason).ok(),
+                        EventPayload::Title { window_id, title } => {
+                            serde_json::to_string(&(window_id, title)).ok()
+                        }
+                        EventPayload::None => None,
+                    };
+                    tx.execute(
+                        "INSERT INTO raw_envelopes (event_id, timestamp, source, kind, payload, derived, polling, sensitive) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        params![
+                            env.id as i64,
+                            env.timestamp.to_rfc3339(),
+                            source,
+                            kind,
+                            payload_json,
+                            if env.derived { 1 } else { 0 },
+                            if env.polling { 1 } else { 0 },
+                            if env.sensitive { 1 } else { 0 },
+                        ],
+                    )
                 }
                 StorageCommand::Shutdown => break,
             };
@@ -139,6 +200,15 @@ impl StorageBackend for SqliteStorage {
         &mut self,
         _events: Vec<crate::daemon::compression::CompactEvent>,
     ) -> Result<()> {
+        Ok(())
+    }
+
+    fn add_envelopes(&mut self, events: Vec<EventEnvelope>) -> Result<()> {
+        for env in events {
+            self.sender
+                .send(StorageCommand::Envelope(env))
+                .context("Failed to send envelope to writer")?;
+        }
         Ok(())
     }
 

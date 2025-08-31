@@ -7,6 +7,8 @@ use std::path::PathBuf;
 pub struct AppConfig {
     pub workspace_dir: PathBuf,
     pub retention_minutes: u64,
+    pub active_grace_secs: u64,
+    pub idle_threshold_secs: u64,
     pub ephemeral_max_duration_secs: u64,
     pub ephemeral_min_distinct_ids: usize,
     pub max_windows_per_app: usize,
@@ -29,6 +31,8 @@ impl Default for AppConfig {
         Self {
             workspace_dir,
             retention_minutes: 10,
+            active_grace_secs: 30,
+            idle_threshold_secs: 300,
             ephemeral_max_duration_secs: 60,
             ephemeral_min_distinct_ids: 3,
             max_windows_per_app: 30,
@@ -51,6 +55,8 @@ impl AppConfig {
             .set_default("workspace_dir", workspace_dir.to_str().unwrap())?
             .set_default("polling_interval_seconds", 2)?
             .set_default("retention_minutes", 10)?
+            .set_default("active_grace_secs", 30)?
+            .set_default("idle_threshold_secs", 300)?
             .set_default("ephemeral_max_duration_secs", 60)?
             .set_default("ephemeral_min_distinct_ids", 3)?
             .set_default("max_windows_per_app", 30)?

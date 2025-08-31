@@ -1,4 +1,5 @@
-use crate::daemon::events::{RawEvent, WindowFocusInfo};
+use crate::daemon::event_model::{EventEnvelope, EventKind, EventPayload, HintKind, SignalKind};
+use crate::daemon::events::WindowFocusInfo;
 use crate::util::maps::{HashMap, HashSet};
 use chrono::{DateTime, Utc};
 use log::{debug, info};
@@ -63,6 +64,7 @@ pub struct RecordProcessor {
     last_keyboard_activity: Instant,
     active_timeout: Duration,
     passive_timeout: Duration,
+    idle_timeout: Duration,
     current_record: Option<ActivityRecord>,
     current_focus: Option<WindowFocusInfo>,
     next_record_id: u64,
@@ -77,65 +79,91 @@ impl RecordProcessor {
             last_keyboard_activity: now,
             active_timeout: Duration::from_secs(30),
             passive_timeout: Duration::from_secs(60),
+            idle_timeout: Duration::from_secs(300),
             current_record: None,
             current_focus: None,
             next_record_id: 1,
         }
     }
 
-    pub fn process_events(&mut self, events: Vec<RawEvent>) -> Vec<ActivityRecord> {
+    pub fn with_thresholds(active_grace_secs: u64, idle_threshold_secs: u64) -> Self {
+        let mut s = Self::new();
+        s.active_timeout = Duration::from_secs(active_grace_secs);
+        s.idle_timeout = Duration::from_secs(idle_threshold_secs);
+        // Passive threshold effectively becomes the idle threshold for transition to Inactive
+        s.passive_timeout = Duration::from_secs(idle_threshold_secs);
+        s
+    }
+
+    pub fn process_envelopes(&mut self, envelopes: Vec<EventEnvelope>) -> Vec<ActivityRecord> {
         let mut new_records = Vec::new();
 
-        // Check for periodic completion of long-running records (every 5 minutes)
+        // Periodic completion as before
         if let Some(ref record) = self.current_record {
             let record_duration = Utc::now().signed_duration_since(record.start_time);
             if record_duration > chrono::Duration::minutes(5) {
-                info!(
-                    "Auto-completing long-running record #{} after {} minutes",
-                    record.record_id,
-                    record_duration.num_minutes()
-                );
                 if let Some(completed) = self.force_complete_current_record() {
                     new_records.push(completed);
                 }
             }
         }
 
-        for event in events {
-            debug!(
-                "Processing event #{}: {} at {}",
-                event.event_id(),
-                event.event_type(),
-                event.timestamp()
-            );
-
-            let completed_record = match &event {
-                RawEvent::KeyboardInput { event_id, .. } => self.handle_keyboard_event(*event_id),
-                RawEvent::MouseInput { event_id, .. } => self.handle_mouse_event(*event_id),
-                RawEvent::WindowFocusChange {
-                    event_id,
-                    focus_info,
-                    ..
-                } => self.handle_focus_change(*event_id, focus_info.clone()),
+        for env in envelopes {
+            let completed_record = match env.kind {
+                EventKind::Signal(SignalKind::KeyboardInput) => self.handle_keyboard_event(env.id),
+                EventKind::Signal(SignalKind::MouseInput) => self.handle_mouse_event(env.id),
+                EventKind::Signal(SignalKind::AppChanged | SignalKind::WindowChanged) => {
+                    if let EventPayload::Focus(focus_info) = env.payload {
+                        self.handle_focus_change(env.id, focus_info)
+                    } else {
+                        None
+                    }
+                }
+                EventKind::Signal(SignalKind::LockStart | SignalKind::LockEnd) => {
+                    // Lock transitions are handled on focus events carrying loginwindow/non-loginwindow
+                    None
+                }
+                EventKind::Hint(HintKind::TitleChanged) => {
+                    if let EventPayload::Title { window_id, title } = env.payload {
+                        self.handle_title_hint(window_id, title)
+                    } else {
+                        None
+                    }
+                }
+                _ => None,
             };
 
             if let Some(record) = completed_record {
-                info!(
-                    "Record #{}: {} completed after {} events from {} to {}",
-                    record.record_id,
-                    format!("{:?}", record.state),
-                    record.event_count,
-                    record.start_time.format("%H:%M:%S%.3f"),
-                    record
-                        .end_time
-                        .map(|t| t.format("%H:%M:%S%.3f").to_string())
-                        .unwrap_or_else(|| "ongoing".to_string())
-                );
                 new_records.push(record);
             }
         }
 
         new_records
+    }
+
+    fn handle_title_hint(
+        &mut self,
+        window_id: String,
+        new_title: String,
+    ) -> Option<ActivityRecord> {
+        if let Some(current_focus) = &mut self.current_focus {
+            if current_focus.window_id == window_id {
+                // finalize current, update title, start new with same state without counting as activity
+                let completed = if let Some(cur) = self.current_record.take() {
+                    let mut c = cur;
+                    c.end_time = Some(Utc::now());
+                    Some(c)
+                } else {
+                    None
+                };
+                current_focus.window_title = new_title;
+                let state = self.current_state;
+                let focus_clone = Some(current_focus.clone());
+                self.start_new_record_with_state(focus_clone, state);
+                return completed;
+            }
+        }
+        None
     }
 
     fn force_complete_current_record(&mut self) -> Option<ActivityRecord> {
@@ -205,7 +233,7 @@ impl RecordProcessor {
                 );
                 Some(ActivityState::Passive)
             }
-            ActivityState::Passive if time_since_activity >= self.passive_timeout => {
+            ActivityState::Passive if time_since_activity >= self.idle_timeout => {
                 debug!(
                     "Timeout: Passive -> Inactive ({}s since activity)",
                     time_since_activity.as_secs()
@@ -299,9 +327,7 @@ impl RecordProcessor {
         self.last_activity = Instant::now();
 
         // Handle macOS lock based on loginwindow app name
-        let is_loginwindow = focus_info
-            .app_name
-            .eq_ignore_ascii_case("loginwindow");
+        let is_loginwindow = focus_info.app_name.eq_ignore_ascii_case("loginwindow");
 
         if is_loginwindow {
             // Entering Locked: finalize current and start Locked record with loginwindow focus
@@ -327,10 +353,7 @@ impl RecordProcessor {
             let completed_record = if let Some(current) = self.current_record.take() {
                 let mut completed = current;
                 completed.end_time = Some(Utc::now());
-                info!(
-                    "Exiting Locked, completed record #{}",
-                    completed.record_id
-                );
+                info!("Exiting Locked, completed record #{}", completed.record_id);
                 Some(completed)
             } else {
                 None
@@ -471,11 +494,7 @@ impl RecordProcessor {
         self.current_state
     }
 
-    pub fn current_record_info(&self) -> Option<(u64, ActivityState, DateTime<Utc>, u32)> {
-        self.current_record
-            .as_ref()
-            .map(|r| (r.record_id, r.state, r.start_time, r.event_count))
-    }
+    // current_record_info removed; use finalize/current_state instead
 }
 
 // Aggregate only the portion of records overlapping [since, now].
