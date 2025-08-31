@@ -230,6 +230,8 @@ impl EventCoordinator {
             let mut store = data_store;
             let socket_server_clone = Arc::clone(&socket_server);
             let mut pending_raw_events = Vec::new();
+            let mut state_hist: std::collections::VecDeque<char> =
+                std::collections::VecDeque::new();
             let mut recent_records: std::collections::VecDeque<ActivityRecord> =
                 std::collections::VecDeque::new();
             let retention = chrono::Duration::minutes(self.retention_minutes as i64);
@@ -352,6 +354,23 @@ impl EventCoordinator {
                                     .process_envelopes(_envelopes_with_lock.clone());
                                 if !new_records.is_empty() {
                                     info!("Generated {} new records", new_records.len());
+                                    // Update state history from new record states
+                                    for r in &new_records {
+                                        let ch = match r.state {
+                                            crate::daemon::records::ActivityState::Active => 'A',
+                                            crate::daemon::records::ActivityState::Passive => 'P',
+                                            crate::daemon::records::ActivityState::Inactive => 'I',
+                                            crate::daemon::records::ActivityState::Locked => 'L',
+                                        };
+                                        if state_hist.back().copied() != Some(ch) {
+                                            state_hist.push_back(ch);
+                                            if state_hist.len() > 10 {
+                                                state_hist.pop_front();
+                                            }
+                                        }
+                                    }
+                                    let hist_str: String = state_hist.iter().collect();
+                                    socket_server_clone.update_state_history(hist_str);
                                     if let Err(e) = store.add_records(new_records.clone()) {
                                         error!("Failed to store records: {}", e);
                                     }
@@ -459,6 +478,23 @@ impl EventCoordinator {
                         }
 
                         recent_records.push_back(timeout_record);
+                        // Update state history
+                        if let Some(last) = recent_records.back() {
+                            let ch = match last.state {
+                                crate::daemon::records::ActivityState::Active => 'A',
+                                crate::daemon::records::ActivityState::Passive => 'P',
+                                crate::daemon::records::ActivityState::Inactive => 'I',
+                                crate::daemon::records::ActivityState::Locked => 'L',
+                            };
+                            if state_hist.back().copied() != Some(ch) {
+                                state_hist.push_back(ch);
+                                if state_hist.len() > 10 {
+                                    state_hist.pop_front();
+                                }
+                                let hist_str: String = state_hist.iter().collect();
+                                socket_server_clone.update_state_history(hist_str);
+                            }
+                        }
                         let now = chrono::Utc::now();
                         let since = now - retention;
                         while let Some(front) = recent_records.front() {

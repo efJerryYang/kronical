@@ -5,7 +5,7 @@ use crate::daemon::socket_server::SocketServer;
 use crate::storage::StorageBackend;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use log::{error, info};
+use log::info;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::thread;
@@ -33,6 +33,7 @@ pub fn run_replay(
     let mut rp = RecordProcessor::with_thresholds(thresholds.0, thresholds.1);
     let mut recent_records: std::collections::VecDeque<ActivityRecord> =
         std::collections::VecDeque::new();
+    let mut state_hist: std::collections::VecDeque<char> = std::collections::VecDeque::new();
 
     info!(
         "Starting replay: {} envelopes from {} to {} at {}x",
@@ -63,6 +64,20 @@ pub fn run_replay(
             let derived = deriver.derive(&vec![env.clone()]);
             let new_records = rp.process_envelopes(derived);
             for r in new_records {
+                let ch = match r.state {
+                    crate::daemon::records::ActivityState::Active => 'A',
+                    crate::daemon::records::ActivityState::Passive => 'P',
+                    crate::daemon::records::ActivityState::Inactive => 'I',
+                    crate::daemon::records::ActivityState::Locked => 'L',
+                };
+                if state_hist.back().copied() != Some(ch) {
+                    state_hist.push_back(ch);
+                    if state_hist.len() > 10 {
+                        state_hist.pop_front();
+                    }
+                    let hist_str: String = state_hist.iter().collect();
+                    server.update_state_history(hist_str);
+                }
                 recent_records.push_back(r);
             }
         }

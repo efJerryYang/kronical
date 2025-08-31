@@ -61,6 +61,7 @@ pub struct MonitorResponse {
     pub data_file_size_mb: f64,
     pub data_directory: String,
     pub recent_apps: Vec<ActivityApp>,
+    pub state_history: String,
 }
 
 pub struct SocketServer {
@@ -70,6 +71,7 @@ pub struct SocketServer {
     notification_clients: Arc<Mutex<Vec<UnixStream>>>,
     app_short_max_duration_secs: u64,
     app_short_min_distinct: usize,
+    state_history: Arc<Mutex<String>>,
 }
 
 impl SocketServer {
@@ -86,6 +88,7 @@ impl SocketServer {
             notification_clients: Arc::new(Mutex::new(Vec::new())),
             app_short_max_duration_secs,
             app_short_min_distinct,
+            state_history: Arc::new(Mutex::new(String::new())),
         }
     }
 
@@ -101,6 +104,15 @@ impl SocketServer {
             "Updated socket server with {} aggregated activities",
             aggregated.len()
         );
+        self.notify_clients();
+    }
+
+    pub fn update_state_history(&self, history: String) {
+        let mut s = self.state_history.lock().unwrap();
+        *s = history.clone();
+        // Sidecar file to allow handle_client to read without self
+        let sidecar = self.socket_path.with_extension("state.txt");
+        let _ = std::fs::write(sidecar, &history);
         self.notify_clients();
     }
 
@@ -187,8 +199,17 @@ fn handle_client(
     match command {
         "status" => {
             let aggregated = aggregated_activities.lock().unwrap();
-            let response =
-                generate_status_response(&aggregated, socket_path, app_short_max, app_short_min)?;
+            let mut response = generate_status_response(
+                &aggregated,
+                socket_path.clone(),
+                app_short_max,
+                app_short_min,
+            )?;
+            // Inject state history from sidecar
+            let sidecar = socket_path.with_extension("state.txt");
+            if let Ok(s) = std::fs::read_to_string(&sidecar) {
+                response.state_history = s.trim().to_string();
+            }
             let json_response = serde_json::to_string(&response)?;
             writeln!(stream, "{}", json_response)?;
         }
@@ -209,12 +230,14 @@ fn generate_status_response(
     let data_dir = socket_path.parent().unwrap();
     let data_file_size_mb = get_data_file_size(data_dir);
     let recent_apps = build_app_tree(aggregated_activities, app_short_max, app_short_min);
+    let state_history = String::new();
 
     Ok(MonitorResponse {
         daemon_status: "running".to_string(),
         data_file_size_mb,
         data_directory: data_dir.to_string_lossy().to_string(),
         recent_apps,
+        state_history,
     })
 }
 
