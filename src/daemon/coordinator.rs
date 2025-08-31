@@ -12,6 +12,8 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
 use uiohook_rs::{EventHandler, Uiohook, UiohookEvent};
+#[cfg(target_os = "macos")]
+use winshift::ActiveWindowInfo;
 use winshift::{FocusChangeHandler, MonitoringMode, WindowFocusHook, WindowHookConfig};
 
 #[derive(Debug, Clone)]
@@ -36,11 +38,12 @@ impl ChronicleEventHandler {
         let callback = Arc::new(FocusCallback {
             sender: sender.clone(),
         });
+        let initial_ms = poll_handle.load(std::sync::atomic::Ordering::Relaxed);
         let focus_wrapper = FocusEventWrapper::new(
             callback,
-            Duration::from_secs(2),
+            Duration::from_millis(initial_ms),
             caps,
-            std::sync::Arc::clone(&poll_handle),
+            poll_handle,
         );
 
         Self {
@@ -110,6 +113,21 @@ impl FocusChangeHandler for ChronicleEventHandler {
     fn on_window_change(&self, window_title: String) {
         debug!("Window changed: {}", window_title);
         self.focus_wrapper.handle_window_change(window_title);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn on_app_change_info(&self, info: ActiveWindowInfo) {
+        debug!(
+            "App+Info: {} pid={} wid={}",
+            info.app_name, info.process_id, info.window_id
+        );
+        self.focus_wrapper.handle_app_change_info(info);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn on_window_change_info(&self, info: ActiveWindowInfo) {
+        debug!("Win+Info: '{}' wid={}", info.title, info.window_id);
+        self.focus_wrapper.handle_window_change_info(info);
     }
 }
 
@@ -604,6 +622,7 @@ impl EventCoordinator {
             handler,
             WindowHookConfig {
                 monitoring_mode: MonitoringMode::Combined,
+                embed_active_info: true,
             },
         );
 
