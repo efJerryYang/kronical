@@ -1,28 +1,22 @@
-mod aggregation_manager;
-mod compression;
-mod config;
-mod coordinator;
-mod events;
-mod focus_tracker;
-mod monitor_ui;
-mod records;
-mod simple_sqlite_storage;
-mod socket_server;
+mod daemon;
+mod monitor;
 mod storage;
-mod storage_backend;
+mod util;
 
-use crate::config::AppConfig;
-use crate::simple_sqlite_storage::SimpleSqliteStorage;
-use crate::storage_backend::StorageBackend;
+use crate::daemon::coordinator::EventCoordinator;
+use crate::daemon::socket_server;
+use crate::monitor::ui as monitor_ui;
+use crate::storage::sqlite3::SqliteStorage;
+use crate::storage::StorageBackend;
+use crate::util::config::AppConfig;
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
-use coordinator::EventCoordinator;
 use crossterm::{
     event::{self as crossterm_event, DisableMouseCapture},
     execute,
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
-use log::{debug, error, info, trace, warn};
+use log::{error, info};
 use ratatui::prelude::Backend;
 use ratatui::prelude::CrosstermBackend;
 use ratatui::widgets::Block;
@@ -78,7 +72,7 @@ fn ensure_workspace_dir(workspace_dir: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn start_daemon(data_file: PathBuf) -> Result<()> {
+fn start_daemon(data_file: PathBuf, app_config: AppConfig) -> Result<()> {
     let pid_file = data_file.parent().unwrap().join("chronicle.pid");
 
     if let Some(existing_pid) = read_pid_file(&pid_file)? {
@@ -98,11 +92,17 @@ fn start_daemon(data_file: PathBuf) -> Result<()> {
     info!("Data file: {:?}", data_file);
     info!("PID file: {:?}", pid_file);
 
-    let data_store: Box<dyn StorageBackend> = Box::new(
-        SimpleSqliteStorage::new(&data_file).context("Failed to initialize SQLite data store")?,
-    );
+    let data_store: Box<dyn StorageBackend> =
+        Box::new(SqliteStorage::new(&data_file).context("Failed to initialize SQLite data store")?);
 
-    let coordinator = EventCoordinator::new();
+    let coordinator = EventCoordinator::new(
+        app_config.retention_minutes,
+        app_config.ephemeral_max_duration_secs,
+        app_config.ephemeral_min_distinct_ids,
+        app_config.max_windows_per_app,
+        app_config.ephemeral_app_max_duration_secs,
+        app_config.ephemeral_app_min_distinct_procs,
+    );
 
     info!("Chronicle will run on MAIN THREAD (required by macOS hooks)");
     let result = coordinator.start_main_thread(data_store, pid_file.clone());
@@ -207,17 +207,14 @@ fn stop_daemon(data_file: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn restart_daemon(data_file: PathBuf) -> Result<()> {
+fn restart_daemon(data_file: PathBuf, app_config: AppConfig) -> Result<()> {
     println!("Restarting Chronicle daemon...");
 
-    // Note: stop_daemon has handled the waiting, we don't need to wait again
-    // and we should not encounter any Err in such case, if any, unexpected
-    // behavior we'd better yield.
     if let Err(e) = stop_daemon(data_file.clone()) {
         panic!("Unexpected error when stopping daemon: {}", e);
     }
 
-    start_daemon(data_file)
+    start_daemon(data_file, app_config)
 }
 
 fn monitor_realtime(data_file: PathBuf) -> Result<()> {
@@ -227,7 +224,6 @@ fn monitor_realtime(data_file: PathBuf) -> Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut terminal = Terminal::new(backend)?;
 
-    // It's important to disable mouse capture to allow text selection in the terminal.
     execute!(terminal.backend_mut(), DisableMouseCapture)?;
 
     let res = run_monitor_loop(&mut terminal, data_file);
@@ -253,7 +249,6 @@ fn run_monitor_loop<B: Backend>(terminal: &mut Terminal<B>, data_file: PathBuf) 
     loop {
         let mut notify_stream;
 
-        // Connection loop
         loop {
             match UnixStream::connect(&notification_socket_path) {
                 Ok(stream) => {
@@ -285,20 +280,15 @@ fn run_monitor_loop<B: Backend>(terminal: &mut Terminal<B>, data_file: PathBuf) 
             }
         }
 
-        // Monitoring loop
         let mut notify_buf = [0u8; 1];
         'monitor: loop {
             match query_daemon_via_socket(&data_file) {
                 Ok(response) => {
                     terminal.draw(|f| monitor_ui::ui(f, &response))?;
                 }
-                Err(_) => {
-                    // Failed to query, daemon might have stopped. Break to reconnect.
-                    break 'monitor;
-                }
+                Err(_) => break 'monitor,
             }
 
-            // Event handling loop
             loop {
                 if crossterm_event::poll(Duration::from_millis(100))? {
                     if let crossterm_event::Event::Key(key) = crossterm_event::read()? {
@@ -310,27 +300,20 @@ fn run_monitor_loop<B: Backend>(terminal: &mut Terminal<B>, data_file: PathBuf) 
 
                 match notify_stream.read(&mut notify_buf) {
                     Ok(0) => {
-                        // 0 bytes read means EOF, socket closed
                         break 'monitor;
                     }
-                    Ok(_) => {
-                        // Notification received, break to redraw
-                        break;
-                    }
-                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
-                        // No notification, continue waiting
-                    }
-                    Err(_) => {
-                        // Any other error, assume disconnection
-                        break 'monitor;
-                    }
+                    Ok(_) => break,
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {}
+                    Err(_) => break 'monitor,
                 }
             }
         }
     }
 }
 
-fn query_daemon_via_socket(data_file: &PathBuf) -> Result<socket_server::MonitorResponse> {
+use std::path::Path;
+
+fn query_daemon_via_socket(data_file: &Path) -> Result<socket_server::MonitorResponse> {
     let socket_path = data_file.parent().unwrap().join("chronicle.sock");
 
     let mut stream = UnixStream::connect(socket_path)?;
@@ -379,7 +362,6 @@ fn main() {
     let cli = Cli::parse();
     setup_logging(cli.verbose);
 
-    // Load configuration
     let config = match AppConfig::load() {
         Ok(config) => config,
         Err(e) => {
@@ -388,7 +370,6 @@ fn main() {
         }
     };
 
-    // Ensure workspace directory exists
     if let Err(e) = ensure_workspace_dir(&config.workspace_dir) {
         error!("Failed to create workspace directory: {}", e);
         process::exit(1);
@@ -397,9 +378,9 @@ fn main() {
     let data_file = config.workspace_dir.join("data.db");
 
     let result = match cli.command {
-        Commands::Start => start_daemon(data_file),
+        Commands::Start => start_daemon(data_file, config.clone()),
         Commands::Stop => stop_daemon(data_file),
-        Commands::Restart => restart_daemon(data_file),
+        Commands::Restart => restart_daemon(data_file, config.clone()),
         Commands::Status => get_status(data_file),
         Commands::Monitor => monitor_realtime(data_file),
     };
