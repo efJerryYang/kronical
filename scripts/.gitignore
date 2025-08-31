@@ -1,0 +1,9 @@
+pyproject.toml
+uv.lock
+.venv/
+
+pidio
+
+*.log
+.python-version
+
