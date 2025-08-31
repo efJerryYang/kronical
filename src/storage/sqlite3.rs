@@ -1,7 +1,8 @@
-use crate::events::RawEvent;
-use crate::records::ActivityRecord;
-use crate::storage_backend::StorageBackend;
+use crate::daemon::events::RawEvent;
+use crate::daemon::records::ActivityRecord;
+use crate::storage::StorageBackend;
 use anyhow::{Context, Result};
+use chrono::{DateTime, Utc};
 use rusqlite::{params, Connection};
 use serde_json;
 use std::path::{Path, PathBuf};
@@ -14,13 +15,13 @@ pub enum StorageCommand {
     Shutdown,
 }
 
-pub struct SimpleSqliteStorage {
+pub struct SqliteStorage {
     db_path: PathBuf,
     sender: mpsc::Sender<StorageCommand>,
     writer_thread: Option<thread::JoinHandle<()>>,
 }
 
-impl SimpleSqliteStorage {
+impl SqliteStorage {
     pub fn new<P: AsRef<Path>>(db_path: P) -> Result<Self> {
         let db_path = db_path.as_ref().to_path_buf();
 
@@ -115,7 +116,7 @@ impl SimpleSqliteStorage {
     }
 }
 
-impl StorageBackend for SimpleSqliteStorage {
+impl StorageBackend for SqliteStorage {
     fn add_events(&mut self, events: Vec<RawEvent>) -> Result<()> {
         for event in events {
             self.sender
@@ -134,12 +135,76 @@ impl StorageBackend for SimpleSqliteStorage {
         Ok(())
     }
 
-    fn add_compact_events(&mut self, _events: Vec<crate::compression::CompactEvent>) -> Result<()> {
+    fn add_compact_events(
+        &mut self,
+        _events: Vec<crate::daemon::compression::CompactEvent>,
+    ) -> Result<()> {
         Ok(())
+    }
+
+    fn fetch_records_since(&mut self, since: DateTime<Utc>) -> Result<Vec<ActivityRecord>> {
+        let conn = Connection::open(&self.db_path)?;
+        // Include records that have not ended or ended after 'since'.
+        let mut stmt = conn.prepare(
+            "SELECT id, start_time, end_time, state, focus_info
+             FROM activity_records
+             WHERE (end_time IS NULL OR end_time >= ?1)
+             ORDER BY start_time ASC",
+        )?;
+
+        let mut rows = stmt.query([since.to_rfc3339()])?;
+        let mut out: Vec<ActivityRecord> = Vec::new();
+
+        while let Some(row) = rows.next()? {
+            let id: i64 = row.get(0)?;
+            let start_s: String = row.get(1)?;
+            let end_s: Option<String> = row.get(2)?;
+            let state_s: String = row.get(3)?;
+            let focus_json: Option<String> = row.get(4)?;
+
+            let start_time = DateTime::parse_from_rfc3339(&start_s)
+                .map(|dt| dt.with_timezone(&Utc))
+                .context("Invalid start_time in DB")?;
+            let end_time = match end_s {
+                Some(s) => Some(
+                    DateTime::parse_from_rfc3339(&s)
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .context("Invalid end_time in DB")?,
+                ),
+                None => None,
+            };
+
+            let state = match state_s.as_str() {
+                "Active" => crate::daemon::records::ActivityState::Active,
+                "Passive" => crate::daemon::records::ActivityState::Passive,
+                "Inactive" => crate::daemon::records::ActivityState::Inactive,
+                other => {
+                    eprintln!("Unknown state in DB: {}", other);
+                    crate::daemon::records::ActivityState::Inactive
+                }
+            };
+
+            let focus_info = match focus_json {
+                Some(js) => serde_json::from_str(&js).ok(),
+                None => None,
+            };
+
+            out.push(ActivityRecord {
+                record_id: id as u64,
+                start_time,
+                end_time,
+                state,
+                focus_info,
+                event_count: 0,
+                triggering_events: Vec::new(),
+            });
+        }
+
+        Ok(out)
     }
 }
 
-impl Drop for SimpleSqliteStorage {
+impl Drop for SqliteStorage {
     fn drop(&mut self) {
         let _ = self.sender.send(StorageCommand::Shutdown);
         if let Some(thread) = self.writer_thread.take() {

@@ -30,6 +30,7 @@ pub struct WindowFocusInfo {
     pub app_name: String,
     pub window_title: String,
     pub window_id: String,
+    pub window_instance_start: DateTime<Utc>,
     pub window_position: Option<MousePosition>,
     pub window_size: Option<(u32, u32)>,
 }

@@ -1,10 +1,41 @@
-use crate::socket_server::{ActivityApp, MonitorResponse};
+use crate::daemon::socket_server::{ActivityApp, MonitorResponse};
 use anyhow::{Context, Result};
 use ratatui::{
     prelude::*,
     widgets::{Block, Borders, List, ListItem, Paragraph, Wrap},
 };
 use std::path::PathBuf;
+
+fn wrap_text(text: &str, max_width: usize) -> Vec<String> {
+    let mut result = Vec::new();
+    let mut current_line = String::new();
+    let mut current_width = 0;
+
+    for word in text.split_whitespace() {
+        let word_len = word.chars().count();
+
+        if current_width + word_len + if current_width > 0 { 1 } else { 0 } > max_width {
+            if !current_line.is_empty() {
+                result.push(current_line);
+            }
+            current_line = word.to_string();
+            current_width = word_len;
+        } else {
+            if current_width > 0 {
+                current_line.push(' ');
+                current_width += 1;
+            }
+            current_line.push_str(word);
+            current_width += word_len;
+        }
+    }
+
+    if !current_line.is_empty() {
+        result.push(current_line);
+    }
+
+    result
+}
 
 fn pretty_format_duration(seconds: u64) -> String {
     if seconds == 0 {
@@ -63,7 +94,7 @@ fn draw_daemon_stats(frame: &mut Frame, area: Rect, response: &MonitorResponse) 
 
     let pid_file = PathBuf::from(&response.data_directory).join("chronicle.pid");
     let pid = read_pid_file(&pid_file)
-        .unwrap_or_else(|_| None)
+        .unwrap_or_default()
         .map(|p| p.to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
@@ -104,6 +135,10 @@ fn draw_recent_activity(frame: &mut Frame, area: Rect, recent_apps: &[ActivityAp
         return;
     }
 
+    // Use ~80% of width to reduce crowding
+    let approx_width = ((area.width as f32) * 0.8) as usize;
+    let content_width = approx_width.max(20);
+
     let items: Vec<ListItem> = recent_apps
         .iter()
         .flat_map(|app| {
@@ -126,34 +161,62 @@ fn draw_recent_activity(frame: &mut Frame, area: Rect, recent_apps: &[ActivityAp
                 .iter()
                 .flat_map(|window| {
                     let window_duration_pretty = pretty_format_duration(window.duration_seconds);
-                    vec![
-                        ListItem::new(Line::from(vec![
-                            Span::raw("  └─ "),
-                            Span::styled(
-                                format!(
-                                    "[wid: {}, duration: {}] ",
-                                    window.window_id, window_duration_pretty
-                                ),
-                                Style::default().fg(Color::Yellow),
+                    let mut window_lines = Vec::new();
+
+                    window_lines.push(ListItem::new(Line::from(vec![
+                        Span::raw("  └─ "),
+                        Span::styled(
+                            format!(
+                                "[wid: {}, duration: {}] ",
+                                window.window_id, window_duration_pretty
                             ),
-                            Span::styled(
-                                format!("{}", window.last_active),
-                                Style::default().fg(Color::DarkGray),
+                            Style::default().fg(Color::Yellow),
+                        ),
+                        Span::styled(
+                            format!(
+                                "[{}, {}]",
+                                window
+                                    .first_seen
+                                    .with_timezone(&chrono::Local)
+                                    .format("%Y-%m-%d %H:%M:%S"),
+                                window
+                                    .last_seen
+                                    .with_timezone(&chrono::Local)
+                                    .format("%Y-%m-%d %H:%M:%S")
                             ),
-                        ])),
-                        ListItem::new(Line::from(vec![
-                            Span::raw("      "),
-                            Span::styled(
-                                window.window_title.clone(),
-                                Style::default().fg(Color::White),
-                            ),
-                        ])),
-                    ]
+                            Style::default().fg(Color::DarkGray),
+                        ),
+                    ])));
+
+                    // Wrapped window title with continuation marker
+                    let wrap_width_first = content_width.saturating_sub(8); // account for prefix
+                    let mut wrapped_title = wrap_text(&window.window_title, wrap_width_first);
+                    let is_wrapped = wrapped_title.len() > 1;
+                    if is_wrapped {
+                        if let Some(first) = wrapped_title.first_mut() {
+                            if first.len() < wrap_width_first {
+                                first.push_str(" …");
+                            }
+                        }
+                    }
+                    for (i, line) in wrapped_title.iter().enumerate() {
+                        let (prefix, color) = if window.is_group {
+                            (if i == 0 { "      " } else { "      ↳ " }, Color::Magenta)
+                        } else {
+                            (if i == 0 { "      " } else { "      ↳ " }, Color::White)
+                        };
+                        window_lines.push(ListItem::new(Line::from(vec![
+                            Span::raw(prefix),
+                            Span::styled(line.clone(), Style::default().fg(color)),
+                        ])));
+                    }
+
+                    window_lines
                 })
                 .collect();
 
             app_items.extend(window_items);
-            app_items.push(ListItem::new(Line::from(" "))); // spacer
+            app_items.push(ListItem::new(Line::from(" ")));
             app_items
         })
         .collect();
