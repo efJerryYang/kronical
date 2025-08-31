@@ -2,7 +2,7 @@ use crate::daemon::events::WindowFocusInfo;
 use crate::util::lru::LruCache;
 use active_win_pos_rs::get_active_window;
 use chrono::{DateTime, Utc};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -262,7 +262,7 @@ impl FocusEventWrapper {
         let focus_wrapper = self.clone();
 
         thread::spawn(move || {
-            info!("Starting window title polling with dynamic interval");
+            debug!("Starting window title polling with dynamic interval");
 
             while !should_stop.load(Ordering::Relaxed) {
                 let ms = poll_ms.load(Ordering::Relaxed);
@@ -281,7 +281,7 @@ impl FocusEventWrapper {
                         let mut titles = last_titles.lock().unwrap();
                         if let Some(last_title) = titles.get_cloned(&window_id) {
                             if last_title != current_title {
-                                info!(
+                                debug!(
                                     "Polling detected title change for window {}: '{}' -> '{}'",
                                     window_id, last_title, current_title
                                 );
@@ -297,7 +297,7 @@ impl FocusEventWrapper {
                 }
             }
 
-            info!("Window title polling stopped");
+            debug!("Window title polling stopped");
         });
     }
 

@@ -6,4 +6,5 @@ pub mod event_model;
 pub mod events;
 pub mod focus_tracker;
 pub mod records;
+pub mod replay;
 pub mod socket_server;

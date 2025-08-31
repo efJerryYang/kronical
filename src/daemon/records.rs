@@ -188,7 +188,7 @@ impl RecordProcessor {
             triggering_events: Vec::new(),
         });
         self.next_record_id += 1;
-        info!(
+        debug!(
             "Started new record #{}",
             self.current_record.as_ref().unwrap().record_id
         );
@@ -211,9 +211,9 @@ impl RecordProcessor {
         });
         self.next_record_id += 1;
         info!(
-            "Started new record #{} with state {:?}",
-            self.current_record.as_ref().unwrap().record_id,
-            state
+            "State -> {:?} (record #{})",
+            state,
+            self.current_record.as_ref().unwrap().record_id
         );
     }
 
@@ -335,8 +335,8 @@ impl RecordProcessor {
                 let mut completed = current;
                 completed.end_time = Some(Utc::now());
                 info!(
-                    "Entering Locked, completed record #{}: {:?} with {} events",
-                    completed.record_id, completed.state, completed.event_count
+                    "State -> Locked (completed #{}, was {:?})",
+                    completed.record_id, completed.state
                 );
                 Some(completed)
             } else {
@@ -353,7 +353,10 @@ impl RecordProcessor {
             let completed_record = if let Some(current) = self.current_record.take() {
                 let mut completed = current;
                 completed.end_time = Some(Utc::now());
-                info!("Exiting Locked, completed record #{}", completed.record_id);
+                info!(
+                    "State Locked -> Active (completed #{})",
+                    completed.record_id
+                );
                 Some(completed)
             } else {
                 None
@@ -371,8 +374,8 @@ impl RecordProcessor {
             let completed_record = if let Some(current) = self.current_record.take() {
                 let mut completed = current;
                 completed.end_time = Some(Utc::now());
-                info!(
-                    "Title change completed record #{}: {:?} with {} events",
+                debug!(
+                    "Title change completed record #{}: {:?} ({} events)",
                     completed.record_id, completed.state, completed.event_count
                 );
                 Some(completed)
@@ -443,12 +446,7 @@ impl RecordProcessor {
             triggering_events,
         });
 
-        debug!(
-            "Record #{}: Started {:?} state at {}",
-            self.next_record_id,
-            new_state,
-            now_utc.format("%H:%M:%S%.3f")
-        );
+        info!("State -> {:?} (record #{})", new_state, self.next_record_id);
 
         self.next_record_id += 1;
         completed_record
@@ -481,8 +479,9 @@ impl RecordProcessor {
 
     pub fn finalize_all(&mut self) -> Option<ActivityRecord> {
         let final_record = self.finalize_current_record(Utc::now());
+        // only debug on finalize to keep INFO quiet
         if let Some(ref record) = final_record {
-            info!(
+            debug!(
                 "Final record #{}: {:?} finalized",
                 record.record_id, record.state
             );

@@ -1,4 +1,5 @@
 use crate::daemon::compression::CompactEvent;
+// EventEnvelope already imported above
 use crate::daemon::event_model::EventEnvelope;
 use crate::daemon::events::RawEvent;
 use crate::daemon::records::ActivityRecord;
@@ -11,6 +12,11 @@ pub trait StorageBackend: Send + Sync {
     fn add_envelopes(&mut self, events: Vec<EventEnvelope>) -> Result<()>;
     fn add_records(&mut self, records: Vec<ActivityRecord>) -> Result<()>;
     fn fetch_records_since(&mut self, since: DateTime<Utc>) -> Result<Vec<ActivityRecord>>;
+    fn fetch_envelopes_between(
+        &mut self,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> Result<Vec<EventEnvelope>>;
 }
 
 pub mod sqlite3;

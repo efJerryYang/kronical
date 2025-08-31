@@ -4,6 +4,7 @@ mod storage;
 mod util;
 
 use crate::daemon::coordinator::EventCoordinator;
+use crate::daemon::replay;
 use crate::daemon::socket_server;
 use crate::monitor::ui as monitor_ui;
 use crate::storage::sqlite3::SqliteStorage;
@@ -50,6 +51,13 @@ enum Commands {
     Restart,
     Status,
     Monitor,
+    Replay {
+        #[arg(long, default_value_t = 60.0)]
+        speed: f64,
+        #[arg(long)]
+        minutes: Option<u64>,
+    },
+    ReplayMonitor,
 }
 
 fn setup_logging(verbose: u8) {
@@ -129,7 +137,7 @@ fn get_status(data_file: PathBuf) -> Result<()> {
     );
     println!("═════════════════════════════════════════════════════════════\n");
 
-    match query_daemon_via_socket(&data_file) {
+    match query_daemon_via_socket(&data_file, false) {
         Ok(response) => {
             println!("Chronicle Daemon:");
             println!("  Status: {}", response.daemon_status);
@@ -232,7 +240,7 @@ fn monitor_realtime(data_file: PathBuf) -> Result<()> {
 
     execute!(terminal.backend_mut(), DisableMouseCapture)?;
 
-    let res = run_monitor_loop(&mut terminal, data_file);
+    let res = run_monitor_loop(&mut terminal, data_file, false);
 
     disable_raw_mode()?;
     execute!(
@@ -249,8 +257,19 @@ fn monitor_realtime(data_file: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn run_monitor_loop<B: Backend>(terminal: &mut Terminal<B>, data_file: PathBuf) -> io::Result<()> {
-    let notification_socket_path = data_file.parent().unwrap().join("chronicle.notify.sock");
+fn run_monitor_loop<B: Backend>(
+    terminal: &mut Terminal<B>,
+    data_file: PathBuf,
+    replay: bool,
+) -> io::Result<()> {
+    let notification_socket_path = if replay {
+        data_file
+            .parent()
+            .unwrap()
+            .join("chronicle.replay.notify.sock")
+    } else {
+        data_file.parent().unwrap().join("chronicle.notify.sock")
+    };
 
     loop {
         let mut notify_stream;
@@ -288,7 +307,7 @@ fn run_monitor_loop<B: Backend>(terminal: &mut Terminal<B>, data_file: PathBuf) 
 
         let mut notify_buf = [0u8; 1];
         'monitor: loop {
-            match query_daemon_via_socket(&data_file) {
+            match query_daemon_via_socket(&data_file, replay) {
                 Ok(response) => {
                     terminal.draw(|f| monitor_ui::ui(f, &response))?;
                 }
@@ -319,8 +338,15 @@ fn run_monitor_loop<B: Backend>(terminal: &mut Terminal<B>, data_file: PathBuf) 
 
 use std::path::Path;
 
-fn query_daemon_via_socket(data_file: &Path) -> Result<socket_server::MonitorResponse> {
-    let socket_path = data_file.parent().unwrap().join("chronicle.sock");
+fn query_daemon_via_socket(
+    data_file: &Path,
+    replay: bool,
+) -> Result<socket_server::MonitorResponse> {
+    let socket_path = if replay {
+        data_file.parent().unwrap().join("chronicle.replay.sock")
+    } else {
+        data_file.parent().unwrap().join("chronicle.sock")
+    };
 
     let mut stream = UnixStream::connect(socket_path)?;
     writeln!(stream, "status")?;
@@ -331,6 +357,50 @@ fn query_daemon_via_socket(data_file: &Path) -> Result<socket_server::MonitorRes
 
     let parsed: socket_server::MonitorResponse = serde_json::from_str(&response)?;
     Ok(parsed)
+}
+
+fn monitor_realtime_with_socket(data_file: PathBuf, replay_mode: bool) -> Result<()> {
+    enable_raw_mode()?;
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen)?;
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend)?;
+
+    execute!(terminal.backend_mut(), DisableMouseCapture)?;
+
+    let res = run_monitor_loop(&mut terminal, data_file, replay_mode);
+
+    disable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        LeaveAlternateScreen,
+        DisableMouseCapture
+    )?;
+    terminal.show_cursor()?;
+
+    if let Err(err) = res {
+        println!("Error in monitor: {:?}", err);
+    }
+
+    Ok(())
+}
+
+fn start_replay_daemon(
+    data_file: PathBuf,
+    app_config: AppConfig,
+    speed: f64,
+    minutes: u64,
+) -> Result<()> {
+    let workspace_dir = data_file.parent().unwrap().to_path_buf();
+    let data_store: Box<dyn StorageBackend> =
+        Box::new(SqliteStorage::new(&data_file).context("Failed to initialize SQLite data store")?);
+    replay::run_replay(
+        data_store,
+        workspace_dir,
+        speed,
+        minutes,
+        (app_config.active_grace_secs, app_config.idle_threshold_secs),
+    )
 }
 
 fn read_pid_file(pid_file: &PathBuf) -> Result<Option<u32>> {
@@ -389,6 +459,11 @@ fn main() {
         Commands::Restart => restart_daemon(data_file, config.clone()),
         Commands::Status => get_status(data_file),
         Commands::Monitor => monitor_realtime(data_file),
+        Commands::Replay { speed, minutes } => {
+            let minutes = minutes.unwrap_or(config.retention_minutes);
+            start_replay_daemon(data_file, config.clone(), speed, minutes)
+        }
+        Commands::ReplayMonitor => monitor_realtime_with_socket(data_file, true),
     };
 
     if let Err(e) = result {

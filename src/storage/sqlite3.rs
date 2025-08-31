@@ -273,6 +273,109 @@ impl StorageBackend for SqliteStorage {
 
         Ok(out)
     }
+
+    fn fetch_envelopes_between(
+        &mut self,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> Result<Vec<EventEnvelope>> {
+        let conn = Connection::open(&self.db_path)?;
+        let mut stmt = conn.prepare(
+            "SELECT event_id, timestamp, source, kind, payload, derived, polling, sensitive
+             FROM raw_envelopes
+             WHERE timestamp >= ?1 AND timestamp <= ?2
+             ORDER BY timestamp ASC",
+        )?;
+        let mut rows = stmt.query([since.to_rfc3339(), until.to_rfc3339()])?;
+        let mut out: Vec<EventEnvelope> = Vec::new();
+        while let Some(row) = rows.next()? {
+            let event_id: Option<i64> = row.get(0)?;
+            let ts_s: String = row.get(1)?;
+            let source_s: String = row.get(2)?;
+            let kind_s: String = row.get(3)?;
+            let payload_s: Option<String> = row.get(4)?;
+            let derived_i: i64 = row.get(5)?;
+            let polling_i: i64 = row.get(6)?;
+            let sensitive_i: i64 = row.get(7)?;
+
+            let timestamp = DateTime::parse_from_rfc3339(&ts_s).map(|dt| dt.with_timezone(&Utc))?;
+            let source = match source_s.as_str() {
+                "hook" => EventSource::Hook,
+                "derived" => EventSource::Derived,
+                "polling" => EventSource::Polling,
+                other => {
+                    eprintln!("Unknown envelope source: {}", other);
+                    EventSource::Hook
+                }
+            };
+            let kind = if kind_s.starts_with("signal:") {
+                let k = &kind_s[7..];
+                let sk = match k {
+                    "keyboard" => SignalKind::KeyboardInput,
+                    "mouse" => SignalKind::MouseInput,
+                    "app_changed" => SignalKind::AppChanged,
+                    "window_changed" => SignalKind::WindowChanged,
+                    "lock_start" => SignalKind::LockStart,
+                    "lock_end" => SignalKind::LockEnd,
+                    _ => SignalKind::AppChanged,
+                };
+                EventKind::Signal(sk)
+            } else if kind_s.starts_with("hint:") {
+                let k = &kind_s[5..];
+                let hk = match k {
+                    "title_changed" => HintKind::TitleChanged,
+                    "position" => HintKind::PositionChanged,
+                    "size" => HintKind::SizeChanged,
+                    _ => HintKind::TitleChanged,
+                };
+                EventKind::Hint(hk)
+            } else {
+                EventKind::Signal(SignalKind::AppChanged)
+            };
+            let payload = match (kind.clone(), payload_s) {
+                (EventKind::Signal(SignalKind::KeyboardInput), Some(js)) => {
+                    serde_json::from_str(&js)
+                        .map(EventPayload::Keyboard)
+                        .unwrap_or(EventPayload::None)
+                }
+                (EventKind::Signal(SignalKind::MouseInput), Some(js)) => serde_json::from_str(&js)
+                    .map(EventPayload::Mouse)
+                    .unwrap_or(EventPayload::None),
+                (EventKind::Signal(_), Some(js)) | (EventKind::Hint(_), Some(js)) => {
+                    // Focus, Lock or Title tuples
+                    if kind_s.contains("lock") {
+                        EventPayload::Lock { reason: js }
+                    } else if kind_s.contains("title") {
+                        // stored as tuple (window_id, title)
+                        match serde_json::from_str::<(String, String)>(&js) {
+                            Ok((wid, title)) => EventPayload::Title {
+                                window_id: wid,
+                                title,
+                            },
+                            Err(_) => EventPayload::None,
+                        }
+                    } else {
+                        serde_json::from_str(&js)
+                            .map(EventPayload::Focus)
+                            .unwrap_or(EventPayload::None)
+                    }
+                }
+                _ => EventPayload::None,
+            };
+
+            out.push(EventEnvelope {
+                id: event_id.unwrap_or(0) as u64,
+                timestamp,
+                source,
+                kind,
+                payload,
+                derived: derived_i != 0,
+                polling: polling_i != 0,
+                sensitive: sensitive_i != 0,
+            });
+        }
+        Ok(out)
+    }
 }
 
 impl Drop for SqliteStorage {
