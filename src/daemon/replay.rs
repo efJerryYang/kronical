@@ -1,5 +1,5 @@
-use crate::daemon::event_deriver::LockDeriver;
-use crate::daemon::records::{aggregate_activities_since, ActivityRecord, RecordProcessor};
+use crate::daemon::event_model::{EventKind, HintKind};
+use crate::daemon::records::{aggregate_activities_since, ActivityRecord, RecordBuilder};
 use crate::daemon::socket_server::SocketServer;
 use crate::storage::StorageBackend;
 use anyhow::Result;
@@ -27,8 +27,20 @@ pub fn run_replay(
     let mut envelopes = store.fetch_envelopes_between(since, now)?;
     envelopes.sort_by_key(|e| e.timestamp);
 
-    let mut deriver = LockDeriver::new();
-    let mut rp = RecordProcessor::with_thresholds(thresholds.0, thresholds.1);
+    // Detect whether the stored envelopes already contain StateChanged hints
+    let has_state_hints = envelopes
+        .iter()
+        .any(|e| matches!(e.kind, EventKind::Hint(HintKind::StateChanged)));
+    let mut state_deriver = if has_state_hints {
+        None
+    } else {
+        Some(crate::daemon::event_deriver::StateDeriver::new(
+            since,
+            thresholds.0 as i64,
+            thresholds.1 as i64,
+        ))
+    };
+    let mut builder = RecordBuilder::new(crate::daemon::records::ActivityState::Inactive);
     let mut recent_records: std::collections::VecDeque<ActivityRecord> =
         std::collections::VecDeque::new();
     let mut state_hist: std::collections::VecDeque<char> = std::collections::VecDeque::new();
@@ -59,9 +71,23 @@ pub fn run_replay(
         }
         last_ts = Some(env.timestamp);
 
-        let derived = deriver.derive(&vec![env]);
-        let new_records = rp.process_envelopes(derived);
-        for r in new_records {
+        // Prefer stored hints; if state hints absent, derive from signals on the fly
+        let mut completed: Vec<ActivityRecord> = Vec::new();
+        match &env.kind {
+            EventKind::Hint(_) => {
+                if let Some(rec) = builder.on_hint(&env) {
+                    completed.push(rec);
+                }
+            }
+            EventKind::Signal(_) => {
+                if let Some(sd) = state_deriver.as_mut().and_then(|d| d.on_signal(&env)) {
+                    if let Some(rec) = builder.on_hint(&sd) {
+                        completed.push(rec);
+                    }
+                }
+            }
+        }
+        for r in completed.into_iter() {
             let ch = match r.state {
                 crate::daemon::records::ActivityState::Active => 'A',
                 crate::daemon::records::ActivityState::Passive => 'P',

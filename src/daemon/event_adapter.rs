@@ -73,6 +73,27 @@ impl EventAdapter {
                                 polling: false,
                                 sensitive: false,
                             });
+                            // New model: emit FocusChanged hint and ActivityPulse signal
+                            out.push(EventEnvelope {
+                                id: *event_id,
+                                timestamp: now,
+                                source: EventSource::Hook,
+                                kind: EventKind::Hint(HintKind::FocusChanged),
+                                payload: EventPayload::Focus(current.clone()),
+                                derived: false,
+                                polling: false,
+                                sensitive: false,
+                            });
+                            out.push(EventEnvelope {
+                                id: *event_id,
+                                timestamp: now,
+                                source: EventSource::Hook,
+                                kind: EventKind::Signal(SignalKind::ActivityPulse),
+                                payload: EventPayload::None,
+                                derived: false,
+                                polling: false,
+                                sensitive: false,
+                            });
                             emitted = true;
                         } else if last.window_id != current.window_id {
                             out.push(EventEnvelope {
@@ -81,6 +102,27 @@ impl EventAdapter {
                                 source: EventSource::Hook,
                                 kind: EventKind::Signal(SignalKind::WindowChanged),
                                 payload: EventPayload::Focus(current.clone()),
+                                derived: false,
+                                polling: false,
+                                sensitive: false,
+                            });
+                            // New model
+                            out.push(EventEnvelope {
+                                id: *event_id,
+                                timestamp: now,
+                                source: EventSource::Hook,
+                                kind: EventKind::Hint(HintKind::FocusChanged),
+                                payload: EventPayload::Focus(current.clone()),
+                                derived: false,
+                                polling: false,
+                                sensitive: false,
+                            });
+                            out.push(EventEnvelope {
+                                id: *event_id,
+                                timestamp: now,
+                                source: EventSource::Hook,
+                                kind: EventKind::Signal(SignalKind::ActivityPulse),
+                                payload: EventPayload::None,
                                 derived: false,
                                 polling: false,
                                 sensitive: false,
@@ -110,6 +152,26 @@ impl EventAdapter {
                             source: EventSource::Hook,
                             kind: EventKind::Signal(SignalKind::AppChanged),
                             payload: EventPayload::Focus(current.clone()),
+                            derived: false,
+                            polling: false,
+                            sensitive: false,
+                        });
+                        out.push(EventEnvelope {
+                            id: *event_id,
+                            timestamp: now,
+                            source: EventSource::Hook,
+                            kind: EventKind::Hint(HintKind::FocusChanged),
+                            payload: EventPayload::Focus(current.clone()),
+                            derived: false,
+                            polling: false,
+                            sensitive: false,
+                        });
+                        out.push(EventEnvelope {
+                            id: *event_id,
+                            timestamp: now,
+                            source: EventSource::Hook,
+                            kind: EventKind::Signal(SignalKind::ActivityPulse),
+                            payload: EventPayload::None,
                             derived: false,
                             polling: false,
                             sensitive: false,

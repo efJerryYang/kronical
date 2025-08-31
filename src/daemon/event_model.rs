@@ -19,6 +19,7 @@ pub enum SignalKind {
     MouseInput,
     AppChanged,
     WindowChanged,
+    ActivityPulse,
     LockStart,
     LockEnd,
 }
@@ -26,6 +27,8 @@ pub enum SignalKind {
 // Hints split records or enrich metadata, but do not affect state
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum HintKind {
+    FocusChanged,
+    StateChanged,
     TitleChanged,
     PositionChanged,
     SizeChanged,
@@ -42,8 +45,17 @@ pub enum EventPayload {
     Keyboard(KeyboardEventData),
     Mouse(MouseEventData),
     Focus(WindowFocusInfo),
-    Lock { reason: String },
-    Title { window_id: String, title: String },
+    Lock {
+        reason: String,
+    },
+    Title {
+        window_id: String,
+        title: String,
+    },
+    State {
+        from: ActivityState,
+        to: ActivityState,
+    },
     None,
 }
 
