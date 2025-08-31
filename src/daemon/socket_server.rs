@@ -123,8 +123,15 @@ impl SocketServer {
 
         let notification_clients = Arc::clone(&self.notification_clients);
         thread::spawn(move || {
-            for stream in notification_listener.incoming().flatten() {
-                notification_clients.lock().unwrap().push(stream);
+            for stream in notification_listener.incoming() {
+                match stream {
+                    Ok(stream) => {
+                        notification_clients.lock().unwrap().push(stream);
+                    }
+                    Err(e) => {
+                        error!("Error accepting notification connection: {}", e);
+                    }
+                }
             }
         });
 
