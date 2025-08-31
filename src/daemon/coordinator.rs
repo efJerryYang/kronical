@@ -308,23 +308,26 @@ impl EventCoordinator {
                                 let envelopes_with_lock = lock_deriver.derive(&envelopes);
                                 // Persist all envelopes
                                 let _ = store.add_envelopes(envelopes_with_lock.clone());
-                                // Feed pipeline
-                                for env in envelopes_with_lock.iter() {
-                                    match env.kind {
-                                        crate::daemon::event_model::EventKind::Signal(_) => {
-                                            if let Some(h) = state_deriver.on_signal(env) {
-                                                let _ = store.add_envelopes(vec![h.clone()]);
-                                                if let Some(rec) = record_builder.on_hint(&h) {
-                                                    let _ = store.add_records(vec![rec.clone()]);
-                                                    recent_records.push_back(rec);
-                                                }
-                                            }
-                                        }
-                                        crate::daemon::event_model::EventKind::Hint(_) => {
-                                            if let Some(rec) = record_builder.on_hint(env) {
-                                                let _ = store.add_records(vec![rec.clone()]);
-                                                recent_records.push_back(rec);
-                                            }
+                                // Feed pipeline (hint-first ordering per timestamp)
+                                for env in envelopes_with_lock.iter().filter(|e| {
+                                    matches!(e.kind, crate::daemon::event_model::EventKind::Hint(_))
+                                }) {
+                                    if let Some(rec) = record_builder.on_hint(env) {
+                                        let _ = store.add_records(vec![rec.clone()]);
+                                        recent_records.push_back(rec);
+                                    }
+                                }
+                                for env in envelopes_with_lock.iter().filter(|e| {
+                                    matches!(
+                                        e.kind,
+                                        crate::daemon::event_model::EventKind::Signal(_)
+                                    )
+                                }) {
+                                    if let Some(h) = state_deriver.on_signal(env) {
+                                        let _ = store.add_envelopes(vec![h.clone()]);
+                                        if let Some(rec) = record_builder.on_hint(&h) {
+                                            let _ = store.add_records(vec![rec.clone()]);
+                                            recent_records.push_back(rec);
                                         }
                                     }
                                 }
@@ -392,26 +395,27 @@ impl EventCoordinator {
 
                                 // New pipeline: feed signals to StateDeriver, hints to RecordBuilder
                                 let mut new_records = Vec::new();
-                                for env in envelopes_with_lock.iter() {
-                                    match env.kind {
-                                        crate::daemon::event_model::EventKind::Signal(_) => {
-                                            if let Some(h) = state_deriver.on_signal(env) {
-                                                if let Err(e) = store.add_envelopes(vec![h.clone()])
-                                                {
-                                                    error!(
-                                                        "Failed to store derived state hint: {}",
-                                                        e
-                                                    );
-                                                }
-                                                if let Some(rec) = record_builder.on_hint(&h) {
-                                                    new_records.push(rec);
-                                                }
-                                            }
+                                // Hints first
+                                for env in envelopes_with_lock.iter().filter(|e| {
+                                    matches!(e.kind, crate::daemon::event_model::EventKind::Hint(_))
+                                }) {
+                                    if let Some(rec) = record_builder.on_hint(env) {
+                                        new_records.push(rec);
+                                    }
+                                }
+                                // Then signals (which may derive state-change hints)
+                                for env in envelopes_with_lock.iter().filter(|e| {
+                                    matches!(
+                                        e.kind,
+                                        crate::daemon::event_model::EventKind::Signal(_)
+                                    )
+                                }) {
+                                    if let Some(h) = state_deriver.on_signal(env) {
+                                        if let Err(e) = store.add_envelopes(vec![h.clone()]) {
+                                            error!("Failed to store derived state hint: {}", e);
                                         }
-                                        crate::daemon::event_model::EventKind::Hint(_) => {
-                                            if let Some(rec) = record_builder.on_hint(env) {
-                                                new_records.push(rec);
-                                            }
+                                        if let Some(rec) = record_builder.on_hint(&h) {
+                                            new_records.push(rec);
                                         }
                                     }
                                 }
