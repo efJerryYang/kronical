@@ -11,6 +11,7 @@ pub enum ActivityState {
     Active,
     Passive,
     Inactive,
+    Locked,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, SizeOf)]
@@ -165,8 +166,34 @@ impl RecordProcessor {
         );
     }
 
+    fn start_new_record_with_state(
+        &mut self,
+        focus_info: Option<WindowFocusInfo>,
+        state: ActivityState,
+    ) {
+        let now_utc = Utc::now();
+        self.current_record = Some(ActivityRecord {
+            record_id: self.next_record_id,
+            start_time: now_utc,
+            end_time: None,
+            state,
+            focus_info,
+            event_count: 0,
+            triggering_events: Vec::new(),
+        });
+        self.next_record_id += 1;
+        info!(
+            "Started new record #{} with state {:?}",
+            self.current_record.as_ref().unwrap().record_id,
+            state
+        );
+    }
+
     pub fn check_timeouts(&mut self) -> Option<ActivityRecord> {
         let now = Instant::now();
+        if self.current_state == ActivityState::Locked {
+            return None;
+        }
         let time_since_activity = now.duration_since(self.last_activity);
         let time_since_keyboard = now.duration_since(self.last_keyboard_activity);
 
@@ -204,6 +231,10 @@ impl RecordProcessor {
 
     fn handle_keyboard_event(&mut self, event_id: u64) -> Option<ActivityRecord> {
         let now = Instant::now();
+        if self.current_state == ActivityState::Locked {
+            // Ignore inputs while locked
+            return None;
+        }
         self.last_activity = now;
         self.last_keyboard_activity = now;
 
@@ -219,6 +250,10 @@ impl RecordProcessor {
 
     fn handle_mouse_event(&mut self, event_id: u64) -> Option<ActivityRecord> {
         let now = Instant::now();
+        if self.current_state == ActivityState::Locked {
+            // Ignore inputs while locked
+            return None;
+        }
         self.last_activity = now;
 
         if self.current_record.is_none() {
@@ -260,6 +295,52 @@ impl RecordProcessor {
         });
 
         self.current_focus = Some(focus_info.clone());
+        // Any real focus signal counts as activity
+        self.last_activity = Instant::now();
+
+        // Handle macOS lock based on loginwindow app name
+        let is_loginwindow = focus_info
+            .app_name
+            .eq_ignore_ascii_case("loginwindow");
+
+        if is_loginwindow {
+            // Entering Locked: finalize current and start Locked record with loginwindow focus
+            let completed_record = if let Some(current) = self.current_record.take() {
+                let mut completed = current;
+                completed.end_time = Some(Utc::now());
+                info!(
+                    "Entering Locked, completed record #{}: {:?} with {} events",
+                    completed.record_id, completed.state, completed.event_count
+                );
+                Some(completed)
+            } else {
+                None
+            };
+
+            self.current_state = ActivityState::Locked;
+            self.start_new_record_with_state(Some(focus_info), ActivityState::Locked);
+            return completed_record;
+        }
+
+        if self.current_state == ActivityState::Locked {
+            // Exiting Locked on non-loginwindow focus: finalize locked and start Active
+            let completed_record = if let Some(current) = self.current_record.take() {
+                let mut completed = current;
+                completed.end_time = Some(Utc::now());
+                info!(
+                    "Exiting Locked, completed record #{}",
+                    completed.record_id
+                );
+                Some(completed)
+            } else {
+                None
+            };
+
+            self.current_state = ActivityState::Active;
+            self.start_new_record_with_state(Some(focus_info), ActivityState::Active);
+            self.add_event_to_current_record(event_id);
+            return completed_record;
+        }
 
         if is_same_window {
             // It's the same window, just a title change. Complete the current record and start a new one
@@ -276,7 +357,9 @@ impl RecordProcessor {
                 None
             };
 
-            self.start_new_record(Some(focus_info));
+            // Keep state unchanged on title-only change
+            let state = self.current_state;
+            self.start_new_record_with_state(Some(focus_info), state);
             self.add_event_to_current_record(event_id);
             completed_record
         } else {
@@ -293,7 +376,9 @@ impl RecordProcessor {
                 None
             };
 
-            self.start_new_record(Some(focus_info));
+            // Focus change should mark as Active immediately
+            self.current_state = ActivityState::Active;
+            self.start_new_record_with_state(Some(focus_info), ActivityState::Active);
             self.add_event_to_current_record(event_id);
             completed_record
         }
@@ -304,6 +389,9 @@ impl RecordProcessor {
         new_state: ActivityState,
         triggering_event: Option<u64>,
     ) -> Option<ActivityRecord> {
+        if self.current_state == ActivityState::Locked {
+            return None;
+        }
         if self.current_state == new_state {
             return None;
         }
@@ -344,6 +432,9 @@ impl RecordProcessor {
     }
 
     fn add_event_to_current_record(&mut self, event_id: u64) {
+        if self.current_state == ActivityState::Locked {
+            return;
+        }
         if let Some(ref mut record) = self.current_record {
             record.event_count += 1;
             if !record.triggering_events.contains(&event_id) {

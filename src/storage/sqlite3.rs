@@ -178,6 +178,7 @@ impl StorageBackend for SqliteStorage {
                 "Active" => crate::daemon::records::ActivityState::Active,
                 "Passive" => crate::daemon::records::ActivityState::Passive,
                 "Inactive" => crate::daemon::records::ActivityState::Inactive,
+                "Locked" => crate::daemon::records::ActivityState::Locked,
                 other => {
                     eprintln!("Unknown state in DB: {}", other);
                     crate::daemon::records::ActivityState::Inactive

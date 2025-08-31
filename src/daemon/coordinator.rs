@@ -1,4 +1,6 @@
 use crate::daemon::compression::CompressionEngine;
+use crate::daemon::event_adapter::EventAdapter;
+use crate::daemon::event_deriver::LockDeriver;
 use crate::daemon::events::{KeyboardEventData, MouseEventData, MousePosition, WindowFocusInfo};
 use crate::daemon::focus_tracker::{FocusCacheCaps, FocusChangeCallback, FocusEventWrapper};
 use crate::daemon::records::{aggregate_activities_since, ActivityRecord, RecordProcessor};
@@ -206,6 +208,8 @@ impl EventCoordinator {
             let mut compression_engine =
                 CompressionEngine::with_focus_cap(self.focus_interner_max_strings);
             let mut record_processor = RecordProcessor::new();
+            let mut adapter = EventAdapter::new();
+            let mut lock_deriver = LockDeriver::new();
             let mut store = data_store;
             let socket_server_clone = Arc::clone(&socket_server);
             let mut pending_raw_events = Vec::new();
@@ -254,8 +258,14 @@ impl EventCoordinator {
                             );
                             if !pending_raw_events.is_empty() {
                                 let raw_events_to_process = std::mem::take(&mut pending_raw_events);
-                                let new_records =
-                                    record_processor.process_events(raw_events_to_process.clone());
+                                // Adapt to EventEnvelope + derive lock boundaries (scaffold for future pipeline)
+                                let envelopes = adapter.adapt_batch(&raw_events_to_process);
+                                let envelopes_with_lock = lock_deriver.derive(&envelopes);
+
+                                let envelopes = adapter.adapt_batch(&raw_events_to_process);
+                                let envelopes_with_lock = lock_deriver.derive(&envelopes);
+                                let new_records = record_processor
+                                    .process_events(raw_events_to_process.clone());
                                 if !new_records.is_empty() {
                                     let _ = store.add_records(new_records.clone());
                                     for r in new_records {
@@ -307,8 +317,12 @@ impl EventCoordinator {
 
                                 let raw_events_to_process = std::mem::take(&mut pending_raw_events);
 
-                                let new_records =
-                                    record_processor.process_events(raw_events_to_process.clone());
+                                // Adapt to EventEnvelope + derive lock boundaries (scaffold for future pipeline)
+                                let envelopes = adapter.adapt_batch(&raw_events_to_process);
+                                let envelopes_with_lock = lock_deriver.derive(&envelopes);
+
+                                let new_records = record_processor
+                                    .process_events(raw_events_to_process.clone());
                                 if !new_records.is_empty() {
                                     info!("Generated {} new records", new_records.len());
                                     if let Err(e) = store.add_records(new_records.clone()) {
@@ -320,7 +334,7 @@ impl EventCoordinator {
                                     }
                                 }
 
-                                match compression_engine.compress_events(raw_events_to_process) {
+                                match compression_engine.compress_events(raw_events_to_process.clone()) {
                                     Ok((processed_events, compact_events)) => {
                                         debug!(
                                             "Compressed into {} compact events",
@@ -328,7 +342,29 @@ impl EventCoordinator {
                                         );
 
                                         if !processed_events.is_empty() {
-                                            if let Err(e) = store.add_events(processed_events) {
+                                            // Suppress input events during Locked period using derived envelopes
+                                            use crate::daemon::event_model::{EventKind, SignalKind};
+                                            let mut suppress: std::collections::HashSet<u64> = std::collections::HashSet::new();
+                                            let mut locked = false;
+                                            for env in &envelopes_with_lock {
+                                                match &env.kind {
+                                                    EventKind::Signal(SignalKind::LockStart) => locked = true,
+                                                    EventKind::Signal(SignalKind::LockEnd) => locked = false,
+                                                    EventKind::Signal(SignalKind::KeyboardInput | SignalKind::MouseInput) if locked => {
+                                                        suppress.insert(env.id);
+                                                    }
+                                                    _ => {}
+                                                }
+                                            }
+                                            let to_store: Vec<_> = processed_events
+                                                .into_iter()
+                                                .filter(|ev| match ev {
+                                                    crate::daemon::events::RawEvent::KeyboardInput { event_id, .. } |
+                                                    crate::daemon::events::RawEvent::MouseInput { event_id, .. } => !suppress.contains(event_id),
+                                                    _ => true,
+                                                })
+                                                .collect();
+                                            if let Err(e) = store.add_events(to_store) {
                                                 error!("Failed to store raw events: {}", e);
                                             }
                                         }
