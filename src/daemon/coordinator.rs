@@ -1,6 +1,6 @@
 use crate::daemon::compression::CompressionEngine;
 use crate::daemon::events::{KeyboardEventData, MouseEventData, MousePosition, WindowFocusInfo};
-use crate::daemon::focus_tracker::{FocusChangeCallback, FocusEventWrapper};
+use crate::daemon::focus_tracker::{FocusCacheCaps, FocusChangeCallback, FocusEventWrapper};
 use crate::daemon::records::{aggregate_activities_since, ActivityRecord, RecordProcessor};
 use crate::daemon::socket_server::SocketServer;
 use crate::storage::StorageBackend;
@@ -26,11 +26,11 @@ pub struct ChronicleEventHandler {
 }
 
 impl ChronicleEventHandler {
-    fn new(sender: mpsc::Sender<ChronicleEvent>) -> Self {
+    fn new(sender: mpsc::Sender<ChronicleEvent>, caps: FocusCacheCaps) -> Self {
         let callback = Arc::new(FocusCallback {
             sender: sender.clone(),
         });
-        let focus_wrapper = FocusEventWrapper::new(callback, Duration::from_secs(2));
+        let focus_wrapper = FocusEventWrapper::new(callback, Duration::from_secs(2), caps);
 
         Self {
             sender,
@@ -109,6 +109,10 @@ pub struct EventCoordinator {
     max_windows_per_app: usize,
     ephemeral_app_max_duration_secs: u64,
     ephemeral_app_min_distinct_procs: usize,
+    pid_cache_capacity: usize,
+    title_cache_capacity: usize,
+    title_cache_ttl_secs: u64,
+    focus_interner_max_strings: usize,
 }
 
 impl EventCoordinator {
@@ -119,6 +123,10 @@ impl EventCoordinator {
         max_windows_per_app: usize,
         ephemeral_app_max_duration_secs: u64,
         ephemeral_app_min_distinct_procs: usize,
+        pid_cache_capacity: usize,
+        title_cache_capacity: usize,
+        title_cache_ttl_secs: u64,
+        focus_interner_max_strings: usize,
     ) -> Self {
         Self {
             retention_minutes,
@@ -127,6 +135,10 @@ impl EventCoordinator {
             max_windows_per_app,
             ephemeral_app_max_duration_secs,
             ephemeral_app_min_distinct_procs,
+            pid_cache_capacity,
+            title_cache_capacity,
+            title_cache_ttl_secs,
+            focus_interner_max_strings,
         }
     }
 
@@ -191,7 +203,8 @@ impl EventCoordinator {
         }
 
         let data_thread = {
-            let mut compression_engine = CompressionEngine::new();
+            let mut compression_engine =
+                CompressionEngine::with_focus_cap(self.focus_interner_max_strings);
             let mut record_processor = RecordProcessor::new();
             let mut store = data_store;
             let socket_server_clone = Arc::clone(&socket_server);
@@ -440,7 +453,14 @@ impl EventCoordinator {
             let _ = std::fs::remove_file(&pid_file_cleanup);
         })?;
 
-        let handler = ChronicleEventHandler::new(sender);
+        let handler = ChronicleEventHandler::new(
+            sender,
+            FocusCacheCaps {
+                pid_cache_capacity: self.pid_cache_capacity,
+                title_cache_capacity: self.title_cache_capacity,
+                title_cache_ttl_secs: self.title_cache_ttl_secs,
+            },
+        );
 
         info!("Step M1: Setting up UIohook on main thread");
         let uiohook = Uiohook::new(handler.clone());

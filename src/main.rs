@@ -102,6 +102,10 @@ fn start_daemon(data_file: PathBuf, app_config: AppConfig) -> Result<()> {
         app_config.max_windows_per_app,
         app_config.ephemeral_app_max_duration_secs,
         app_config.ephemeral_app_min_distinct_procs,
+        app_config.pid_cache_capacity,
+        app_config.title_cache_capacity,
+        app_config.title_cache_ttl_secs,
+        app_config.focus_interner_max_strings,
     );
 
     info!("Chronicle will run on MAIN THREAD (required by macOS hooks)");

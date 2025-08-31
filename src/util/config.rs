@@ -12,6 +12,10 @@ pub struct AppConfig {
     pub max_windows_per_app: usize,
     pub ephemeral_app_max_duration_secs: u64,
     pub ephemeral_app_min_distinct_procs: usize,
+    pub pid_cache_capacity: usize,
+    pub title_cache_capacity: usize,
+    pub title_cache_ttl_secs: u64,
+    pub focus_interner_max_strings: usize,
 }
 
 impl Default for AppConfig {
@@ -30,6 +34,10 @@ impl Default for AppConfig {
             max_windows_per_app: 30,
             ephemeral_app_max_duration_secs: 60,
             ephemeral_app_min_distinct_procs: 3,
+            pid_cache_capacity: 1024,
+            title_cache_capacity: 512,
+            title_cache_ttl_secs: 0,
+            focus_interner_max_strings: 4096,
         }
     }
 }
@@ -47,7 +55,11 @@ impl AppConfig {
             .set_default("ephemeral_min_distinct_ids", 3)?
             .set_default("max_windows_per_app", 30)?
             .set_default("ephemeral_app_max_duration_secs", 60)?
-            .set_default("ephemeral_app_min_distinct_procs", 3)?;
+            .set_default("ephemeral_app_min_distinct_procs", 3)?
+            .set_default("pid_cache_capacity", 1024)?
+            .set_default("title_cache_capacity", 512)?
+            .set_default("title_cache_ttl_secs", 0)?
+            .set_default("focus_interner_max_strings", 4096)?;
 
         // Load config file if it exists
         if config_path.exists() {

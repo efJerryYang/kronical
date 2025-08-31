@@ -1,13 +1,20 @@
 use crate::daemon::events::WindowFocusInfo;
+use crate::util::lru::LruCache;
 use active_win_pos_rs::get_active_window;
 use chrono::{DateTime, Utc};
 use log::{error, info, warn};
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use sysinfo::{Pid, System};
+
+#[derive(Debug, Clone, Copy)]
+pub struct FocusCacheCaps {
+    pub pid_cache_capacity: usize,
+    pub title_cache_capacity: usize,
+    pub title_cache_ttl_secs: u64,
+}
 
 #[derive(Debug, Clone)]
 pub struct FocusState {
@@ -64,24 +71,32 @@ pub trait FocusChangeCallback {
 pub struct FocusEventWrapper {
     current_state: Arc<Mutex<FocusState>>,
     callback: Arc<dyn FocusChangeCallback + Send + Sync>,
-    pid_cache: Arc<Mutex<HashMap<i32, u64>>>,
+    pid_cache: Arc<Mutex<LruCache<i32, u64>>>,
     poll_interval: Duration,
     should_stop_polling: Arc<AtomicBool>,
-    last_titles: Arc<Mutex<HashMap<String, String>>>, // window_id -> last_title
+    last_titles: Arc<Mutex<LruCache<String, String>>>, // window_id -> last_title (LRU-capped)
 }
 
 impl FocusEventWrapper {
     pub fn new(
         callback: Arc<dyn FocusChangeCallback + Send + Sync>,
         poll_interval: Duration,
+        caps: FocusCacheCaps,
     ) -> Self {
         let wrapper = Self {
             current_state: Arc::new(Mutex::new(FocusState::new())),
             callback,
-            pid_cache: Arc::new(Mutex::new(HashMap::new())),
+            pid_cache: Arc::new(Mutex::new(LruCache::with_capacity(caps.pid_cache_capacity))),
             poll_interval,
             should_stop_polling: Arc::new(AtomicBool::new(false)),
-            last_titles: Arc::new(Mutex::new(HashMap::new())),
+            last_titles: Arc::new(Mutex::new(if caps.title_cache_ttl_secs > 0 {
+                LruCache::with_capacity_and_ttl(
+                    caps.title_cache_capacity,
+                    Duration::from_secs(caps.title_cache_ttl_secs),
+                )
+            } else {
+                LruCache::with_capacity(caps.title_cache_capacity)
+            })),
         };
 
         if poll_interval.as_millis() > 0 {
@@ -93,8 +108,8 @@ impl FocusEventWrapper {
 
     fn get_process_start_time(&self, pid: i32) -> u64 {
         let mut cache = self.pid_cache.lock().unwrap();
-        if let Some(start_time) = cache.get(&pid) {
-            return *start_time;
+        if let Some(start_time) = cache.get_cloned(&pid) {
+            return start_time;
         }
 
         let mut system = System::new();
@@ -105,7 +120,7 @@ impl FocusEventWrapper {
         );
         if let Some(process) = system.process(Pid::from(pid as usize)) {
             let start_time = process.start_time();
-            cache.insert(pid, start_time);
+            cache.put(pid, start_time);
             start_time
         } else {
             0
@@ -261,8 +276,8 @@ impl FocusEventWrapper {
                         let current_title = active_window.title;
 
                         let mut titles = last_titles.lock().unwrap();
-                        if let Some(last_title) = titles.get(&window_id) {
-                            if last_title != &current_title {
+                        if let Some(last_title) = titles.get_cloned(&window_id) {
+                            if last_title != current_title {
                                 info!(
                                     "Polling detected title change for window {}: '{}' -> '{}'",
                                     window_id, last_title, current_title
@@ -271,7 +286,7 @@ impl FocusEventWrapper {
                             }
                         }
 
-                        titles.insert(window_id, current_title);
+                        titles.put(window_id, current_title);
                     }
                     Err(e) => {
                         error!("Failed to get active window during polling: {:?}", e);
