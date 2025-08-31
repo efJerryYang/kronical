@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -71,7 +71,8 @@ pub struct SocketServer {
     notification_clients: Arc<Mutex<Vec<UnixStream>>>,
     app_short_max_duration_secs: u64,
     app_short_min_distinct: usize,
-    state_history: Arc<Mutex<String>>,
+    state_history: Arc<RwLock<String>>,
+    state_tx: mpsc::Sender<String>,
 }
 
 impl SocketServer {
@@ -81,6 +82,17 @@ impl SocketServer {
         app_short_min_distinct: usize,
     ) -> Self {
         let notification_socket_path = socket_path.with_extension("notify.sock");
+        let (tx, rx) = mpsc::channel();
+        let state_history = Arc::new(RwLock::new(String::new()));
+        let sh_clone = Arc::clone(&state_history);
+        std::thread::spawn(move || {
+            while let Ok(s) = rx.recv() {
+                if let Ok(mut guard) = sh_clone.write() {
+                    *guard = s;
+                }
+            }
+        });
+
         Self {
             socket_path,
             notification_socket_path,
@@ -88,7 +100,8 @@ impl SocketServer {
             notification_clients: Arc::new(Mutex::new(Vec::new())),
             app_short_max_duration_secs,
             app_short_min_distinct,
-            state_history: Arc::new(Mutex::new(String::new())),
+            state_history,
+            state_tx: tx,
         }
     }
 
@@ -108,11 +121,8 @@ impl SocketServer {
     }
 
     pub fn update_state_history(&self, history: String) {
-        let mut s = self.state_history.lock().unwrap();
-        *s = history.clone();
-        // Sidecar file to allow handle_client to read without self
-        let sidecar = self.socket_path.with_extension("state.txt");
-        let _ = std::fs::write(sidecar, &history);
+        // send via channel to avoid locking from producers
+        let _ = self.state_tx.send(history);
         self.notify_clients();
     }
 
@@ -148,6 +158,7 @@ impl SocketServer {
         });
 
         let aggregated_activities = Arc::clone(&self.aggregated_activities);
+        let state_history = Arc::clone(&self.state_history);
         let socket_path = self.socket_path.clone();
         let app_short_max = self.app_short_max_duration_secs;
         let app_short_min = self.app_short_min_distinct;
@@ -158,6 +169,7 @@ impl SocketServer {
                     Ok(stream) => {
                         let aggregated = Arc::clone(&aggregated_activities);
                         let socket_path_clone = socket_path.clone();
+                        let state_history_clone = Arc::clone(&state_history);
                         thread::spawn(move || {
                             if let Err(e) = handle_client(
                                 stream,
@@ -165,6 +177,7 @@ impl SocketServer {
                                 socket_path_clone,
                                 app_short_max,
                                 app_short_min,
+                                state_history_clone,
                             ) {
                                 error!("Error handling client: {}", e);
                             }
@@ -187,6 +200,7 @@ fn handle_client(
     socket_path: PathBuf,
     app_short_max: u64,
     app_short_min: usize,
+    state_history: Arc<RwLock<String>>,
 ) -> Result<()> {
     let mut reader = BufReader::new(&stream);
     let mut line = String::new();
@@ -205,10 +219,8 @@ fn handle_client(
                 app_short_max,
                 app_short_min,
             )?;
-            // Inject state history from sidecar
-            let sidecar = socket_path.with_extension("state.txt");
-            if let Ok(s) = std::fs::read_to_string(&sidecar) {
-                response.state_history = s.trim().to_string();
+            if let Ok(s) = state_history.read() {
+                response.state_history = s.clone();
             }
             let json_response = serde_json::to_string(&response)?;
             writeln!(stream, "{}", json_response)?;
