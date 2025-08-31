@@ -1,11 +1,11 @@
 use crate::daemon::records::AggregatedActivity;
 use anyhow::Result;
-use log::{error, info};
+use log::{debug, error, info};
 use serde::{Deserialize, Serialize};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::PathBuf;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, RwLock};
 use std::thread;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -61,6 +61,7 @@ pub struct MonitorResponse {
     pub data_file_size_mb: f64,
     pub data_directory: String,
     pub recent_apps: Vec<ActivityApp>,
+    pub state_history: String,
 }
 
 pub struct SocketServer {
@@ -70,6 +71,8 @@ pub struct SocketServer {
     notification_clients: Arc<Mutex<Vec<UnixStream>>>,
     app_short_max_duration_secs: u64,
     app_short_min_distinct: usize,
+    state_history: Arc<RwLock<String>>,
+    state_tx: mpsc::Sender<String>,
 }
 
 impl SocketServer {
@@ -79,6 +82,17 @@ impl SocketServer {
         app_short_min_distinct: usize,
     ) -> Self {
         let notification_socket_path = socket_path.with_extension("notify.sock");
+        let (tx, rx) = mpsc::channel();
+        let state_history = Arc::new(RwLock::new(String::new()));
+        let sh_clone = Arc::clone(&state_history);
+        std::thread::spawn(move || {
+            while let Ok(s) = rx.recv() {
+                if let Ok(mut guard) = sh_clone.write() {
+                    *guard = s;
+                }
+            }
+        });
+
         Self {
             socket_path,
             notification_socket_path,
@@ -86,6 +100,8 @@ impl SocketServer {
             notification_clients: Arc::new(Mutex::new(Vec::new())),
             app_short_max_duration_secs,
             app_short_min_distinct,
+            state_history,
+            state_tx: tx,
         }
     }
 
@@ -97,10 +113,16 @@ impl SocketServer {
     pub fn update_aggregated_data(&self, aggregated_activities: Vec<AggregatedActivity>) {
         let mut aggregated = self.aggregated_activities.lock().unwrap();
         *aggregated = aggregated_activities;
-        info!(
+        debug!(
             "Updated socket server with {} aggregated activities",
             aggregated.len()
         );
+        self.notify_clients();
+    }
+
+    pub fn update_state_history(&self, history: String) {
+        // send via channel to avoid locking from producers
+        let _ = self.state_tx.send(history);
         self.notify_clients();
     }
 
@@ -136,6 +158,7 @@ impl SocketServer {
         });
 
         let aggregated_activities = Arc::clone(&self.aggregated_activities);
+        let state_history = Arc::clone(&self.state_history);
         let socket_path = self.socket_path.clone();
         let app_short_max = self.app_short_max_duration_secs;
         let app_short_min = self.app_short_min_distinct;
@@ -146,6 +169,7 @@ impl SocketServer {
                     Ok(stream) => {
                         let aggregated = Arc::clone(&aggregated_activities);
                         let socket_path_clone = socket_path.clone();
+                        let state_history_clone = Arc::clone(&state_history);
                         thread::spawn(move || {
                             if let Err(e) = handle_client(
                                 stream,
@@ -153,6 +177,7 @@ impl SocketServer {
                                 socket_path_clone,
                                 app_short_max,
                                 app_short_min,
+                                state_history_clone,
                             ) {
                                 error!("Error handling client: {}", e);
                             }
@@ -175,6 +200,7 @@ fn handle_client(
     socket_path: PathBuf,
     app_short_max: u64,
     app_short_min: usize,
+    state_history: Arc<RwLock<String>>,
 ) -> Result<()> {
     let mut reader = BufReader::new(&stream);
     let mut line = String::new();
@@ -182,13 +208,20 @@ fn handle_client(
     reader.read_line(&mut line)?;
     let command = line.trim();
 
-    info!("Received command: {}", command);
+    debug!("Received command: {}", command);
 
     match command {
         "status" => {
             let aggregated = aggregated_activities.lock().unwrap();
-            let response =
-                generate_status_response(&aggregated, socket_path, app_short_max, app_short_min)?;
+            let mut response = generate_status_response(
+                &aggregated,
+                socket_path.clone(),
+                app_short_max,
+                app_short_min,
+            )?;
+            if let Ok(s) = state_history.read() {
+                response.state_history = s.clone();
+            }
             let json_response = serde_json::to_string(&response)?;
             writeln!(stream, "{}", json_response)?;
         }
@@ -209,12 +242,14 @@ fn generate_status_response(
     let data_dir = socket_path.parent().unwrap();
     let data_file_size_mb = get_data_file_size(data_dir);
     let recent_apps = build_app_tree(aggregated_activities, app_short_max, app_short_min);
+    let state_history = String::new();
 
     Ok(MonitorResponse {
         daemon_status: "running".to_string(),
         data_file_size_mb,
         data_directory: data_dir.to_string_lossy().to_string(),
         recent_apps,
+        state_history,
     })
 }
 

@@ -10,22 +10,35 @@ pub type StringId = u16;
 pub struct StringInterner {
     strings: Vec<String>,
     lookup: HashMap<String, StringId>,
+    max_strings: usize,
 }
 
 impl StringInterner {
     pub fn new() -> Self {
+        Self::with_cap(4096)
+    }
+
+    pub fn with_cap(max_strings: usize) -> Self {
         Self {
             strings: Vec::new(),
             lookup: HashMap::new(),
+            max_strings: max_strings.max(1),
         }
     }
 
     pub fn intern(&mut self, s: &str) -> StringId {
-        *self.lookup.entry(s.to_string()).or_insert_with(|| {
-            let id = self.strings.len() as StringId;
-            self.strings.push(s.to_string());
-            id
-        })
+        if let Some(id) = self.lookup.get(s) {
+            return *id;
+        }
+        // Reset (cheap) when capacity exceeded; IDs restart. Safe for our current usage.
+        if self.strings.len() >= self.max_strings {
+            self.strings.clear();
+            self.lookup.clear();
+        }
+        let id = self.strings.len() as StringId;
+        self.strings.push(s.to_string());
+        self.lookup.insert(s.to_string(), id);
+        id
     }
 }
 
@@ -481,6 +494,12 @@ impl FocusEventProcessor {
         }
     }
 
+    pub fn with_cap(max_strings: usize) -> Self {
+        Self {
+            string_interner: StringInterner::with_cap(max_strings),
+        }
+    }
+
     pub fn get_string_interner(&self) -> &StringInterner {
         &self.string_interner
     }
@@ -561,11 +580,15 @@ pub struct CompressionEngine {
 
 impl CompressionEngine {
     pub fn new() -> Self {
+        Self::with_focus_cap(4096)
+    }
+
+    pub fn with_focus_cap(max_strings: usize) -> Self {
         Self {
             scroll_compressor: ScrollCompressor::new(),
             mouse_compressor: MouseTrajectoryCompressor::new(),
             keyboard_compressor: IdentityKeyboardCompressor::new(),
-            focus_processor: FocusEventProcessor::new(),
+            focus_processor: FocusEventProcessor::with_cap(max_strings),
             total_compact_events: 0,
             total_compact_events_bytes: 0,
         }

@@ -1,3 +1,6 @@
+use crate::daemon::event_model::{
+    EventEnvelope, EventKind, EventPayload, EventSource, HintKind, SignalKind,
+};
 use crate::daemon::events::RawEvent;
 use crate::daemon::records::ActivityRecord;
 use crate::storage::StorageBackend;
@@ -12,6 +15,7 @@ use std::thread;
 pub enum StorageCommand {
     RawEvent(RawEvent),
     Record(ActivityRecord),
+    Envelope(EventEnvelope),
     Shutdown,
 }
 
@@ -60,6 +64,18 @@ impl SqliteStorage {
                 data TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_raw_events_timestamp ON raw_events(timestamp);
+            CREATE TABLE IF NOT EXISTS raw_envelopes (
+                id INTEGER PRIMARY KEY,
+                event_id INTEGER,
+                timestamp TEXT NOT NULL,
+                source TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                payload TEXT,
+                derived INTEGER NOT NULL,
+                polling INTEGER NOT NULL,
+                sensitive INTEGER NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_raw_envelopes_timestamp ON raw_envelopes(timestamp);
             CREATE TABLE IF NOT EXISTS activity_records (
                 id INTEGER PRIMARY KEY,
                 start_time TEXT NOT NULL,
@@ -96,6 +112,51 @@ impl SqliteStorage {
                         .as_ref()
                         .map(|fi| serde_json::to_string(fi).unwrap());
                     tx.execute("INSERT INTO activity_records (start_time, end_time, state, focus_info) VALUES (?, ?, ?, ?)", params![record.start_time.to_rfc3339(), record.end_time.map(|t| t.to_rfc3339()), format!("{:?}", record.state), focus_info_json])
+                }
+                StorageCommand::Envelope(env) => {
+                    let source = match env.source {
+                        EventSource::Hook => "hook",
+                        EventSource::Derived => "derived",
+                        EventSource::Polling => "polling",
+                    };
+                    let kind = match &env.kind {
+                        EventKind::Signal(sk) => match sk {
+                            SignalKind::KeyboardInput => "signal:keyboard",
+                            SignalKind::MouseInput => "signal:mouse",
+                            SignalKind::AppChanged => "signal:app_changed",
+                            SignalKind::WindowChanged => "signal:window_changed",
+                            SignalKind::LockStart => "signal:lock_start",
+                            SignalKind::LockEnd => "signal:lock_end",
+                        },
+                        EventKind::Hint(hk) => match hk {
+                            HintKind::TitleChanged => "hint:title_changed",
+                            HintKind::PositionChanged => "hint:position",
+                            HintKind::SizeChanged => "hint:size",
+                        },
+                    };
+                    let payload_json = match &env.payload {
+                        EventPayload::Keyboard(k) => serde_json::to_string(k).ok(),
+                        EventPayload::Mouse(m) => serde_json::to_string(m).ok(),
+                        EventPayload::Focus(f) => serde_json::to_string(f).ok(),
+                        EventPayload::Lock { reason } => serde_json::to_string(reason).ok(),
+                        EventPayload::Title { window_id, title } => {
+                            serde_json::to_string(&(window_id, title)).ok()
+                        }
+                        EventPayload::None => None,
+                    };
+                    tx.execute(
+                        "INSERT INTO raw_envelopes (event_id, timestamp, source, kind, payload, derived, polling, sensitive) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        params![
+                            env.id as i64,
+                            env.timestamp.to_rfc3339(),
+                            source,
+                            kind,
+                            payload_json,
+                            if env.derived { 1 } else { 0 },
+                            if env.polling { 1 } else { 0 },
+                            if env.sensitive { 1 } else { 0 },
+                        ],
+                    )
                 }
                 StorageCommand::Shutdown => break,
             };
@@ -142,6 +203,15 @@ impl StorageBackend for SqliteStorage {
         Ok(())
     }
 
+    fn add_envelopes(&mut self, events: Vec<EventEnvelope>) -> Result<()> {
+        for env in events {
+            self.sender
+                .send(StorageCommand::Envelope(env))
+                .context("Failed to send envelope to writer")?;
+        }
+        Ok(())
+    }
+
     fn fetch_records_since(&mut self, since: DateTime<Utc>) -> Result<Vec<ActivityRecord>> {
         let conn = Connection::open(&self.db_path)?;
         // Include records that have not ended or ended after 'since'.
@@ -178,6 +248,7 @@ impl StorageBackend for SqliteStorage {
                 "Active" => crate::daemon::records::ActivityState::Active,
                 "Passive" => crate::daemon::records::ActivityState::Passive,
                 "Inactive" => crate::daemon::records::ActivityState::Inactive,
+                "Locked" => crate::daemon::records::ActivityState::Locked,
                 other => {
                     eprintln!("Unknown state in DB: {}", other);
                     crate::daemon::records::ActivityState::Inactive
@@ -200,6 +271,109 @@ impl StorageBackend for SqliteStorage {
             });
         }
 
+        Ok(out)
+    }
+
+    fn fetch_envelopes_between(
+        &mut self,
+        since: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> Result<Vec<EventEnvelope>> {
+        let conn = Connection::open(&self.db_path)?;
+        let mut stmt = conn.prepare(
+            "SELECT event_id, timestamp, source, kind, payload, derived, polling, sensitive
+             FROM raw_envelopes
+             WHERE timestamp >= ?1 AND timestamp <= ?2
+             ORDER BY timestamp ASC",
+        )?;
+        let mut rows = stmt.query([since.to_rfc3339(), until.to_rfc3339()])?;
+        let mut out: Vec<EventEnvelope> = Vec::new();
+        while let Some(row) = rows.next()? {
+            let event_id: Option<i64> = row.get(0)?;
+            let ts_s: String = row.get(1)?;
+            let source_s: String = row.get(2)?;
+            let kind_s: String = row.get(3)?;
+            let payload_s: Option<String> = row.get(4)?;
+            let derived_i: i64 = row.get(5)?;
+            let polling_i: i64 = row.get(6)?;
+            let sensitive_i: i64 = row.get(7)?;
+
+            let timestamp = DateTime::parse_from_rfc3339(&ts_s).map(|dt| dt.with_timezone(&Utc))?;
+            let source = match source_s.as_str() {
+                "hook" => EventSource::Hook,
+                "derived" => EventSource::Derived,
+                "polling" => EventSource::Polling,
+                other => {
+                    eprintln!("Unknown envelope source: {}", other);
+                    EventSource::Hook
+                }
+            };
+            let kind = if kind_s.starts_with("signal:") {
+                let k = &kind_s[7..];
+                let sk = match k {
+                    "keyboard" => SignalKind::KeyboardInput,
+                    "mouse" => SignalKind::MouseInput,
+                    "app_changed" => SignalKind::AppChanged,
+                    "window_changed" => SignalKind::WindowChanged,
+                    "lock_start" => SignalKind::LockStart,
+                    "lock_end" => SignalKind::LockEnd,
+                    _ => SignalKind::AppChanged,
+                };
+                EventKind::Signal(sk)
+            } else if kind_s.starts_with("hint:") {
+                let k = &kind_s[5..];
+                let hk = match k {
+                    "title_changed" => HintKind::TitleChanged,
+                    "position" => HintKind::PositionChanged,
+                    "size" => HintKind::SizeChanged,
+                    _ => HintKind::TitleChanged,
+                };
+                EventKind::Hint(hk)
+            } else {
+                EventKind::Signal(SignalKind::AppChanged)
+            };
+            let payload = match (kind.clone(), payload_s) {
+                (EventKind::Signal(SignalKind::KeyboardInput), Some(js)) => {
+                    serde_json::from_str(&js)
+                        .map(EventPayload::Keyboard)
+                        .unwrap_or(EventPayload::None)
+                }
+                (EventKind::Signal(SignalKind::MouseInput), Some(js)) => serde_json::from_str(&js)
+                    .map(EventPayload::Mouse)
+                    .unwrap_or(EventPayload::None),
+                (EventKind::Signal(_), Some(js)) | (EventKind::Hint(_), Some(js)) => {
+                    // Focus, Lock or Title tuples
+                    if kind_s.contains("lock") {
+                        EventPayload::Lock { reason: js }
+                    } else if kind_s.contains("title") {
+                        // stored as tuple (window_id, title)
+                        match serde_json::from_str::<(String, String)>(&js) {
+                            Ok((wid, title)) => EventPayload::Title {
+                                window_id: wid,
+                                title,
+                            },
+                            Err(_) => EventPayload::None,
+                        }
+                    } else {
+                        serde_json::from_str(&js)
+                            .map(EventPayload::Focus)
+                            .unwrap_or(EventPayload::None)
+                    }
+                }
+                _ => EventPayload::None,
+            };
+
+            out.push(EventEnvelope {
+                id: event_id.unwrap_or(0) as u64,
+                timestamp,
+                source,
+                kind,
+                payload,
+                derived: derived_i != 0,
+                polling: polling_i != 0,
+                sensitive: sensitive_i != 0,
+            });
+        }
         Ok(out)
     }
 }

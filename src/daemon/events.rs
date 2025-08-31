@@ -63,6 +63,7 @@ impl RawEvent {
         }
     }
 
+    #[allow(dead_code)]
     pub fn event_id(&self) -> u64 {
         match self {
             RawEvent::KeyboardInput { event_id, .. } => *event_id,

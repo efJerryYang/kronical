@@ -67,7 +67,7 @@ fn pretty_format_duration(seconds: u64) -> String {
 pub fn ui(frame: &mut Frame, response: &MonitorResponse) {
     let main_layout = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(4), Constraint::Min(10)])
+        .constraints([Constraint::Length(5), Constraint::Min(10)])
         .split(frame.area());
 
     draw_daemon_stats(frame, main_layout[0], response);
@@ -98,6 +98,15 @@ fn draw_daemon_stats(frame: &mut Frame, area: Rect, response: &MonitorResponse) 
         .map(|p| p.to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
+    // Ensure state string is length 10
+    let mut state = response.state_history.clone();
+    if state.len() > 10 {
+        state = state[state.len() - 10..].to_string();
+    } else if state.len() < 10 {
+        let pad = " ".repeat(10 - state.len());
+        state = format!("{}{}", state, pad);
+    }
+
     let text = vec![
         Line::from(vec![
             Span::styled("Status: ", Style::default().fg(Color::Gray)),
@@ -114,6 +123,15 @@ fn draw_daemon_stats(frame: &mut Frame, area: Rect, response: &MonitorResponse) 
                 pid,
                 Style::default()
                     .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("State: ", Style::default().fg(Color::Gray)),
+            Span::styled(
+                state,
+                Style::default()
+                    .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             ),
         ]),
