@@ -653,17 +653,24 @@ fn normalize_title(s: &str) -> String {
 struct WindowIdInterner {
     map: HashMap<String, u32>,
     next: u32,
+    max_entries: usize,
 }
 impl WindowIdInterner {
     fn new() -> Self {
         Self {
             map: HashMap::new(),
             next: 1,
+            max_entries: 4096,
         }
     }
     fn intern(&mut self, s: &str) -> u32 {
         if let Some(&id) = self.map.get(s) {
             return id;
+        }
+        if self.map.len() >= self.max_entries {
+            self.map.clear();
+            self.map.shrink_to_fit();
+            self.next = 1;
         }
         let id = self.next;
         self.map.insert(s.to_string(), id);
