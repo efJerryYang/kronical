@@ -53,10 +53,10 @@ pub fn to_pb(s: &snapshot::Snapshot) -> SnapshotReply {
         crate::daemon::records::ActivityState::Locked => PbState::Locked,
     } as i32;
     let focus = s.focus.as_ref().map(|f| Focus {
-        app: f.app_name.clone(),
+        app: (*f.app_name).clone(),
         pid: f.pid,
-        window_id: f.window_id.clone(),
-        title: f.window_title.clone(),
+        window_id: f.window_id.to_string(),
+        title: (*f.window_title).clone(),
         since_rfc3339: f.window_instance_start.to_rfc3339(),
     });
     let last_transition = s.last_transition.as_ref().map(|t| Transition {

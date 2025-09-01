@@ -345,8 +345,8 @@ impl EventCoordinator {
                     let mut windows: Vec<SnapshotWindow> = Vec::with_capacity(agg.windows.len());
                     for w in agg.windows.values() {
                         windows.push(SnapshotWindow {
-                            window_id: w.window_id.clone(),
-                            window_title: w.window_title.clone(),
+                            window_id: w.window_id.to_string(),
+                            window_title: (*w.window_title).clone(),
                             first_seen: w.first_seen,
                             last_seen: w.last_seen,
                             duration_seconds: w.duration_seconds,
@@ -379,7 +379,7 @@ impl EventCoordinator {
                     windows.append(&mut groups);
                     windows.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
                     items.push(SnapshotApp {
-                        app_name: agg.app_name.clone(),
+                        app_name: (*agg.app_name).clone(),
                         pid: agg.pid,
                         process_start_time: agg.process_start_time,
                         windows,
@@ -433,8 +433,8 @@ impl EventCoordinator {
                                 Vec::with_capacity(agg.windows.len());
                             for w in agg.windows.values() {
                                 windows.push(SnapshotWindow {
-                                    window_id: w.window_id.clone(),
-                                    window_title: w.window_title.clone(),
+                                    window_id: w.window_id.to_string(),
+                                    window_title: (*w.window_title).clone(),
                                     first_seen: w.first_seen,
                                     last_seen: w.last_seen,
                                     duration_seconds: w.duration_seconds,
@@ -467,7 +467,7 @@ impl EventCoordinator {
                             windows.append(&mut groups);
                             windows.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
                             items.push(SnapshotApp {
-                                app_name: agg.app_name.clone(),
+                                app_name: (*agg.app_name).clone(),
                                 pid: agg.pid,
                                 process_start_time: agg.process_start_time,
                                 windows,

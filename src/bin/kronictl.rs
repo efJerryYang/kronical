@@ -1,5 +1,3 @@
-use kronical as _; // ensure library is linked
-                   // use kronical::monitor::ui as monitor_ui; // deprecated legacy
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use crossterm::{
@@ -8,6 +6,7 @@ use crossterm::{
 };
 #[cfg(feature = "kroni-api")]
 use hyper_util::rt::TokioIo;
+use kronical as _; // ensure library is linked
 #[cfg(feature = "kroni-api")]
 use kronical::kroni_api::kroni::v1::kroni_client::KroniClient;
 #[cfg(feature = "kroni-api")]
@@ -26,6 +25,7 @@ use ratatui::{
 use std::io::{self};
 use std::path::PathBuf;
 use std::process::{self, Command, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 #[cfg(feature = "kroni-api")]
@@ -122,7 +122,7 @@ fn spawn_kronid() -> Result<()> {
     Command::new(cmd)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
+        .stderr(Stdio::inherit())
         .spawn()
         .context("Failed to spawn kronid")?;
     Ok(())
@@ -720,9 +720,9 @@ fn grpc_snapshot(uds_http: &PathBuf) -> Result<kronical::daemon::snapshot::Snaps
             .map(|f| kronical::daemon::events::WindowFocusInfo {
                 pid: f.pid,
                 process_start_time: 0,
-                app_name: f.app,
-                window_title: f.title,
-                window_id: f.window_id,
+                app_name: Arc::new(f.app),
+                window_title: Arc::new(f.title),
+                window_id: f.window_id.parse().unwrap_or(0),
                 window_instance_start: DateTime::parse_from_rfc3339(&f.since_rfc3339)
                     .ok()
                     .map(|dt| dt.with_timezone(&Utc))

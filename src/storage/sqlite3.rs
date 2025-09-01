@@ -403,7 +403,7 @@ impl StorageBackend for SqliteStorage {
                         EventPayload::Lock { reason: js }
                     } else if kind_s.contains("title") {
                         // stored as tuple (window_id, title)
-                        match serde_json::from_str::<(String, String)>(&js) {
+                        match serde_json::from_str::<(u32, String)>(&js) {
                             Ok((wid, title)) => EventPayload::Title {
                                 window_id: wid,
                                 title,

@@ -4,14 +4,15 @@ use kronical::daemon::event_deriver::{LockDeriver, StateDeriver};
 use kronical::daemon::event_model::EventKind;
 use kronical::daemon::events::{RawEvent, WindowFocusInfo};
 use kronical::daemon::records::{ActivityState, RecordBuilder};
+use std::sync::Arc;
 
-fn mk_focus(pid: i32, app: &str, wid: &str, title: &str, ts: DateTime<Utc>) -> RawEvent {
+fn mk_focus(pid: i32, app: &str, wid: u32, title: &str, ts: DateTime<Utc>) -> RawEvent {
     let focus_info = WindowFocusInfo {
         pid,
         process_start_time: 42,
-        app_name: app.to_string(),
-        window_title: title.to_string(),
-        window_id: wid.to_string(),
+        app_name: Arc::new(app.to_string()),
+        window_title: Arc::new(title.to_string()),
+        window_id: wid,
         window_instance_start: ts,
         window_position: None,
         window_size: None,
@@ -95,7 +96,7 @@ fn test_end_to_end_stream_counts() {
 
     let mut batch: Vec<RawEvent> = Vec::new();
     // Initial focus
-    batch.push(mk_focus(100, "Safari", "w1", "A", now));
+    batch.push(mk_focus(100, "Safari", 1, "A", now));
 
     // 200 input events over 20s; title changes every 50 events; window switch at 150
     let mut expected_focus_splits = 1; // initial focus
@@ -109,12 +110,12 @@ fn test_end_to_end_stream_counts() {
         }
         if i % 50 == 0 {
             // title change
-            batch.push(mk_focus(100, "Safari", "w1", &format!("A-{}", i), ts));
+            batch.push(mk_focus(100, "Safari", 1, &format!("A-{}", i), ts));
             expected_title_splits += 1;
         }
         if i == 150 {
             // window switch
-            batch.push(mk_focus(100, "Safari", "w2", "B", ts));
+            batch.push(mk_focus(100, "Safari", 2, "B", ts));
             expected_focus_splits += 1;
         }
     }
@@ -155,14 +156,14 @@ fn test_end_to_end_with_lock() {
     let mut builder = RecordBuilder::new(ActivityState::Inactive);
 
     // Focus to app
-    let mut batch: Vec<RawEvent> = vec![mk_focus(200, "Code", "w1", "Edit", now)];
+    let mut batch: Vec<RawEvent> = vec![mk_focus(200, "Code", 1, "Edit", now)];
     // Become active
     batch.push(mk_kb(now + chrono::Duration::seconds(1)));
     // Switch to loginwindow (lock)
     batch.push(mk_focus(
         1,
         "loginwindow",
-        "lw",
+        999,
         "",
         now + chrono::Duration::seconds(5),
     ));
@@ -175,7 +176,7 @@ fn test_end_to_end_with_lock() {
     batch.push(mk_focus(
         200,
         "Code",
-        "w1",
+        1,
         "Edit",
         now + chrono::Duration::seconds(20),
     ));

@@ -1,4 +1,5 @@
 use crate::daemon::events::WindowFocusInfo;
+use crate::daemon::records::StringInterner;
 use crate::util::lru::LruCache;
 use chrono::{DateTime, Utc};
 use log::{debug, error, info, warn};
@@ -22,7 +23,7 @@ pub struct FocusState {
     pub app_name: String,
     pub pid: i32,
     pub window_title: String,
-    pub window_id: String,
+    pub window_id: u32,
     pub window_instance_start: DateTime<Utc>,
     pub process_start_time: u64,
     pub last_app_update: Instant,
@@ -35,7 +36,7 @@ impl FocusState {
             app_name: String::new(),
             pid: 0,
             window_title: String::new(),
-            window_id: String::new(),
+            window_id: 0,
             window_instance_start: Utc::now(),
             process_start_time: 0,
             last_app_update: Instant::now(),
@@ -47,17 +48,17 @@ impl FocusState {
         !self.app_name.is_empty()
             && !self.window_title.is_empty()
             && self.pid > 0
-            && !self.window_id.is_empty()
+            && self.window_id > 0
             && self.process_start_time > 0
     }
 
-    fn to_window_focus_info(&self) -> WindowFocusInfo {
+    fn to_window_focus_info(&self, interner: &mut StringInterner) -> WindowFocusInfo {
         WindowFocusInfo {
             pid: self.pid,
             process_start_time: self.process_start_time,
-            app_name: self.app_name.clone(),
-            window_title: self.window_title.clone(),
-            window_id: self.window_id.clone(),
+            app_name: interner.intern(&self.app_name),
+            window_title: interner.intern(&self.window_title),
+            window_id: self.window_id,
             window_instance_start: self.window_instance_start,
             window_position: None,
             window_size: None,
@@ -75,7 +76,8 @@ pub struct FocusEventWrapper {
     pid_cache: Arc<Mutex<LruCache<i32, u64>>>,
     poll_ms: Arc<AtomicU64>,
     should_stop_polling: Arc<AtomicBool>,
-    last_titles: Arc<Mutex<LruCache<String, String>>>, // window_id -> last_title (LRU-capped)
+    last_titles: Arc<Mutex<LruCache<u32, String>>>, // window_id -> last_title (LRU-capped)
+    string_interner: Arc<Mutex<StringInterner>>,
 }
 
 impl FocusEventWrapper {
@@ -102,6 +104,7 @@ impl FocusEventWrapper {
             } else {
                 LruCache::with_capacity(caps.title_cache_capacity)
             })),
+            string_interner: Arc::new(Mutex::new(StringInterner::new())),
         };
 
         if poll_interval.as_millis() > 0 {
@@ -186,9 +189,11 @@ impl FocusEventWrapper {
             // Wait a moment for the OS to settle the window title after a switch
             std::thread::sleep(Duration::from_millis(100));
             // On macOS-only support, assume info callback already provided latest details
-            let focus_info = state.to_window_focus_info();
+            let mut interner = self.string_interner.lock().unwrap();
+            let focus_info = state.to_window_focus_info(&mut interner);
             // Emit immediately on first title after app change; future quick duplicates suppressed by processor
             drop(state);
+            drop(interner);
             info!(
                 "FocusEventWrapper: Emitting consolidated focus change: {} -> {}",
                 focus_info.app_name, focus_info.window_title
@@ -210,13 +215,15 @@ impl FocusEventWrapper {
         state.pid = info.process_id;
         state.process_start_time = self.get_process_start_time(info.process_id);
         state.window_title = info.title.clone();
-        state.window_id = format!("{}", info.window_id);
+        state.window_id = info.window_id;
         state.window_instance_start = Utc::now();
         state.last_app_update = Instant::now();
         state.last_window_update = state.last_app_update;
         if state.is_complete() {
-            let focus_info = state.to_window_focus_info();
+            let mut interner = self.string_interner.lock().unwrap();
+            let focus_info = state.to_window_focus_info(&mut interner);
             drop(state);
+            drop(interner);
             info!(
                 "FocusEventWrapper: Emitting consolidated focus change (app+info): {} -> {}",
                 focus_info.app_name, focus_info.window_title
@@ -234,11 +241,13 @@ impl FocusEventWrapper {
             state.process_start_time = self.get_process_start_time(info.process_id);
         }
         state.window_title = info.title.clone();
-        state.window_id = format!("{}", info.window_id);
+        state.window_id = info.window_id;
         state.last_window_update = Instant::now();
         if state.is_complete() {
-            let focus_info = state.to_window_focus_info();
+            let mut interner = self.string_interner.lock().unwrap();
+            let focus_info = state.to_window_focus_info(&mut interner);
             drop(state);
+            drop(interner);
             info!(
                 "FocusEventWrapper: Emitting consolidated focus change (win+info): {} -> {}",
                 focus_info.app_name, focus_info.window_title
@@ -251,8 +260,10 @@ impl FocusEventWrapper {
         // Single attempt to emit a focus change after app change, only if window info has settled
         let state = self.current_state.lock().unwrap();
         if state.is_complete() {
-            let focus_info = state.to_window_focus_info();
+            let mut interner = self.string_interner.lock().unwrap();
+            let focus_info = state.to_window_focus_info(&mut interner);
             drop(state);
+            drop(interner);
             info!(
                 "FocusEventWrapper: Emitting consolidated focus change from app change: {} -> {}",
                 focus_info.app_name, focus_info.window_title
@@ -281,7 +292,7 @@ impl FocusEventWrapper {
 
                 match get_active_window_info() {
                     Ok(info) => {
-                        let window_id = format!("{}", info.window_id);
+                        let window_id = info.window_id;
                         let current_title = info.title.clone();
 
                         let mut titles = last_titles.lock().unwrap();
@@ -319,6 +330,7 @@ impl Clone for FocusEventWrapper {
             poll_ms: Arc::clone(&self.poll_ms),
             should_stop_polling: Arc::clone(&self.should_stop_polling),
             last_titles: Arc::clone(&self.last_titles),
+            string_interner: Arc::clone(&self.string_interner),
         }
     }
 }

@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 // no-op: keep minimal imports to avoid unused warnings
 use serde::{Deserialize, Serialize};
 use size_of::SizeOf;
+use std::sync::{Arc, Weak};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, SizeOf)]
 pub enum ActivityState {
@@ -27,8 +28,8 @@ pub struct ActivityRecord {
 
 #[derive(Debug, Clone)]
 pub struct WindowActivity {
-    pub window_id: String,
-    pub window_title: String,
+    pub window_id: u32,
+    pub window_title: Arc<String>,
     pub duration_seconds: u64,
     pub first_seen: DateTime<Utc>,
     pub last_seen: DateTime<Utc>,
@@ -37,7 +38,7 @@ pub struct WindowActivity {
 
 #[derive(Debug, Clone)]
 pub struct AggregatedActivity {
-    pub app_name: String,
+    pub app_name: Arc<String>,
     pub pid: i32,
     pub process_start_time: u64,
     pub windows: HashMap<u32, WindowActivity>,
@@ -65,6 +66,7 @@ pub struct RecordBuilder {
     current_record: Option<ActivityRecord>,
     current_focus: Option<WindowFocusInfo>,
     next_record_id: u64,
+    string_interner: StringInterner,
 }
 
 impl RecordBuilder {
@@ -74,6 +76,7 @@ impl RecordBuilder {
             current_record: None,
             current_focus: None,
             next_record_id: 1,
+            string_interner: StringInterner::new(),
         }
     }
 
@@ -96,7 +99,7 @@ impl RecordBuilder {
             }
             EventKind::Hint(HintKind::TitleChanged) => {
                 if let EventPayload::Title { window_id, title } = &env.payload {
-                    self.apply_title_change(window_id, title)
+                    self.apply_title_change(*window_id, title)
                 } else {
                     None
                 }
@@ -128,7 +131,7 @@ impl RecordBuilder {
         completed
     }
 
-    fn apply_title_change(&mut self, window_id: &str, new_title: &str) -> Option<ActivityRecord> {
+    fn apply_title_change(&mut self, window_id: u32, new_title: &str) -> Option<ActivityRecord> {
         let should_update = self
             .current_focus
             .as_ref()
@@ -137,7 +140,7 @@ impl RecordBuilder {
         if should_update {
             let completed = self.finalize_current();
             if let Some(cf) = &mut self.current_focus {
-                cf.window_title = new_title.to_string();
+                cf.window_title = self.string_interner.intern(new_title);
             }
             self.start_new_current();
             return completed;
@@ -198,13 +201,13 @@ mod tests {
         }
     }
 
-    fn mk_focus(pid: i32, app: &str, wid: &str, title: &str) -> WindowFocusInfo {
+    fn mk_focus(pid: i32, app: &str, wid: u32, title: &str) -> WindowFocusInfo {
         WindowFocusInfo {
             pid,
             process_start_time: 1,
-            app_name: app.to_string(),
-            window_title: title.to_string(),
-            window_id: wid.to_string(),
+            app_name: Arc::new(app.to_string()),
+            window_title: Arc::new(title.to_string()),
+            window_id: wid,
             window_instance_start: Utc::now(),
             window_position: None,
             window_size: None,
@@ -224,14 +227,14 @@ mod tests {
         }
     }
 
-    fn mk_env_title_changed(wid: &str, title: &str) -> EventEnvelope {
+    fn mk_env_title_changed(wid: u32, title: &str) -> EventEnvelope {
         EventEnvelope {
             id: 3,
             timestamp: Utc::now(),
             source: EventSource::Polling,
             kind: EventKind::Hint(HintKind::TitleChanged),
             payload: EventPayload::Title {
-                window_id: wid.to_string(),
+                window_id: wid,
                 title: title.to_string(),
             },
             derived: false,
@@ -275,7 +278,7 @@ mod tests {
         let mut rb = RecordBuilder::new(ActivityState::Inactive);
 
         // First focus -> start record (Inactive)
-        let f1 = mk_focus(100, "Safari", "w1", "Tab A");
+        let f1 = mk_focus(100, "Safari", 1, "Tab A");
         let _none = rb.on_hint(&mk_env_focus_changed(f1));
         assert!(rb.current_record.is_some());
         assert_eq!(
@@ -293,7 +296,7 @@ mod tests {
         );
 
         // Title change on same window
-        let completed2 = rb.on_hint(&mk_env_title_changed("w1", "Tab B"));
+        let completed2 = rb.on_hint(&mk_env_title_changed(1, "Tab B"));
         assert!(completed2.is_some());
         assert_eq!(completed2.unwrap().state, ActivityState::Active);
         assert_eq!(
@@ -302,7 +305,7 @@ mod tests {
         );
 
         // Focus change to another window
-        let f2 = mk_focus(100, "Safari", "w2", "Tab C");
+        let f2 = mk_focus(100, "Safari", 2, "Tab C");
         let completed3 = rb.on_hint(&mk_env_focus_changed(f2));
         assert!(completed3.is_some());
         assert_eq!(completed3.unwrap().state, ActivityState::Active);
@@ -329,7 +332,7 @@ mod tests {
         let mut builder = RecordBuilder::new(ActivityState::Inactive);
 
         // t0: focus change to w1 title A
-        let f1 = mk_focus(200, "Safari", "w1", "A");
+        let f1 = mk_focus(200, "Safari", 1, "A");
         let ev1 = RawEvent::WindowFocusChange {
             timestamp: now,
             event_id: 10,
@@ -363,7 +366,7 @@ mod tests {
         completed.clear();
 
         // t0+2s: same window, title changed to B
-        let f1b = mk_focus(200, "Safari", "w1", "B");
+        let f1b = mk_focus(200, "Safari", 1, "B");
         let ev2 = RawEvent::WindowFocusChange {
             timestamp: now + chrono::Duration::seconds(2),
             event_id: 11,
@@ -411,7 +414,7 @@ mod tests {
         let mut deriver = StateDeriver::new(now, 30, 300);
 
         // Focus to normal app (start a record)
-        let f = mk_focus(123, "Safari", "w1", "Home");
+        let f = mk_focus(123, "Safari", 1, "Home");
         let _ = builder.on_hint(&mk_env_focus_changed(f));
 
         // Become Active via keyboard
@@ -462,10 +465,10 @@ mod tests {
     #[test]
     fn test_title_change_ignored_for_different_window() {
         let mut rb = RecordBuilder::new(ActivityState::Active);
-        let f = mk_focus(1, "Terminal", "w1", "A");
+        let f = mk_focus(1, "Terminal", 1, "A");
         let _ = rb.on_hint(&mk_env_focus_changed(f));
         // Title change for a different window id should not split
-        let none = rb.on_hint(&mk_env_title_changed("w2", "Other"));
+        let none = rb.on_hint(&mk_env_title_changed(2, "Other"));
         assert!(none.is_none());
         // State remains
         assert_eq!(rb.current_state(), ActivityState::Active);
@@ -480,9 +483,9 @@ mod tests {
             let fi = WindowFocusInfo {
                 pid: 999,
                 process_start_time: 42,
-                app_name: "EphemeralApp".to_string(),
-                window_title: title.to_string(),
-                window_id: format!("win-{}", id),
+                app_name: Arc::new("EphemeralApp".to_string()),
+                window_title: Arc::new(title.to_string()),
+                window_id: id as u32,
                 window_instance_start: start,
                 window_position: None,
                 window_size: None,
@@ -528,7 +531,6 @@ pub fn aggregate_activities_since(
     max_windows_per_app: usize,
 ) -> Vec<AggregatedActivity> {
     let mut app_map: HashMap<(u32, u64), AggregatedActivity> = HashMap::new();
-    let mut interner = WindowIdInterner::new();
 
     for record in records {
         if let Some(focus_info) = &record.focus_info {
@@ -561,22 +563,23 @@ pub fn aggregate_activities_since(
             aggregated.first_seen = aggregated.first_seen.min(rec_start);
             aggregated.last_seen = aggregated.last_seen.max(rec_end);
 
-            if !focus_info.window_title.is_empty() && !focus_info.window_id.is_empty() {
-                let wid_id = interner.intern(&focus_info.window_id);
+            if !focus_info.window_title.is_empty() && focus_info.window_id > 0 {
+                let window_id = focus_info.window_id;
+                let window_title_arc = focus_info.window_title.clone();
                 let window_activity =
                     aggregated
                         .windows
-                        .entry(wid_id)
+                        .entry(window_id)
                         .or_insert_with(|| WindowActivity {
-                            window_id: focus_info.window_id.clone(),
-                            window_title: focus_info.window_title.clone(),
+                            window_id,
+                            window_title: window_title_arc.clone(),
                             duration_seconds: 0,
                             first_seen: rec_start,
                             last_seen: rec_end,
                             record_count: 0,
                         });
 
-                window_activity.window_title = focus_info.window_title.clone();
+                window_activity.window_title = window_title_arc;
                 window_activity.duration_seconds += duration;
                 window_activity.first_seen = window_activity.first_seen.min(rec_start);
                 window_activity.last_seen = window_activity.last_seen.max(rec_end);
@@ -650,31 +653,43 @@ fn normalize_title(s: &str) -> String {
     s.trim().to_lowercase()
 }
 
-struct WindowIdInterner {
-    map: HashMap<String, u32>,
-    next: u32,
+pub struct StringInterner {
+    map: HashMap<String, Weak<String>>,
     max_entries: usize,
 }
-impl WindowIdInterner {
-    fn new() -> Self {
+
+impl StringInterner {
+    pub fn new() -> Self {
         Self {
             map: HashMap::new(),
-            next: 1,
             max_entries: 4096,
         }
     }
-    fn intern(&mut self, s: &str) -> u32 {
-        if let Some(&id) = self.map.get(s) {
-            return id;
+
+    pub fn intern(&mut self, s: &str) -> Arc<String> {
+        self.cleanup_dead_references();
+
+        if let Some(weak_ref) = self.map.get(s) {
+            if let Some(arc_string) = weak_ref.upgrade() {
+                return arc_string;
+            }
         }
+
+        if self.map.len() >= self.max_entries {
+            self.cleanup_dead_references();
+        }
+
+        let arc_string = Arc::new(s.to_string());
+        self.map.insert(s.to_string(), Arc::downgrade(&arc_string));
+        arc_string
+    }
+
+    fn cleanup_dead_references(&mut self) {
+        self.map.retain(|_, weak_ref| weak_ref.strong_count() > 0);
+
         if self.map.len() >= self.max_entries {
             self.map.clear();
             self.map.shrink_to_fit();
-            self.next = 1;
         }
-        let id = self.next;
-        self.map.insert(s.to_string(), id);
-        self.next = self.next.saturating_add(1);
-        id
     }
 }

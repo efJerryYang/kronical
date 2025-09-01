@@ -5,6 +5,8 @@ use kronical::storage::StorageBackend;
 use kronical::util::config::AppConfig;
 use log::{error, info};
 use std::path::PathBuf;
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
+use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
 
 fn ensure_workspace_dir(workspace_dir: &PathBuf) -> Result<()> {
     if !workspace_dir.exists() {
@@ -19,21 +21,54 @@ fn write_pid_file(pid_file: &PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn main() {
-    env_logger::Builder::from_default_env()
-        .filter_level(log::LevelFilter::Info)
+fn setup_file_logging(log_dir: &PathBuf) -> Result<()> {
+    std::fs::create_dir_all(log_dir).context("Failed to create log directory")?;
+
+    let file_appender = RollingFileAppender::builder()
+        .rotation(Rotation::DAILY)
+        .filename_prefix("kronid")
+        .filename_suffix("log")
+        .max_log_files(7)
+        .build(log_dir)
+        .context("Failed to create log appender")?;
+
+    let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
+    tracing_subscriber::registry()
+        .with(
+            fmt::layer()
+                .with_writer(file_appender)
+                .with_target(true)
+                .with_thread_ids(true)
+                .with_level(true)
+                .with_ansi(false)
+                .with_timer(fmt::time::ChronoUtc::new(
+                    "%Y-%m-%dT%H:%M:%S%.6fZ".to_string(),
+                )),
+        )
+        .with(env_filter)
         .init();
 
+    Ok(())
+}
+
+fn main() {
     let config = match AppConfig::load() {
         Ok(c) => c,
         Err(e) => {
-            error!("Failed to load configuration: {}", e);
+            eprintln!("Failed to load configuration: {}", e);
             std::process::exit(1);
         }
     };
 
     if let Err(e) = ensure_workspace_dir(&config.workspace_dir) {
-        error!("Failed to create workspace directory: {}", e);
+        eprintln!("Failed to create workspace directory: {}", e);
+        std::process::exit(1);
+    }
+
+    let log_dir = config.workspace_dir.join("logs");
+    if let Err(e) = setup_file_logging(&log_dir) {
+        eprintln!("Failed to setup logging: {}", e);
         std::process::exit(1);
     }
 

@@ -135,8 +135,8 @@ impl EventAdapter {
                                 source: EventSource::Polling,
                                 kind: EventKind::Hint(HintKind::TitleChanged),
                                 payload: EventPayload::Title {
-                                    window_id: current.window_id.clone(),
-                                    title: current.window_title.clone(),
+                                    window_id: current.window_id,
+                                    title: (*current.window_title).clone(),
                                 },
                                 derived: false,
                                 polling: true,

@@ -1,6 +1,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use size_of::SizeOf;
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Serialize, Deserialize, SizeOf)]
 pub struct MousePosition {
@@ -27,9 +28,9 @@ pub struct MouseEventData {
 pub struct WindowFocusInfo {
     pub pid: i32,
     pub process_start_time: u64,
-    pub app_name: String,
-    pub window_title: String,
-    pub window_id: String,
+    pub app_name: Arc<String>,
+    pub window_title: Arc<String>,
+    pub window_id: u32,
     pub window_instance_start: DateTime<Utc>,
     pub window_position: Option<MousePosition>,
     pub window_size: Option<(u32, u32)>,
