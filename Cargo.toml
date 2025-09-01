@@ -14,9 +14,6 @@ path = "src/bin/kronictl.rs"
 name = "kronid"
 path = "src/bin/kronid.rs"
 
-[[bin]]
-name = "kroniadm"
-path = "src/bin/kroniadm.rs"
 
 [dependencies]
 # Use local vendor winshift with richer callbacks (ActiveWindowInfo)
