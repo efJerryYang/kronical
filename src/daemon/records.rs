@@ -171,6 +171,10 @@ impl RecordBuilder {
     pub fn current_state(&self) -> ActivityState {
         self.current_state
     }
+
+    pub fn current_focus(&self) -> Option<WindowFocusInfo> {
+        self.current_focus.clone()
+    }
 }
 
 #[cfg(test)]

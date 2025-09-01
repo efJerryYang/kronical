@@ -6,10 +6,15 @@ use crate::daemon::records::ActivityRecord;
 use crate::storage::StorageBackend;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use once_cell::sync::Lazy;
 use rusqlite::{params, Connection};
 use serde_json;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+use std::sync::{
+    atomic::{AtomicU64, Ordering},
+    RwLock,
+};
 use std::thread;
 
 pub enum StorageCommand {
@@ -17,6 +22,35 @@ pub enum StorageCommand {
     Record(ActivityRecord),
     Envelope(EventEnvelope),
     Shutdown,
+}
+
+static STORAGE_BACKLOG: AtomicU64 = AtomicU64::new(0);
+static LAST_FLUSH_AT: Lazy<RwLock<Option<DateTime<Utc>>>> = Lazy::new(|| RwLock::new(None));
+
+fn inc_backlog() {
+    let _ = STORAGE_BACKLOG.fetch_add(1, Ordering::Relaxed);
+}
+fn dec_backlog() {
+    let _ = STORAGE_BACKLOG.fetch_sub(1, Ordering::Relaxed);
+}
+fn set_last_flush(t: DateTime<Utc>) {
+    if let Ok(mut g) = LAST_FLUSH_AT.write() {
+        *g = Some(t);
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct StorageMetrics {
+    pub backlog_count: u64,
+    pub last_flush_at: Option<DateTime<Utc>>,
+}
+
+pub fn storage_metrics() -> StorageMetrics {
+    let last = LAST_FLUSH_AT.read().ok().and_then(|g| (*g).clone());
+    StorageMetrics {
+        backlog_count: STORAGE_BACKLOG.load(Ordering::Relaxed),
+        last_flush_at: last,
+    }
 }
 
 pub struct SqliteStorage {
@@ -171,17 +205,25 @@ impl SqliteStorage {
 
             if let Err(e) = result {
                 eprintln!("Failed to write to DB: {}", e);
+                crate::daemon::snapshot::push_health(format!("db write error: {}", e));
             }
 
             count += 1;
             if count % 100 == 0 {
                 if let Err(e) = tx.commit() {
                     eprintln!("Failed to commit transaction: {}", e);
+                    crate::daemon::snapshot::push_health(format!("db commit error: {}", e));
                 }
+                set_last_flush(Utc::now());
                 tx = conn.transaction().expect("Failed to start new transaction");
             }
+            dec_backlog();
         }
-        let _ = tx.commit();
+        if let Err(e) = tx.commit() {
+            eprintln!("Final commit error: {}", e);
+            crate::daemon::snapshot::push_health(format!("db final commit error: {}", e));
+        }
+        set_last_flush(Utc::now());
     }
 }
 
@@ -191,6 +233,7 @@ impl StorageBackend for SqliteStorage {
             self.sender
                 .send(StorageCommand::RawEvent(event))
                 .context("Failed to send raw event to writer")?;
+            inc_backlog();
         }
         Ok(())
     }
@@ -200,6 +243,7 @@ impl StorageBackend for SqliteStorage {
             self.sender
                 .send(StorageCommand::Record(record.clone()))
                 .context("Failed to send record to writer")?;
+            inc_backlog();
         }
         Ok(())
     }
@@ -216,6 +260,7 @@ impl StorageBackend for SqliteStorage {
             self.sender
                 .send(StorageCommand::Envelope(env))
                 .context("Failed to send envelope to writer")?;
+            inc_backlog();
         }
         Ok(())
     }

@@ -1,9 +1,9 @@
-use chronicle::daemon::event_adapter::EventAdapter;
-use chronicle::daemon::event_deriver::{LockDeriver, StateDeriver};
-use chronicle::daemon::event_model::{EventKind, EventSource, HintKind, SignalKind};
-use chronicle::daemon::events::{RawEvent, WindowFocusInfo};
-use chronicle::daemon::records::{ActivityState, RecordBuilder};
 use chrono::{DateTime, Utc};
+use kronical::daemon::event_adapter::EventAdapter;
+use kronical::daemon::event_deriver::{LockDeriver, StateDeriver};
+use kronical::daemon::event_model::{EventKind, EventSource, HintKind, SignalKind};
+use kronical::daemon::events::{RawEvent, WindowFocusInfo};
+use kronical::daemon::records::{ActivityState, RecordBuilder};
 
 fn mk_focus(pid: i32, app: &str, wid: &str, title: &str, ts: DateTime<Utc>) -> RawEvent {
     let focus_info = WindowFocusInfo {
@@ -27,7 +27,7 @@ fn mk_kb(ts: DateTime<Utc>) -> RawEvent {
     RawEvent::KeyboardInput {
         timestamp: ts,
         event_id: ts.timestamp_millis() as u64,
-        data: chronicle::daemon::events::KeyboardEventData {
+        data: kronical::daemon::events::KeyboardEventData {
             key_code: Some(42),
             key_char: None,
             modifiers: vec![],
@@ -39,8 +39,8 @@ fn mk_mouse(ts: DateTime<Utc>) -> RawEvent {
     RawEvent::MouseInput {
         timestamp: ts,
         event_id: ts.timestamp_millis() as u64,
-        data: chronicle::daemon::events::MouseEventData {
-            position: chronicle::daemon::events::MousePosition { x: 0, y: 0 },
+        data: kronical::daemon::events::MouseEventData {
+            position: kronical::daemon::events::MousePosition { x: 0, y: 0 },
             button: None,
             click_count: None,
             wheel_delta: None,
@@ -54,7 +54,7 @@ fn process_batch(
     state_deriver: &mut StateDeriver,
     builder: &mut RecordBuilder,
     batch: Vec<RawEvent>,
-) -> Vec<chronicle::daemon::records::ActivityRecord> {
+) -> Vec<kronical::daemon::records::ActivityRecord> {
     let mut completed = Vec::new();
     let envs = adapter.adapt_batch(&batch);
     let envs = lock_deriver.derive(&envs);

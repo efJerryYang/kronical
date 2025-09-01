@@ -1,7 +1,7 @@
-use chronicle::daemon::event_adapter::EventAdapter;
-use chronicle::daemon::event_model::{EventKind, HintKind};
-use chronicle::daemon::events::{RawEvent, WindowFocusInfo};
 use chrono::Utc;
+use kronical::daemon::event_adapter::EventAdapter;
+use kronical::daemon::event_model::{EventKind, HintKind};
+use kronical::daemon::events::{RawEvent, WindowFocusInfo};
 
 #[test]
 fn title_only_change_emits_only_hint() {

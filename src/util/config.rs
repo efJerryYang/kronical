@@ -23,7 +23,7 @@ pub struct AppConfig {
 impl Default for AppConfig {
     fn default() -> Self {
         let workspace_dir = if let Some(home) = dirs::home_dir() {
-            home.join(".chronicle")
+            home.join(".kronical")
         } else {
             panic!("Failed to determine home directory")
         };
@@ -72,7 +72,7 @@ impl AppConfig {
         }
 
         // Allow environment variables to override config
-        builder = builder.add_source(Environment::with_prefix("CHRONICLE"));
+        builder = builder.add_source(Environment::with_prefix("KRONICAL"));
 
         let config = builder.build()?;
         let app_config: AppConfig = config.try_deserialize()?;
