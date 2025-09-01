@@ -3,7 +3,7 @@
 use crate::daemon::snapshot;
 use anyhow::Result;
 use axum::response::sse::{Event, Sse};
-use axum::{routing::get, Json, Router};
+use axum::{Json, Router, routing::get};
 use futures_util::stream::Stream;
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
@@ -21,8 +21,8 @@ async fn snapshot_handler() -> Json<snapshot::Snapshot> {
 }
 
 async fn stream_handler() -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
-    use tokio_stream::wrappers::IntervalStream;
     use tokio_stream::StreamExt;
+    use tokio_stream::wrappers::IntervalStream;
     let stream = IntervalStream::new(tokio::time::interval(Duration::from_millis(500))).map(|_| {
         let snap = snapshot::get_current();
         let data = serde_json::to_string(&*snap).unwrap_or_else(|_| "{}".into());

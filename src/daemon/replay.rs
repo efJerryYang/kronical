@@ -1,5 +1,5 @@
 use crate::daemon::event_model::{EventKind, HintKind};
-use crate::daemon::records::{aggregate_activities_since, ActivityRecord, RecordBuilder};
+use crate::daemon::records::{ActivityRecord, RecordBuilder, aggregate_activities_since};
 use crate::storage::StorageBackend;
 use anyhow::Result;
 use chrono::{DateTime, Utc};

@@ -9,7 +9,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 use sysinfo::{Pid, System};
 #[cfg(target_os = "macos")]
-use winshift::{get_active_window_info, ActiveWindowInfo};
+use winshift::{ActiveWindowInfo, get_active_window_info};
 
 #[derive(Debug, Clone, Copy)]
 pub struct FocusCacheCaps {

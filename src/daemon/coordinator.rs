@@ -3,12 +3,13 @@ use crate::daemon::event_adapter::EventAdapter;
 use crate::daemon::event_deriver::LockDeriver;
 use crate::daemon::events::{KeyboardEventData, MouseEventData, MousePosition, WindowFocusInfo};
 use crate::daemon::focus_tracker::{FocusCacheCaps, FocusChangeCallback, FocusEventWrapper};
-use crate::daemon::records::{aggregate_activities_since, ActivityRecord};
+use crate::daemon::records::{ActivityRecord, aggregate_activities_since};
+use crate::daemon::system_tracker::SystemTracker;
 // legacy socket server removed
 use crate::storage::StorageBackend;
 use anyhow::Result;
 use log::{debug, error, info, trace};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 use uiohook_rs::{EventHandler, Uiohook, UiohookEvent};
@@ -169,6 +170,9 @@ pub struct EventCoordinator {
     title_cache_capacity: usize,
     title_cache_ttl_secs: u64,
     focus_interner_max_strings: usize,
+    tracker_enabled: bool,
+    tracker_interval_secs: f64,
+    tracker_batch_size: usize,
 }
 
 impl EventCoordinator {
@@ -185,6 +189,9 @@ impl EventCoordinator {
         title_cache_capacity: usize,
         title_cache_ttl_secs: u64,
         focus_interner_max_strings: usize,
+        tracker_enabled: bool,
+        tracker_interval_secs: f64,
+        tracker_batch_size: usize,
     ) -> Self {
         Self {
             retention_minutes,
@@ -199,6 +206,9 @@ impl EventCoordinator {
             title_cache_capacity,
             title_cache_ttl_secs,
             focus_interner_max_strings,
+            tracker_enabled,
+            tracker_interval_secs,
+            tracker_batch_size,
         }
     }
 
@@ -271,6 +281,25 @@ impl EventCoordinator {
                 error!("Failed to start HTTP admin: {}", e);
             } else {
                 info!("HTTP admin server started successfully");
+            }
+        }
+
+        if self.tracker_enabled {
+            let current_pid = std::process::id();
+            let tracker_zip_path = pid_file.parent().unwrap().join("system-tracker.zip");
+            let tracker = SystemTracker::new(
+                current_pid,
+                self.tracker_interval_secs,
+                self.tracker_batch_size,
+                tracker_zip_path,
+            );
+            if let Err(e) = tracker.start() {
+                error!("Failed to start system tracker: {}", e);
+            } else {
+                info!(
+                    "System tracker started successfully for PID {}",
+                    current_pid
+                );
             }
         }
 

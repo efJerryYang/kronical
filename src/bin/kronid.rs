@@ -1,12 +1,12 @@
 use anyhow::{Context, Result};
 use kronical::daemon::coordinator::EventCoordinator;
-use kronical::storage::sqlite3::SqliteStorage;
 use kronical::storage::StorageBackend;
+use kronical::storage::sqlite3::SqliteStorage;
 use kronical::util::config::AppConfig;
 use log::{error, info};
 use std::path::PathBuf;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
-use tracing_subscriber::{fmt, layer::SubscriberExt, util::SubscriberInitExt, EnvFilter};
+use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 fn ensure_workspace_dir(workspace_dir: &PathBuf) -> Result<()> {
     if !workspace_dir.exists() {
@@ -102,6 +102,9 @@ fn main() {
         config.title_cache_capacity,
         config.title_cache_ttl_secs,
         config.focus_interner_max_strings,
+        config.tracker_enabled,
+        config.tracker_interval_secs,
+        config.tracker_batch_size,
     );
 
     info!("Kronicle daemon will run on MAIN THREAD (required by macOS hooks)");

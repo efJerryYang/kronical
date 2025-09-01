@@ -33,7 +33,7 @@ fn parses_single_sse_event_into_snapshot() {
             data_buf.push_str(payload);
             data_buf.push('\n');
         } else if line.is_empty() { // event delimiter
-             // complete event
+            // complete event
         }
     }
     let parsed: Snapshot = serde_json::from_str(data_buf.trim_end()).unwrap();

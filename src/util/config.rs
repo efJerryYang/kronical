@@ -18,6 +18,9 @@ pub struct AppConfig {
     pub title_cache_capacity: usize,
     pub title_cache_ttl_secs: u64,
     pub focus_interner_max_strings: usize,
+    pub tracker_enabled: bool,
+    pub tracker_interval_secs: f64,
+    pub tracker_batch_size: usize,
 }
 
 impl Default for AppConfig {
@@ -30,7 +33,7 @@ impl Default for AppConfig {
 
         Self {
             workspace_dir,
-            retention_minutes: 10,
+            retention_minutes: 72 * 60,
             active_grace_secs: 30,
             idle_threshold_secs: 300,
             ephemeral_max_duration_secs: 60,
@@ -42,6 +45,9 @@ impl Default for AppConfig {
             title_cache_capacity: 512,
             title_cache_ttl_secs: 0,
             focus_interner_max_strings: 4096,
+            tracker_enabled: false,
+            tracker_interval_secs: 1.0,
+            tracker_batch_size: 60,
         }
     }
 }
@@ -53,7 +59,7 @@ impl AppConfig {
 
         let mut builder = Config::builder()
             .set_default("workspace_dir", workspace_dir.to_str().unwrap())?
-            .set_default("retention_minutes", 10)?
+            .set_default("retention_minutes", 72 * 60)?
             .set_default("active_grace_secs", 30)?
             .set_default("idle_threshold_secs", 300)?
             .set_default("ephemeral_max_duration_secs", 60)?
@@ -64,7 +70,10 @@ impl AppConfig {
             .set_default("pid_cache_capacity", 1024)?
             .set_default("title_cache_capacity", 512)?
             .set_default("title_cache_ttl_secs", 0)?
-            .set_default("focus_interner_max_strings", 4096)?;
+            .set_default("focus_interner_max_strings", 4096)?
+            .set_default("tracker_enabled", false)?
+            .set_default("tracker_interval_secs", 1.0)?
+            .set_default("tracker_batch_size", 60)?;
 
         // Load config file if it exists
         if config_path.exists() {

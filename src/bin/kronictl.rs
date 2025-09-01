@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use crossterm::{
     event as crossterm_event, execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 #[cfg(feature = "kroni-api")]
 use hyper_util::rt::TokioIo;
@@ -11,16 +11,16 @@ use kronical as _; // ensure library is linked
 use kronical::kroni_api::kroni::v1::kroni_client::KroniClient;
 #[cfg(feature = "kroni-api")]
 use kronical::kroni_api::kroni::v1::{SnapshotRequest, WatchRequest};
-use kronical::storage::sqlite3::SqliteStorage;
 use kronical::storage::StorageBackend;
+use kronical::storage::sqlite3::SqliteStorage;
 use kronical::util::config::AppConfig;
 use log::error;
 use ratatui::{
+    Terminal,
     prelude::{Backend, Constraint, CrosstermBackend, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, Paragraph, Wrap},
-    Terminal,
 };
 use std::io::{self};
 use std::path::PathBuf;

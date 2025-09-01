@@ -4,10 +4,9 @@ use crate::util::maps::{HashMap, HashSet};
 use chrono::{DateTime, Utc};
 // no-op: keep minimal imports to avoid unused warnings
 use serde::{Deserialize, Serialize};
-use size_of::SizeOf;
 use std::sync::{Arc, Weak};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, SizeOf)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ActivityState {
     Active,
     Passive,
@@ -15,7 +14,7 @@ pub enum ActivityState {
     Locked,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, SizeOf)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActivityRecord {
     pub record_id: u64,
     pub start_time: DateTime<Utc>,

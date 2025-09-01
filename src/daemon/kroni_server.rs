@@ -3,11 +3,10 @@
 use crate::daemon::snapshot;
 use crate::kroni_api::kroni::v1::kroni_server::{Kroni, KroniServer};
 use crate::kroni_api::kroni::v1::{
-    snapshot_reply::ActivityState as PbState, snapshot_reply::Cadence, snapshot_reply::Config,
-    snapshot_reply::Counts, snapshot_reply::Focus, snapshot_reply::Replay,
-    snapshot_reply::SnapshotApp as PbApp, snapshot_reply::SnapshotWindow as PbWin,
-    snapshot_reply::Storage, snapshot_reply::Transition, SnapshotReply, SnapshotRequest,
-    WatchRequest,
+    SnapshotReply, SnapshotRequest, WatchRequest, snapshot_reply::ActivityState as PbState,
+    snapshot_reply::Cadence, snapshot_reply::Config, snapshot_reply::Counts, snapshot_reply::Focus,
+    snapshot_reply::Replay, snapshot_reply::SnapshotApp as PbApp,
+    snapshot_reply::SnapshotWindow as PbWin, snapshot_reply::Storage, snapshot_reply::Transition,
 };
 use anyhow::Result;
 use futures_core::Stream;
@@ -15,9 +14,9 @@ use log::{info, warn};
 use std::path::PathBuf;
 use std::pin::Pin;
 use tokio::net::UnixListener;
-use tokio_stream::wrappers::IntervalStream;
 use tokio_stream::StreamExt;
-use tonic::{transport::Server, Request, Response, Status};
+use tokio_stream::wrappers::IntervalStream;
+use tonic::{Request, Response, Status, transport::Server};
 
 #[derive(Clone, Default)]
 struct KroniSvc {}

@@ -7,13 +7,13 @@ use crate::storage::StorageBackend;
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use once_cell::sync::Lazy;
-use rusqlite::{params, Connection};
+use rusqlite::{Connection, params};
 use serde_json;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::sync::{
-    atomic::{AtomicU64, Ordering},
     RwLock,
+    atomic::{AtomicU64, Ordering},
 };
 use std::thread;
 

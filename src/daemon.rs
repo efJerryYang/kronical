@@ -7,6 +7,7 @@ pub mod events;
 pub mod focus_tracker;
 pub mod records;
 pub mod replay;
+pub mod system_tracker;
 // legacy socket_server removed
 pub mod snapshot;
 
