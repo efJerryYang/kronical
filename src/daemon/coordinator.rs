@@ -329,8 +329,9 @@ impl EventCoordinator {
                 let mut short_per_name: StdHashMap<
                     &str,
                     Vec<&crate::daemon::records::AggregatedActivity>,
-                > = StdHashMap::new();
-                let mut normal: Vec<&crate::daemon::records::AggregatedActivity> = Vec::new();
+                > = StdHashMap::with_capacity(16);
+                let mut normal: Vec<&crate::daemon::records::AggregatedActivity> =
+                    Vec::with_capacity(aggregated_activities.len());
                 for agg in aggregated_activities.iter() {
                     if agg.total_duration_seconds <= app_short_max_duration_secs {
                         short_per_name.entry(&agg.app_name).or_default().push(agg);
@@ -338,45 +339,43 @@ impl EventCoordinator {
                         normal.push(agg);
                     }
                 }
-                let mut items: Vec<SnapshotApp> = Vec::new();
+                let mut items: Vec<SnapshotApp> =
+                    Vec::with_capacity(normal.len() + short_per_name.len());
                 for agg in normal {
-                    let mut windows: Vec<SnapshotWindow> = agg
-                        .windows
-                        .values()
-                        .map(|w| SnapshotWindow {
+                    let mut windows: Vec<SnapshotWindow> = Vec::with_capacity(agg.windows.len());
+                    for w in agg.windows.values() {
+                        windows.push(SnapshotWindow {
                             window_id: w.window_id.clone(),
                             window_title: w.window_title.clone(),
                             first_seen: w.first_seen,
                             last_seen: w.last_seen,
                             duration_seconds: w.duration_seconds,
                             is_group: false,
-                        })
-                        .collect();
-                    let mut groups: Vec<SnapshotWindow> = agg
-                        .ephemeral_groups
-                        .values()
-                        .map(|g| {
-                            let avg = if g.occurrence_count > 0 {
-                                g.total_duration_seconds / g.occurrence_count as u64
-                            } else {
-                                0
-                            };
-                            let title = format!(
-                                "{} (short-lived) ×{} avg {}",
-                                g.title_key,
-                                g.distinct_ids.len(),
-                                pretty_format_duration(avg)
-                            );
-                            SnapshotWindow {
-                                window_id: format!("group:{}", g.title_key),
-                                window_title: title,
-                                first_seen: g.first_seen,
-                                last_seen: g.last_seen,
-                                duration_seconds: g.total_duration_seconds,
-                                is_group: true,
-                            }
-                        })
-                        .collect();
+                        });
+                    }
+                    let mut groups: Vec<SnapshotWindow> =
+                        Vec::with_capacity(agg.ephemeral_groups.len());
+                    for g in agg.ephemeral_groups.values() {
+                        let avg = if g.occurrence_count > 0 {
+                            g.total_duration_seconds / g.occurrence_count as u64
+                        } else {
+                            0
+                        };
+                        let title = format!(
+                            "{} (short-lived) ×{} avg {}",
+                            g.title_key,
+                            g.distinct_ids.len(),
+                            pretty_format_duration(avg)
+                        );
+                        groups.push(SnapshotWindow {
+                            window_id: format!("group:{}", g.title_key),
+                            window_title: title,
+                            first_seen: g.first_seen,
+                            last_seen: g.last_seen,
+                            duration_seconds: g.total_duration_seconds,
+                            is_group: true,
+                        });
+                    }
                     windows.append(&mut groups);
                     windows.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
                     items.push(SnapshotApp {
@@ -430,43 +429,41 @@ impl EventCoordinator {
                         });
                     } else {
                         for agg in v {
-                            let mut windows: Vec<SnapshotWindow> = agg
-                                .windows
-                                .values()
-                                .map(|w| SnapshotWindow {
+                            let mut windows: Vec<SnapshotWindow> =
+                                Vec::with_capacity(agg.windows.len());
+                            for w in agg.windows.values() {
+                                windows.push(SnapshotWindow {
                                     window_id: w.window_id.clone(),
                                     window_title: w.window_title.clone(),
                                     first_seen: w.first_seen,
                                     last_seen: w.last_seen,
                                     duration_seconds: w.duration_seconds,
                                     is_group: false,
-                                })
-                                .collect();
-                            let mut groups: Vec<SnapshotWindow> = agg
-                                .ephemeral_groups
-                                .values()
-                                .map(|g| {
-                                    let avg = if g.occurrence_count > 0 {
-                                        g.total_duration_seconds / g.occurrence_count as u64
-                                    } else {
-                                        0
-                                    };
-                                    let title = format!(
-                                        "{} (short-lived) ×{} avg {}",
-                                        g.title_key,
-                                        g.distinct_ids.len(),
-                                        pretty_format_duration(avg)
-                                    );
-                                    SnapshotWindow {
-                                        window_id: format!("group:{}", g.title_key),
-                                        window_title: title,
-                                        first_seen: g.first_seen,
-                                        last_seen: g.last_seen,
-                                        duration_seconds: g.total_duration_seconds,
-                                        is_group: true,
-                                    }
-                                })
-                                .collect();
+                                });
+                            }
+                            let mut groups: Vec<SnapshotWindow> =
+                                Vec::with_capacity(agg.ephemeral_groups.len());
+                            for g in agg.ephemeral_groups.values() {
+                                let avg = if g.occurrence_count > 0 {
+                                    g.total_duration_seconds / g.occurrence_count as u64
+                                } else {
+                                    0
+                                };
+                                let title = format!(
+                                    "{} (short-lived) ×{} avg {}",
+                                    g.title_key,
+                                    g.distinct_ids.len(),
+                                    pretty_format_duration(avg)
+                                );
+                                groups.push(SnapshotWindow {
+                                    window_id: format!("group:{}", g.title_key),
+                                    window_title: title,
+                                    first_seen: g.first_seen,
+                                    last_seen: g.last_seen,
+                                    duration_seconds: g.total_duration_seconds,
+                                    is_group: true,
+                                });
+                            }
                             windows.append(&mut groups);
                             windows.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
                             items.push(SnapshotApp {
@@ -512,10 +509,8 @@ impl EventCoordinator {
                         for r in recs.drain(..) {
                             recent_records.push_back(r);
                         }
-                        let records_vec: Vec<ActivityRecord> =
-                            recent_records.iter().cloned().collect();
                         let _agg = aggregate_activities_since(
-                            &records_vec,
+                            recent_records.make_contiguous(),
                             since0,
                             now0,
                             eph_max,
@@ -613,10 +608,8 @@ impl EventCoordinator {
                                 }
                                 #[cfg(feature = "kroni-api")]
                                 let agg = {
-                                    let records_vec: Vec<ActivityRecord> =
-                                        recent_records.iter().cloned().collect();
                                     aggregate_activities_since(
-                                        &records_vec,
+                                        recent_records.make_contiguous(),
                                         since,
                                         now,
                                         eph_max,
@@ -864,10 +857,8 @@ impl EventCoordinator {
                                 }
                                 #[cfg(feature = "kroni-api")]
                                 let agg = {
-                                    let records_vec: Vec<ActivityRecord> =
-                                        recent_records.iter().cloned().collect();
                                     aggregate_activities_since(
-                                        &records_vec,
+                                        recent_records.make_contiguous(),
                                         since,
                                         now,
                                         eph_max,
@@ -985,10 +976,8 @@ impl EventCoordinator {
                         }
                         #[cfg(feature = "kroni-api")]
                         let agg = {
-                            let records_vec: Vec<ActivityRecord> =
-                                recent_records.iter().cloned().collect();
                             aggregate_activities_since(
-                                &records_vec,
+                                recent_records.make_contiguous(),
                                 since,
                                 now,
                                 eph_max,
@@ -1063,10 +1052,8 @@ impl EventCoordinator {
                     }
                     #[cfg(feature = "kroni-api")]
                     let agg = {
-                        let records_vec: Vec<ActivityRecord> =
-                            recent_records.iter().cloned().collect();
                         aggregate_activities_since(
-                            &records_vec,
+                            recent_records.make_contiguous(),
                             since,
                             now,
                             eph_max,

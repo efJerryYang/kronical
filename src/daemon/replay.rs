@@ -112,16 +112,28 @@ pub fn run_replay(
                     break;
                 }
             }
-            let recs: Vec<ActivityRecord> = recent_records.iter().cloned().collect();
-            let _agg = aggregate_activities_since(&recs, since_sim, now_sim, 60, 3, 30);
+            let _agg = aggregate_activities_since(
+                recent_records.make_contiguous(),
+                since_sim,
+                now_sim,
+                60,
+                3,
+                30,
+            );
             last_push = std::time::Instant::now();
         }
     }
 
     if let Some(now_sim) = last_ts {
         let since_sim = now_sim - chrono::Duration::minutes(retention_minutes as i64);
-        let recs: Vec<ActivityRecord> = recent_records.iter().cloned().collect();
-        let _agg = aggregate_activities_since(&recs, since_sim, now_sim, 60, 3, 30);
+        let _agg = aggregate_activities_since(
+            recent_records.make_contiguous(),
+            since_sim,
+            now_sim,
+            60,
+            3,
+            30,
+        );
     }
 
     Ok(())
