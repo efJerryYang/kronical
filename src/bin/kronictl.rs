@@ -67,6 +67,21 @@ enum Commands {
         minutes: Option<u64>,
     },
     ReplayMonitor,
+    Tracker {
+        #[command(subcommand)]
+        action: TrackerAction,
+    },
+}
+
+#[derive(Subcommand)]
+enum TrackerAction {
+    Start,
+    Stop,
+    Restart,
+    Show {
+        #[arg(long)]
+        follow: bool,
+    },
 }
 
 fn setup_logging(verbose: u8) {
@@ -557,6 +572,18 @@ fn main() {
             start_replay_daemon(data_file, config.clone(), speed, minutes)
         }
         Commands::ReplayMonitor => monitor_replay(data_file),
+        Commands::Tracker { action } => match action {
+            TrackerAction::Start => tracker_start(&config.workspace_dir),
+            TrackerAction::Stop => tracker_stop(&config.workspace_dir),
+            TrackerAction::Restart => {
+                if let Err(e) = tracker_stop(&config.workspace_dir) {
+                    eprintln!("Warning: Failed to stop tracker: {}", e);
+                }
+                std::thread::sleep(Duration::from_millis(500));
+                tracker_start(&config.workspace_dir)
+            }
+            TrackerAction::Show { follow } => tracker_show(&config.workspace_dir, follow),
+        },
     };
     if let Err(e) = result {
         error!("Error: {}", e);
@@ -1002,4 +1029,139 @@ fn print_snapshot_line(s: &kronical::daemon::snapshot::Snapshot) {
         "seq={} state={:?} focus={} cad={}ms backlog={}",
         s.seq, s.activity_state, focus, s.cadence_ms, s.storage.backlog_count
     );
+}
+
+fn tracker_start(workspace_dir: &PathBuf) -> Result<()> {
+    println!("Starting system tracker...");
+
+    let tracker_pid_file = workspace_dir.join("tracker.pid");
+    if tracker_pid_file.exists() {
+        if let Ok(Some(pid)) = read_pid_file(&tracker_pid_file) {
+            if is_process_running(pid) {
+                return Err(anyhow::anyhow!(
+                    "System tracker is already running (PID: {})",
+                    pid
+                ));
+            }
+        }
+        std::fs::remove_file(&tracker_pid_file)?;
+    }
+
+    let config = AppConfig::load()?;
+    if !config.tracker_enabled {
+        return Err(anyhow::anyhow!(
+            "Tracker is disabled in configuration. Set tracker_enabled = true in config.toml"
+        ));
+    }
+
+    let zip_path = workspace_dir.join("system-metrics.zip");
+    let tracker = kronical::daemon::system_tracker::SystemTracker::new(
+        std::process::id(),
+        config.tracker_interval_secs,
+        config.tracker_batch_size,
+        zip_path,
+    );
+
+    tracker.start()?;
+
+    std::fs::write(&tracker_pid_file, std::process::id().to_string())
+        .context("Failed to write tracker PID file")?;
+
+    println!("System tracker started successfully");
+    Ok(())
+}
+
+fn tracker_stop(workspace_dir: &PathBuf) -> Result<()> {
+    println!("Stopping system tracker...");
+
+    let tracker_pid_file = workspace_dir.join("tracker.pid");
+    if !tracker_pid_file.exists() {
+        return Err(anyhow::anyhow!(
+            "System tracker is not running (no PID file found)"
+        ));
+    }
+
+    if let Ok(Some(_pid)) = read_pid_file(&tracker_pid_file) {
+        println!("System tracker stopped successfully");
+        std::fs::remove_file(&tracker_pid_file)?;
+    } else {
+        return Err(anyhow::anyhow!("Failed to read tracker PID file"));
+    }
+
+    Ok(())
+}
+
+fn tracker_show(workspace_dir: &PathBuf, follow: bool) -> Result<()> {
+    let zip_path = workspace_dir.join("system-metrics.zip");
+
+    if !zip_path.exists() {
+        return Err(anyhow::anyhow!(
+            "No tracker data found at {}",
+            zip_path.display()
+        ));
+    }
+
+    if follow {
+        println!("Following tracker data (press Ctrl+C to exit)...");
+        use std::fs;
+        let mut last_size = fs::metadata(&zip_path)?.len();
+
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+            let current_size = fs::metadata(&zip_path)?.len();
+            if current_size != last_size {
+                show_tracker_data(&zip_path)?;
+                last_size = current_size;
+            }
+        }
+    } else {
+        show_tracker_data(&zip_path)?;
+    }
+
+    Ok(())
+}
+
+fn show_tracker_data(zip_path: &PathBuf) -> Result<()> {
+    use std::fs::File;
+    use std::io::Read;
+    use zip::ZipArchive;
+
+    let file = File::open(zip_path)?;
+    let mut archive = ZipArchive::new(file)?;
+
+    let mut csv_file = archive.by_name("system-metrics.csv")?;
+    let mut contents = String::new();
+    csv_file.read_to_string(&mut contents)?;
+
+    let mut reader = csv::Reader::from_reader(contents.as_bytes());
+
+    println!(
+        "{:<20} {:>8} {:>12} {:>12}",
+        "Timestamp", "CPU %", "Memory MB", "Disk IO"
+    );
+    println!("{}", "-".repeat(60));
+
+    for result in reader.records() {
+        let record = result?;
+        if record.len() >= 4 {
+            let timestamp = &record[0];
+            let cpu = record[1].parse::<f64>().unwrap_or(0.0);
+            let memory = record[2].parse::<u64>().unwrap_or(0) / 1024 / 1024; // Convert to MB
+            let disk_io = record[3].parse::<u64>().unwrap_or(0);
+
+            let time_part = timestamp
+                .split('T')
+                .nth(1)
+                .unwrap_or(timestamp)
+                .split('.')
+                .next()
+                .unwrap_or("");
+            println!(
+                "{:<20} {:>8.1} {:>12} {:>12}",
+                time_part, cpu, memory, disk_io
+            );
+        }
+    }
+
+    Ok(())
 }

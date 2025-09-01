@@ -21,6 +21,62 @@ fn write_pid_file(pid_file: &PathBuf) -> Result<()> {
     Ok(())
 }
 
+fn verify_pid_file(pid_file: &PathBuf) -> Result<()> {
+    let current_pid = std::process::id();
+    let content =
+        std::fs::read_to_string(pid_file).context("Failed to read PID file for verification")?;
+    let file_pid: u32 = content
+        .trim()
+        .parse()
+        .context("PID file contains invalid PID format")?;
+
+    if file_pid != current_pid {
+        return Err(anyhow::anyhow!(
+            "PID file verification failed: expected {}, found {}",
+            current_pid,
+            file_pid
+        ));
+    }
+
+    info!("PID file verification successful (PID: {})", current_pid);
+    Ok(())
+}
+
+fn cleanup_pid_file(pid_file: &PathBuf) {
+    if !pid_file.exists() {
+        error!(
+            "PID file disappeared during runtime! This indicates a problem with process management."
+        );
+        return;
+    }
+
+    let current_pid = std::process::id();
+    match std::fs::read_to_string(pid_file) {
+        Ok(content) => match content.trim().parse::<u32>() {
+            Ok(file_pid) => {
+                if file_pid == current_pid {
+                    if let Err(e) = std::fs::remove_file(pid_file) {
+                        error!("Failed to remove PID file: {}", e);
+                    } else {
+                        info!("Successfully cleaned up PID file");
+                    }
+                } else {
+                    error!(
+                        "PID file contains different PID ({}) than current process ({}). Not removing PID file!",
+                        file_pid, current_pid
+                    );
+                }
+            }
+            Err(e) => {
+                error!("PID file contains invalid PID: {}. Error: {}", content, e);
+            }
+        },
+        Err(e) => {
+            error!("Failed to read PID file for cleanup: {}", e);
+        }
+    }
+}
+
 fn setup_file_logging(log_dir: &PathBuf) -> Result<()> {
     std::fs::create_dir_all(log_dir).context("Failed to create log directory")?;
 
@@ -79,6 +135,11 @@ fn main() {
         std::process::exit(1);
     }
 
+    if let Err(e) = verify_pid_file(&pid_file) {
+        error!("PID file verification failed: {}", e);
+        std::process::exit(1);
+    }
+
     info!("Starting Kronicle daemon (kronid)");
 
     let data_store: Box<dyn StorageBackend> = match SqliteStorage::new(&data_file) {
@@ -109,7 +170,9 @@ fn main() {
 
     info!("Kronicle daemon will run on MAIN THREAD (required by macOS hooks)");
     let result = coordinator.start_main_thread(data_store, pid_file.clone());
-    let _ = std::fs::remove_file(&pid_file);
+
+    cleanup_pid_file(&pid_file);
+
     if let Err(e) = result {
         error!("Kronicle daemon error: {}", e);
         std::process::exit(1);
