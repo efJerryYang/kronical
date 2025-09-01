@@ -14,7 +14,6 @@ use futures_core::Stream;
 use log::{info, warn};
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::Arc;
 use tokio::net::UnixListener;
 use tokio_stream::wrappers::IntervalStream;
 use tokio_stream::StreamExt;
@@ -46,7 +45,7 @@ impl Kroni for KroniSvc {
     }
 }
 
-pub(crate) fn to_pb(s: &snapshot::Snapshot) -> SnapshotReply {
+pub fn to_pb(s: &snapshot::Snapshot) -> SnapshotReply {
     let state = match s.activity_state {
         crate::daemon::records::ActivityState::Active => PbState::Active,
         crate::daemon::records::ActivityState::Passive => PbState::Passive,

@@ -5,12 +5,15 @@ use anyhow::Result;
 use axum::response::sse::{Event, Sse};
 use axum::{routing::get, Json, Router};
 use futures_util::stream::Stream;
+use hyper::server::conn::http1;
+use hyper_util::rt::TokioIo;
+use hyper_util::service::TowerToHyperService;
 use log::{info, warn};
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::time::Duration;
 use tokio::net::UnixListener;
-use tonic::transport::server::Connected;
+use tower::Service;
 
 async fn snapshot_handler() -> Json<snapshot::Snapshot> {
     let s = snapshot::get_current();
@@ -45,11 +48,27 @@ pub fn spawn_http_admin(uds_path: PathBuf) -> Result<std::thread::JoinHandle<()>
                 .route("/v1/snapshot", get(snapshot_handler))
                 .route("/v1/stream", get(stream_handler));
             tx.send(()).ok();
+            let listener = UnixListener::bind(&uds_path).expect("bind unix listener");
             info!("HTTP admin listening on {:?}", uds_path);
-            axum_server::bind_unix(uds_path)
-                .serve(app.into_make_service())
-                .await
-                .expect("serve http admin");
+
+            let make_service = app.into_make_service();
+
+            loop {
+                let (stream, _) = listener.accept().await.expect("accept unix connection");
+                let io = TokioIo::new(stream);
+                let mut make_svc = make_service.clone();
+
+                tokio::task::spawn(async move {
+                    let service = make_svc.call(()).await.expect("create service");
+                    let hyper_service = TowerToHyperService::new(service);
+                    if let Err(err) = http1::Builder::new()
+                        .serve_connection(io, hyper_service)
+                        .await
+                    {
+                        eprintln!("Error serving connection: {:?}", err);
+                    }
+                });
+            }
         });
     });
     rx.recv().ok();

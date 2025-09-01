@@ -135,6 +135,13 @@ pub struct ConfigSummary {
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct CountsSummary {
+    pub signals_seen: u64,
+    pub hints_seen: u64,
+    pub records_emitted: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ReplayInfo {
     pub mode: String, // "live" | "replay"
     pub position: Option<u64>,

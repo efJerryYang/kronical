@@ -1,4 +1,3 @@
-use chrono::{DateTime, Utc};
 use kronical::daemon::snapshot::Snapshot;
 
 fn assemble_sse_payload(json: &str) -> String {

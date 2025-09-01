@@ -7,6 +7,8 @@ use crossterm::{
     terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
 };
 #[cfg(feature = "kroni-api")]
+use hyper_util::rt::TokioIo;
+#[cfg(feature = "kroni-api")]
 use kronical::kroni_api::kroni::v1::kroni_client::KroniClient;
 #[cfg(feature = "kroni-api")]
 use kronical::kroni_api::kroni::v1::{SnapshotRequest, WatchRequest};
@@ -691,7 +693,10 @@ fn grpc_snapshot(uds_http: &PathBuf) -> Result<kronical::daemon::snapshot::Snaps
         let channel = ep
             .connect_with_connector(service_fn(move |_| {
                 let p = uds_grpc.clone();
-                async move { tokio::net::UnixStream::connect(p).await }
+                async move {
+                    let stream = tokio::net::UnixStream::connect(p).await?;
+                    Ok::<_, std::io::Error>(TokioIo::new(stream))
+                }
             }))
             .await?;
         let mut client = KroniClient::new(channel);
@@ -889,7 +894,7 @@ fn grpc_snapshot(uds_http: &PathBuf) -> Result<kronical::daemon::snapshot::Snaps
 fn sse_watch_via_grpc_then_http(uds_path: &PathBuf, pretty: bool) -> Result<()> {
     #[cfg(feature = "kroni-api")]
     {
-        if let Err(e) = grpc_watch(uds_path, pretty) {
+        if let Err(_e) = grpc_watch(uds_path, pretty) {
             // Fallback to HTTP SSE
             return sse_watch_via_http(uds_path, pretty);
         } else {
@@ -912,11 +917,14 @@ fn grpc_watch(_uds_http_sock: &PathBuf, pretty: bool) -> Result<()> {
         let channel = ep
             .connect_with_connector(service_fn(move |_| {
                 let p = uds_grpc.clone();
-                async move { tokio::net::UnixStream::connect(p).await }
+                async move {
+                    let stream = tokio::net::UnixStream::connect(p).await?;
+                    Ok::<_, std::io::Error>(TokioIo::new(stream))
+                }
             }))
             .await?;
         let mut client = KroniClient::new(channel);
-        let mut stream = client
+        let stream = client
             .watch(tonic::Request::new(WatchRequest {
                 sections: vec![],
                 detail: "summary".into(),

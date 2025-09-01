@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 use kronical::daemon::event_adapter::EventAdapter;
 use kronical::daemon::event_deriver::{LockDeriver, StateDeriver};
-use kronical::daemon::event_model::{EventKind, EventSource, HintKind, SignalKind};
+use kronical::daemon::event_model::EventKind;
 use kronical::daemon::events::{RawEvent, WindowFocusInfo};
 use kronical::daemon::records::{ActivityState, RecordBuilder};
 

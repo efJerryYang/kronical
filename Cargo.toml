@@ -51,13 +51,17 @@ prost = { version = "0.13", optional = true }
 tokio-stream = { version = "0.1", optional = true }
 tower = { version = "0.5", optional = true }
 axum = { version = "0.7", optional = true }
-axum-server = { version = "0.6", optional = true }
+axum-server = { version = "0.6", features = ["tls-rustls"], optional = true }
+futures-util = { version = "0.3", optional = true }
+futures-core = { version = "0.3", optional = true }
+hyper = { version = "1.0", features = ["full"], optional = true }
+hyper-util = { version = "0.1", features = ["tokio", "server", "http1"], optional = true }
 
 [features]
 default = []
 # Enable the Kroni gRPC API server and client binaries
-kroni-api = ["tonic", "prost", "tokio-stream", "tower"]
-http-admin = ["axum", "axum-server"]
+kroni-api = ["tonic", "prost", "tokio-stream", "tower", "futures-core", "hyper-util"]
+http-admin = ["axum", "axum-server", "futures-util", "hyper", "hyper-util", "tokio-stream", "tower"]
 
 [lib]
 name = "kronical"

@@ -295,6 +295,14 @@ impl EventCoordinator {
             let app_eph_max = self.ephemeral_app_max_duration_secs;
             #[cfg(feature = "kroni-api")]
             let app_eph_min = self.ephemeral_app_min_distinct_procs;
+            #[cfg(feature = "kroni-api")]
+            let mut counts = crate::daemon::snapshot::Counts {
+                signals_seen: 0,
+                hints_seen: 0,
+                records_emitted: 0,
+            };
+            #[cfg(feature = "kroni-api")]
+            let mut last_transition: Option<crate::daemon::snapshot::Transition> = None;
 
             let poll_handle_arc2 = std::sync::Arc::clone(&poll_handle_arc);
             let ags = self.active_grace_secs;

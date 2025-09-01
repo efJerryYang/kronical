@@ -9,6 +9,7 @@ fn main() {
     tonic_build::configure()
         .build_client(true)
         .build_server(true)
+        .type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]")
         .compile_protos(&["proto/kroni.proto"], &["proto"]) // files, includes
         .expect("Failed to compile kroni.proto");
 }
