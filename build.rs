@@ -6,7 +6,7 @@ fn main() {
         return;
     }
     println!("cargo:rerun-if-changed=proto/kroni.proto");
-    tonic_build::configure()
+    tonic_prost_build::configure()
         .build_client(true)
         .build_server(true)
         .type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]")

@@ -1,14 +1,14 @@
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
 use std::io::BufWriter;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
-use zip::{CompressionMethod, ZipWriter, write::FileOptions};
+use zip::{CompressionMethod, ZipArchive, ZipWriter, write::FileOptions};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemMetrics {
@@ -58,14 +58,7 @@ impl SystemTracker {
         let running = Arc::clone(&self.running);
 
         thread::spawn(move || {
-            let mut csv_writer = match create_csv_writer(&zip_path) {
-                Ok(writer) => writer,
-                Err(e) => {
-                    error!("Failed to create CSV writer: {}", e);
-                    return;
-                }
-            };
-
+            let mut metrics_buffer = Vec::new();
             let mut last_disk_io = 0u64;
             let mut batch_count = 0;
 
@@ -83,17 +76,15 @@ impl SystemTracker {
                             disk_io_bytes,
                         };
 
-                        if let Err(e) = csv_writer.serialize(&metrics) {
-                            error!("Failed to write metrics: {}", e);
-                        } else {
-                            batch_count += 1;
+                        metrics_buffer.push(metrics);
+                        batch_count += 1;
 
-                            if batch_count % batch_size == 0 {
-                                if let Err(e) = csv_writer.flush() {
-                                    error!("Failed to flush CSV writer: {}", e);
-                                } else {
-                                    debug!("Flushed {} metrics to disk", batch_count);
-                                }
+                        if batch_count % batch_size == 0 {
+                            if let Err(e) = write_metrics_to_zip(&zip_path, &metrics_buffer) {
+                                error!("Failed to write metrics batch to ZIP: {}", e);
+                            } else {
+                                debug!("Written {} metrics to ZIP file", metrics_buffer.len());
+                                metrics_buffer.clear();
                             }
                         }
                     }
@@ -112,10 +103,12 @@ impl SystemTracker {
                 }
             }
 
-            if let Err(e) = csv_writer.flush() {
-                error!("Failed to flush final metrics: {}", e);
-            } else {
-                info!("System tracker stopped, final metrics flushed");
+            if !metrics_buffer.is_empty() {
+                if let Err(e) = write_metrics_to_zip(&zip_path, &metrics_buffer) {
+                    error!("Failed to write final metrics batch: {}", e);
+                } else {
+                    info!("System tracker stopped, final metrics written successfully");
+                }
             }
         });
 
@@ -217,20 +210,54 @@ fn is_process_running(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
-fn create_csv_writer(zip_path: &PathBuf) -> Result<csv::Writer<ZipWriter<BufWriter<File>>>> {
-    let file = if zip_path.exists() {
-        OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(zip_path)?
-    } else {
-        File::create(zip_path)?
-    };
+fn write_metrics_to_zip(zip_path: &PathBuf, metrics_buffer: &[SystemMetrics]) -> Result<()> {
+    let mut existing_metrics = Vec::new();
 
+    if zip_path.exists() {
+        existing_metrics = read_existing_metrics(zip_path)?;
+    }
+
+    existing_metrics.extend_from_slice(metrics_buffer);
+
+    let file = File::create(zip_path)?;
     let mut zip = ZipWriter::new(BufWriter::new(file));
-    let options = FileOptions::default().compression_method(CompressionMethod::Deflated);
+    let options: FileOptions<()> =
+        FileOptions::default().compression_method(CompressionMethod::Deflated);
     zip.start_file("system-metrics.csv", options)?;
 
-    let writer = csv::Writer::from_writer(zip);
-    Ok(writer)
+    let mut csv_writer = csv::Writer::from_writer(zip);
+
+    for metric in &existing_metrics {
+        csv_writer.serialize(metric)?;
+    }
+
+    csv_writer.flush()?;
+    let zip_writer = match csv_writer.into_inner() {
+        Ok(writer) => writer,
+        Err(e) => return Err(anyhow::anyhow!("Failed to get inner ZIP writer: {}", e)),
+    };
+
+    zip_writer.finish()?;
+
+    Ok(())
+}
+
+fn read_existing_metrics(zip_path: &PathBuf) -> Result<Vec<SystemMetrics>> {
+    use std::io::Read;
+
+    let file = File::open(zip_path)?;
+    let mut archive = ZipArchive::new(file)?;
+    let mut csv_file = archive.by_name("system-metrics.csv")?;
+    let mut contents = String::new();
+    csv_file.read_to_string(&mut contents)?;
+
+    let mut reader = csv::Reader::from_reader(contents.as_bytes());
+    let mut metrics = Vec::new();
+
+    for result in reader.deserialize() {
+        let metric: SystemMetrics = result?;
+        metrics.push(metric);
+    }
+
+    Ok(metrics)
 }

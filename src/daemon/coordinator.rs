@@ -43,21 +43,21 @@ fn pretty_format_duration(seconds: u64) -> String {
 }
 
 #[derive(Debug, Clone)]
-pub enum ChronicleEvent {
+pub enum KronicalEvent {
     KeyboardInput,
     MouseInput,
     WindowFocusChange { focus_info: WindowFocusInfo },
     Shutdown,
 }
 
-pub struct ChronicleEventHandler {
-    sender: mpsc::Sender<ChronicleEvent>,
+pub struct KronicalEventHandler {
+    sender: mpsc::Sender<KronicalEvent>,
     focus_wrapper: FocusEventWrapper,
 }
 
-impl ChronicleEventHandler {
+impl KronicalEventHandler {
     fn new(
-        sender: mpsc::Sender<ChronicleEvent>,
+        sender: mpsc::Sender<KronicalEvent>,
         caps: FocusCacheCaps,
         poll_handle: std::sync::Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
@@ -80,14 +80,14 @@ impl ChronicleEventHandler {
 }
 
 struct FocusCallback {
-    sender: mpsc::Sender<ChronicleEvent>,
+    sender: mpsc::Sender<KronicalEvent>,
 }
 
 impl FocusChangeCallback for FocusCallback {
     fn on_focus_change(&self, focus_info: WindowFocusInfo) {
         if let Err(e) = self
             .sender
-            .send(ChronicleEvent::WindowFocusChange { focus_info })
+            .send(KronicalEvent::WindowFocusChange { focus_info })
         {
             error!("Failed to send unified focus change event: {}", e);
         } else {
@@ -96,21 +96,21 @@ impl FocusChangeCallback for FocusCallback {
     }
 }
 
-impl EventHandler for ChronicleEventHandler {
+impl EventHandler for KronicalEventHandler {
     fn handle_event(&self, event: &UiohookEvent) {
         trace!("UIohook event received: {:?}", event);
         let chronicle_event = match event {
             UiohookEvent::Keyboard(_) => {
                 trace!("Keyboard event detected");
-                ChronicleEvent::KeyboardInput
+                KronicalEvent::KeyboardInput
             }
             UiohookEvent::Mouse(_) => {
                 trace!("Mouse event detected");
-                ChronicleEvent::MouseInput
+                KronicalEvent::MouseInput
             }
             UiohookEvent::Wheel(_) => {
                 trace!("Wheel event detected");
-                ChronicleEvent::MouseInput
+                KronicalEvent::MouseInput
             }
             UiohookEvent::HookEnabled => {
                 debug!("UIohook enabled");
@@ -130,7 +130,7 @@ impl EventHandler for ChronicleEventHandler {
     }
 }
 
-impl FocusChangeHandler for ChronicleEventHandler {
+impl FocusChangeHandler for KronicalEventHandler {
     fn on_app_change(&self, pid: i32, app_name: String) {
         debug!("App changed: {} (PID: {})", app_name, pid);
         self.focus_wrapper.handle_app_change(pid, app_name);
@@ -212,7 +212,7 @@ impl EventCoordinator {
         }
     }
 
-    fn convert_chronicle_to_raw(event: ChronicleEvent) -> Result<crate::daemon::events::RawEvent> {
+    fn convert_chronicle_to_raw(event: KronicalEvent) -> Result<crate::daemon::events::RawEvent> {
         use crate::daemon::events::RawEvent;
         use chrono::Utc;
 
@@ -220,7 +220,7 @@ impl EventCoordinator {
         let event_id = chrono::Utc::now().timestamp_millis() as u64;
 
         match event {
-            ChronicleEvent::KeyboardInput => Ok(RawEvent::KeyboardInput {
+            KronicalEvent::KeyboardInput => Ok(RawEvent::KeyboardInput {
                 timestamp: now,
                 event_id,
                 data: KeyboardEventData {
@@ -229,7 +229,7 @@ impl EventCoordinator {
                     modifiers: Vec::new(),
                 },
             }),
-            ChronicleEvent::MouseInput => Ok(RawEvent::MouseInput {
+            KronicalEvent::MouseInput => Ok(RawEvent::MouseInput {
                 timestamp: now,
                 event_id,
                 data: MouseEventData {
@@ -239,12 +239,12 @@ impl EventCoordinator {
                     wheel_delta: None,
                 },
             }),
-            ChronicleEvent::WindowFocusChange { focus_info } => Ok(RawEvent::WindowFocusChange {
+            KronicalEvent::WindowFocusChange { focus_info } => Ok(RawEvent::WindowFocusChange {
                 timestamp: now,
                 event_id,
                 focus_info,
             }),
-            ChronicleEvent::Shutdown => {
+            KronicalEvent::Shutdown => {
                 Err(anyhow::anyhow!("Cannot convert Shutdown event to RawEvent"))
             }
         }
@@ -255,7 +255,7 @@ impl EventCoordinator {
         data_store: Box<dyn StorageBackend>,
         pid_file: std::path::PathBuf,
     ) -> Result<()> {
-        info!("Step A: Starting Kronicle on MAIN THREAD (required for hooks)");
+        info!("Step A: Starting Kronical on MAIN THREAD (required for hooks)");
 
         let (sender, receiver) = mpsc::channel();
 
@@ -564,7 +564,7 @@ impl EventCoordinator {
 
                 loop {
                     match receiver.recv_timeout(Duration::from_millis(50)) {
-                        Ok(ChronicleEvent::Shutdown) => {
+                        Ok(KronicalEvent::Shutdown) => {
                             info!(
                                 "Shutdown signal received, flushing pending events and finalizing"
                             );
@@ -1139,7 +1139,7 @@ impl EventCoordinator {
         let pid_file_cleanup = pid_file.clone();
         ctrlc::set_handler(move || {
             info!("Step S: Ctrl+C received, sending shutdown signal");
-            if let Err(e) = shutdown_sender.send(ChronicleEvent::Shutdown) {
+            if let Err(e) = shutdown_sender.send(KronicalEvent::Shutdown) {
                 error!("Step S: Failed to send shutdown: {}", e);
             }
 
@@ -1156,7 +1156,7 @@ impl EventCoordinator {
         })?;
 
         // poll_handle_arc already created earlier; reuse it for the handler
-        let handler = ChronicleEventHandler::new(
+        let handler = KronicalEventHandler::new(
             sender,
             FocusCacheCaps {
                 pid_cache_capacity: self.pid_cache_capacity,
@@ -1200,12 +1200,33 @@ impl EventCoordinator {
             error!("Step C: Background thread panicked: {:?}", e);
         }
 
-        info!("Step C: Kronicle shutdown complete");
+        info!("Step C: Cleaning up socket files");
+        let socket_dir = pid_file.parent().unwrap();
+        let grpc_sock = socket_dir.join("kroni.sock");
+        let http_sock = socket_dir.join("kroni.http.sock");
+
+        if grpc_sock.exists() {
+            if let Err(e) = std::fs::remove_file(&grpc_sock) {
+                error!("Failed to remove gRPC socket: {}", e);
+            } else {
+                info!("Removed gRPC socket file");
+            }
+        }
+
+        if http_sock.exists() {
+            if let Err(e) = std::fs::remove_file(&http_sock) {
+                error!("Failed to remove HTTP socket: {}", e);
+            } else {
+                info!("Removed HTTP socket file");
+            }
+        }
+
+        info!("Step C: Kronical shutdown complete");
         Ok(())
     }
 }
 
-impl Clone for ChronicleEventHandler {
+impl Clone for KronicalEventHandler {
     fn clone(&self) -> Self {
         Self {
             sender: self.sender.clone(),

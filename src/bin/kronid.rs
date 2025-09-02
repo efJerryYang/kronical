@@ -140,7 +140,7 @@ fn main() {
         std::process::exit(1);
     }
 
-    info!("Starting Kronicle daemon (kronid)");
+    info!("Starting Kronical daemon (kronid)");
 
     let data_store: Box<dyn StorageBackend> = match SqliteStorage::new(&data_file) {
         Ok(s) => Box::new(s),
@@ -168,13 +168,13 @@ fn main() {
         config.tracker_batch_size,
     );
 
-    info!("Kronicle daemon will run on MAIN THREAD (required by macOS hooks)");
+    info!("Kronical daemon will run on MAIN THREAD (required by macOS hooks)");
     let result = coordinator.start_main_thread(data_store, pid_file.clone());
 
     cleanup_pid_file(&pid_file);
 
     if let Err(e) = result {
-        error!("Kronicle daemon error: {}", e);
+        error!("Kronical daemon error: {}", e);
         std::process::exit(1);
     }
 }

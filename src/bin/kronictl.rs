@@ -75,13 +75,11 @@ enum Commands {
 
 #[derive(Subcommand)]
 enum TrackerAction {
-    Start,
-    Stop,
-    Restart,
     Show {
         #[arg(long)]
         follow: bool,
     },
+    Status,
 }
 
 fn setup_logging(verbose: u8) {
@@ -147,26 +145,26 @@ fn stop_daemon(data_file: PathBuf) -> Result<()> {
     let pid_file = data_file.parent().unwrap().join("kronid.pid");
     if let Some(pid) = read_pid_file(&pid_file)? {
         if is_process_running(pid) {
-            println!("Stopping Kronicle daemon (PID: {})...", pid);
+            println!("Stopping Kronical daemon (PID: {})...", pid);
             #[cfg(unix)]
             unsafe {
                 libc::kill(pid as i32, libc::SIGTERM);
             }
             std::thread::sleep(Duration::from_millis(500));
             if !is_process_running(pid) {
-                println!("Kronicle daemon stopped successfully");
+                println!("Kronical daemon stopped successfully");
                 let _ = std::fs::remove_file(&pid_file);
             } else {
                 println!(
-                    "Kronicle daemon did not stop gracefully, you may need to kill it manually"
+                    "Kronical daemon did not stop gracefully, you may need to kill it manually"
                 );
             }
         } else {
-            println!("Kronicle daemon is not running (stale PID file)");
+            println!("Kronical daemon is not running (stale PID file)");
             let _ = std::fs::remove_file(&pid_file);
         }
     } else {
-        println!("Kronicle daemon is not running");
+        println!("Kronical daemon is not running");
     }
     Ok(())
 }
@@ -176,20 +174,20 @@ fn start_daemon(data_file: PathBuf, _app_config: AppConfig) -> Result<()> {
     if let Some(existing_pid) = read_pid_file(&pid_file)? {
         if is_process_running(existing_pid) {
             return Err(anyhow::anyhow!(
-                "Kronicle daemon is already running (PID: {}). Use 'kronictl stop' first.",
+                "Kronical daemon is already running (PID: {}). Use 'kronictl stop' first.",
                 existing_pid
             ));
         } else {
             let _ = std::fs::remove_file(&pid_file);
         }
     }
-    println!("Starting Kronicle daemon in background...");
+    println!("Starting Kronical daemon in background...");
     spawn_kronid()?;
     Ok(())
 }
 
 fn restart_daemon(data_file: PathBuf, app_config: AppConfig) -> Result<()> {
-    println!("Restarting Kronicle daemon...");
+    println!("Restarting Kronical daemon...");
     let _ = stop_daemon(data_file.clone());
     start_daemon(data_file, app_config)
 }
@@ -198,14 +196,14 @@ fn get_status(data_file: PathBuf) -> Result<()> {
     let now = chrono::Utc::now();
     let local_now = now.with_timezone(&chrono::Local);
     println!(
-        "Kronicle Status Snapshot - {}",
+        "Kronical Status Snapshot - {}",
         local_now.format("%Y-%m-%d %H:%M:%S %Z")
     );
     println!("═════════════════════════════════════════════════════════════\n");
     let uds_http = data_file.parent().unwrap().join("kroni.http.sock");
     match http_get_snapshot(&uds_http) {
         Ok(snap) => {
-            println!("Kronicle Daemon:");
+            println!("Kronical Daemon:");
             println!("  State: {:?}", snap.activity_state);
             if let Some(f) = snap.focus {
                 println!("  Focus: {} [{}] - {}", f.app_name, f.pid, f.window_title);
@@ -228,7 +226,7 @@ fn get_status(data_file: PathBuf) -> Result<()> {
             );
         }
         Err(_) => {
-            println!("Kronicle Daemon: Not running");
+            println!("Kronical Daemon: Not running");
         }
     }
     println!("\nTip: Use 'kronictl monitor' for real-time updates");
@@ -573,16 +571,8 @@ fn main() {
         }
         Commands::ReplayMonitor => monitor_replay(data_file),
         Commands::Tracker { action } => match action {
-            TrackerAction::Start => tracker_start(&config.workspace_dir),
-            TrackerAction::Stop => tracker_stop(&config.workspace_dir),
-            TrackerAction::Restart => {
-                if let Err(e) = tracker_stop(&config.workspace_dir) {
-                    eprintln!("Warning: Failed to stop tracker: {}", e);
-                }
-                std::thread::sleep(Duration::from_millis(500));
-                tracker_start(&config.workspace_dir)
-            }
             TrackerAction::Show { follow } => tracker_show(&config.workspace_dir, follow),
+            TrackerAction::Status => tracker_status(&config),
         },
     };
     if let Err(e) = result {
@@ -1031,75 +1021,65 @@ fn print_snapshot_line(s: &kronical::daemon::snapshot::Snapshot) {
     );
 }
 
-fn tracker_start(workspace_dir: &PathBuf) -> Result<()> {
-    println!("Starting system tracker...");
+fn tracker_status(config: &AppConfig) -> Result<()> {
+    println!("System Tracker Status");
+    println!("════════════════════");
 
-    let tracker_pid_file = workspace_dir.join("tracker.pid");
-    if tracker_pid_file.exists() {
-        if let Ok(Some(pid)) = read_pid_file(&tracker_pid_file) {
-            if is_process_running(pid) {
-                return Err(anyhow::anyhow!(
-                    "System tracker is already running (PID: {})",
-                    pid
-                ));
-            }
-        }
-        std::fs::remove_file(&tracker_pid_file)?;
-    }
-
-    let config = AppConfig::load()?;
     if !config.tracker_enabled {
-        return Err(anyhow::anyhow!(
-            "Tracker is disabled in configuration. Set tracker_enabled = true in config.toml"
-        ));
+        println!("Status: DISABLED");
+        println!("To enable: Set tracker_enabled = true in config.toml and restart daemon");
+        return Ok(());
     }
 
-    let zip_path = workspace_dir.join("system-metrics.zip");
-    let tracker = kronical::daemon::system_tracker::SystemTracker::new(
-        std::process::id(),
-        config.tracker_interval_secs,
-        config.tracker_batch_size,
-        zip_path,
-    );
+    let daemon_pid_file = config.workspace_dir.join("kronid.pid");
+    if let Ok(Some(pid)) = read_pid_file(&daemon_pid_file) {
+        if is_process_running(pid) {
+            println!("Status: ENABLED and running with daemon (PID: {})", pid);
+            println!("Interval: {} seconds", config.tracker_interval_secs);
+            println!("Batch size: {}", config.tracker_batch_size);
 
-    tracker.start()?;
+            let zip_path = config.workspace_dir.join("system-tracker.zip");
+            if zip_path.exists() {
+                let metadata = std::fs::metadata(&zip_path)?;
+                println!(
+                    "Data file: {} ({} bytes)",
+                    zip_path.display(),
+                    metadata.len()
+                );
+                let modified = metadata.modified()?;
+                println!("Last modified: {:?}", modified);
+            } else {
+                println!("Data file: Not yet created");
+            }
+        } else {
+            println!("Status: ENABLED but daemon not running");
+        }
+    } else {
+        println!("Status: ENABLED but daemon not running (no PID file)");
+    }
 
-    std::fs::write(&tracker_pid_file, std::process::id().to_string())
-        .context("Failed to write tracker PID file")?;
-
-    println!("System tracker started successfully");
     Ok(())
 }
 
-fn tracker_stop(workspace_dir: &PathBuf) -> Result<()> {
-    println!("Stopping system tracker...");
-
+fn cleanup_stale_tracker_pid(workspace_dir: &PathBuf) {
     let tracker_pid_file = workspace_dir.join("tracker.pid");
-    if !tracker_pid_file.exists() {
-        return Err(anyhow::anyhow!(
-            "System tracker is not running (no PID file found)"
-        ));
+    if tracker_pid_file.exists() {
+        println!("Removing stale tracker.pid file (tracker is now part of daemon)");
+        let _ = std::fs::remove_file(&tracker_pid_file);
     }
-
-    if let Ok(Some(_pid)) = read_pid_file(&tracker_pid_file) {
-        println!("System tracker stopped successfully");
-        std::fs::remove_file(&tracker_pid_file)?;
-    } else {
-        return Err(anyhow::anyhow!("Failed to read tracker PID file"));
-    }
-
-    Ok(())
 }
 
 fn tracker_show(workspace_dir: &PathBuf, follow: bool) -> Result<()> {
-    let zip_path = workspace_dir.join("system-metrics.zip");
+    let zip_path = workspace_dir.join("system-tracker.zip");
 
     if !zip_path.exists() {
         return Err(anyhow::anyhow!(
-            "No tracker data found at {}",
+            "No tracker data found at {}. Make sure tracker_enabled = true in config and daemon is running.",
             zip_path.display()
         ));
     }
+
+    cleanup_stale_tracker_pid(workspace_dir);
 
     if follow {
         println!("Following tracker data (press Ctrl+C to exit)...");
