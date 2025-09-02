@@ -99,7 +99,7 @@ impl FocusChangeCallback for FocusCallback {
 impl EventHandler for KronicalEventHandler {
     fn handle_event(&self, event: &UiohookEvent) {
         trace!("UIohook event received: {:?}", event);
-        let chronicle_event = match event {
+        let kronid_event = match event {
             UiohookEvent::Keyboard(_) => {
                 trace!("Keyboard event detected");
                 KronicalEvent::KeyboardInput
@@ -122,7 +122,7 @@ impl EventHandler for KronicalEventHandler {
             }
         };
 
-        if let Err(e) = self.sender.send(chronicle_event) {
+        if let Err(e) = self.sender.send(kronid_event) {
             error!("Failed to send input event: {}", e);
         } else {
             trace!("Event sent to background thread successfully");
@@ -212,7 +212,7 @@ impl EventCoordinator {
         }
     }
 
-    fn convert_chronicle_to_raw(event: KronicalEvent) -> Result<crate::daemon::events::RawEvent> {
+    fn convert_kronid_to_raw(event: KronicalEvent) -> Result<crate::daemon::events::RawEvent> {
         use crate::daemon::events::RawEvent;
         use chrono::Utc;
 
@@ -699,7 +699,7 @@ impl EventCoordinator {
                             event_count += 1;
                             debug!("Processing event #{}: {:?}", event_count, event);
 
-                            if let Ok(raw_event) = Self::convert_chronicle_to_raw(event) {
+                            if let Ok(raw_event) = Self::convert_kronid_to_raw(event) {
                                 pending_raw_events.push(raw_event);
                                 trace!(
                                     "Added raw event to pending batch (total: {})",

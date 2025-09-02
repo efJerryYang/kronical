@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
-Unified system monitoring and plotting script for Chronicle daemon.
+Unified system monitoring and plotting script for Kronical daemon (kronid).
 
 Features:
 - Track CPU, memory, and disk I/O with microsecond precision timestamps
 - Live plotting with --watch mode
 - Lock file mechanism to prevent concurrent tracking
 - CSV output with automatic compression
-- Auto-detection of Chronicle daemon PID
+- Auto-detection of Kronical daemon PID
 
 Usage:
   python tracker.py [PID]              # Track specified PID or auto-detect
@@ -364,7 +364,7 @@ class LivePlotter:
         plt.show()
 
 
-def find_chronicle_pid() -> Optional[int]:
+def find_kronical_pid() -> Optional[int]:
     try:
         result = subprocess.run(["pgrep", "kronid"], capture_output=True, text=True)
         if result.returncode == 0:
@@ -377,14 +377,14 @@ def find_chronicle_pid() -> Optional[int]:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="System monitoring and plotting for Chronicle")
-    parser.add_argument("pid", nargs="?", type=int, help="PID to monitor (auto-detect Chronicle if omitted)")
+    parser = argparse.ArgumentParser(description="System monitoring and plotting for Kronical")
+    parser.add_argument("pid", nargs="?", type=int, help="PID to monitor (auto-detect Kronical if omitted)")
     parser.add_argument("--watch", "-w", metavar="ZIPFILE", help="Live plot mode for existing ZIP file")
     parser.add_argument("--hour", action="store_true", help="Show last hour with second resolution (use with --watch)")
     parser.add_argument("--day", action="store_true", help="Show last day with 24-second resolution (use with --watch)")
     parser.add_argument("--week", action="store_true", help="Show last week with 7*24-second resolution (use with --watch)")
     parser.add_argument("--month", action="store_true", help="Show last month with 30*7*24-second resolution (use with --watch)")
-    parser.add_argument("--detect", "-d", action="store_true", help="Auto-detect and start tracking Chronicle daemon if running")
+    parser.add_argument("--detect", "-d", action="store_true", help="Auto-detect and start tracking Kronical daemon if running")
     parser.add_argument("--interval", "-i", type=float, default=1.0, help="Sampling interval in seconds (default: 1.0)")
     parser.add_argument("--output", "-o", default="system-info.zip", help="Output ZIP file (default: system-info.zip)")
     
@@ -412,21 +412,21 @@ def main():
         return
     
     if args.detect:
-        pid = find_chronicle_pid()
+        pid = find_kronical_pid()
         if not pid:
-            print("Chronicle daemon not running. Use 'kronictl start' to start it first.", file=sys.stderr)
+            print("Kronical daemon not running. Use 'kronical start' to start it first.", file=sys.stderr)
             sys.exit(0)
-        print(f"Detected Chronicle daemon PID: {pid} - starting tracker...")
+        print(f"Detected Kronical daemon PID: {pid} - starting tracker...")
     elif args.pid:
         pid = args.pid
     else:
-        pid = find_chronicle_pid()
+        pid = find_kronical_pid()
         if not pid:
-            print("Error: No PID specified and Chronicle daemon not found", file=sys.stderr)
-            print("Use 'kronictl start' to start Chronicle daemon", file=sys.stderr)
+            print("Error: No PID specified and Kronical daemon not found", file=sys.stderr)
+            print("Use 'kronical start' to start Kronical daemon", file=sys.stderr)
             print("Or use --detect flag to auto-start tracking when daemon is detected", file=sys.stderr)
             sys.exit(1)
-        print(f"Auto-detected Chronicle daemon PID: {pid}")
+        print(f"Auto-detected Kronical daemon PID: {pid}")
     
     try:
         os.kill(pid, 0)
