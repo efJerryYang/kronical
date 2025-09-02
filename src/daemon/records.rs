@@ -1,11 +1,10 @@
-use crate::daemon::event_model::{EventEnvelope, EventKind, EventPayload, HintKind, SignalKind};
+use crate::daemon::event_model::{EventEnvelope, EventKind, EventPayload, HintKind};
 use crate::daemon::events::WindowFocusInfo;
 use crate::util::maps::{HashMap, HashSet};
 use chrono::{DateTime, Utc};
-use log::{debug, info};
+// no-op: keep minimal imports to avoid unused warnings
 use serde::{Deserialize, Serialize};
 use size_of::SizeOf;
-use std::time::{Duration, Instant};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, SizeOf)]
 pub enum ActivityState {
@@ -58,442 +57,461 @@ pub struct EphemeralGroup {
     pub last_seen: DateTime<Utc>,
 }
 
-pub struct RecordProcessor {
+// Legacy RecordProcessor removed in favor of StateDeriver + RecordBuilder.
+
+// New builder strictly for records; it reacts only to hints and explicit state transitions.
+pub struct RecordBuilder {
     current_state: ActivityState,
-    last_activity: Instant,
-    last_keyboard_activity: Instant,
-    active_timeout: Duration,
-    passive_timeout: Duration,
-    idle_timeout: Duration,
     current_record: Option<ActivityRecord>,
     current_focus: Option<WindowFocusInfo>,
     next_record_id: u64,
 }
 
-impl RecordProcessor {
-    pub fn new() -> Self {
-        let now = Instant::now();
+impl RecordBuilder {
+    pub fn new(initial_state: ActivityState) -> Self {
         Self {
-            current_state: ActivityState::Inactive,
-            last_activity: now,
-            last_keyboard_activity: now,
-            active_timeout: Duration::from_secs(30),
-            passive_timeout: Duration::from_secs(60),
-            idle_timeout: Duration::from_secs(300),
+            current_state: initial_state,
             current_record: None,
             current_focus: None,
             next_record_id: 1,
         }
     }
 
-    pub fn with_thresholds(active_grace_secs: u64, idle_threshold_secs: u64) -> Self {
-        let mut s = Self::new();
-        s.active_timeout = Duration::from_secs(active_grace_secs);
-        s.idle_timeout = Duration::from_secs(idle_threshold_secs);
-        // Passive threshold effectively becomes the idle threshold for transition to Inactive
-        s.passive_timeout = Duration::from_secs(idle_threshold_secs);
-        s
-    }
-
-    pub fn process_envelopes(&mut self, envelopes: Vec<EventEnvelope>) -> Vec<ActivityRecord> {
-        let mut new_records = Vec::new();
-
-        // Periodic completion as before
-        if let Some(ref record) = self.current_record {
-            let record_duration = Utc::now().signed_duration_since(record.start_time);
-            if record_duration > chrono::Duration::minutes(5) {
-                if let Some(completed) = self.force_complete_current_record() {
-                    new_records.push(completed);
-                }
-            }
-        }
-
-        for env in envelopes {
-            let completed_record = match env.kind {
-                EventKind::Signal(SignalKind::KeyboardInput) => self.handle_keyboard_event(env.id),
-                EventKind::Signal(SignalKind::MouseInput) => self.handle_mouse_event(env.id),
-                EventKind::Signal(SignalKind::AppChanged | SignalKind::WindowChanged) => {
-                    if let EventPayload::Focus(focus_info) = env.payload {
-                        self.handle_focus_change(env.id, focus_info)
-                    } else {
-                        None
-                    }
-                }
-                EventKind::Signal(SignalKind::LockStart | SignalKind::LockEnd) => {
-                    // Lock transitions are handled on focus events carrying loginwindow/non-loginwindow
-                    None
-                }
-                EventKind::Hint(HintKind::TitleChanged) => {
-                    if let EventPayload::Title { window_id, title } = env.payload {
-                        self.handle_title_hint(window_id, title)
-                    } else {
-                        None
-                    }
-                }
-                _ => None,
-            };
-
-            if let Some(record) = completed_record {
-                new_records.push(record);
-            }
-        }
-
-        new_records
-    }
-
-    fn handle_title_hint(
-        &mut self,
-        window_id: String,
-        new_title: String,
-    ) -> Option<ActivityRecord> {
-        if let Some(current_focus) = &mut self.current_focus {
-            if current_focus.window_id == window_id {
-                // finalize current, update title, start new with same state without counting as activity
-                let completed = if let Some(cur) = self.current_record.take() {
-                    let mut c = cur;
-                    c.end_time = Some(Utc::now());
-                    Some(c)
+    // Apply a hint envelope to update focus/title and split records as needed.
+    pub fn on_hint(&mut self, env: &EventEnvelope) -> Option<ActivityRecord> {
+        match &env.kind {
+            EventKind::Hint(HintKind::FocusChanged) => {
+                if let EventPayload::Focus(fi) = &env.payload {
+                    self.apply_focus_change(fi.clone())
                 } else {
                     None
-                };
-                current_focus.window_title = new_title;
-                let state = self.current_state;
-                let focus_clone = Some(current_focus.clone());
-                self.start_new_record_with_state(focus_clone, state);
-                return completed;
+                }
             }
+            EventKind::Hint(HintKind::StateChanged) => {
+                if let EventPayload::State { from: _, to } = &env.payload {
+                    self.on_state_transition(*to)
+                } else {
+                    None
+                }
+            }
+            EventKind::Hint(HintKind::TitleChanged) => {
+                if let EventPayload::Title { window_id, title } = &env.payload {
+                    self.apply_title_change(window_id, title)
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    }
+
+    // Apply a state transition to split records and start a new slice in the new state.
+    pub fn on_state_transition(&mut self, new_state: ActivityState) -> Option<ActivityRecord> {
+        if self.current_state == new_state {
+            return None;
+        }
+        let completed = self.finalize_current();
+        self.current_state = new_state;
+        self.start_new_current();
+        completed
+    }
+
+    pub fn finalize_all(&mut self) -> Option<ActivityRecord> {
+        self.finalize_current()
+    }
+
+    fn apply_focus_change(&mut self, focus_info: WindowFocusInfo) -> Option<ActivityRecord> {
+        // Any focus change splits the record with current state and updates focus
+        self.current_focus = Some(focus_info);
+        let completed = self.finalize_current();
+        self.start_new_current();
+        completed
+    }
+
+    fn apply_title_change(&mut self, window_id: &str, new_title: &str) -> Option<ActivityRecord> {
+        let should_update = self
+            .current_focus
+            .as_ref()
+            .map(|cf| cf.window_id == window_id)
+            .unwrap_or(false);
+        if should_update {
+            let completed = self.finalize_current();
+            if let Some(cf) = &mut self.current_focus {
+                cf.window_title = new_title.to_string();
+            }
+            self.start_new_current();
+            return completed;
         }
         None
     }
 
-    fn force_complete_current_record(&mut self) -> Option<ActivityRecord> {
-        if let Some(current) = self.current_record.take() {
-            let mut completed = current;
-            completed.end_time = Some(Utc::now());
-            Some(completed)
-        } else {
-            None
-        }
-    }
-
-    fn start_new_record(&mut self, focus_info: Option<WindowFocusInfo>) {
+    fn start_new_current(&mut self) {
         let now_utc = Utc::now();
         self.current_record = Some(ActivityRecord {
             record_id: self.next_record_id,
             start_time: now_utc,
             end_time: None,
-            state: ActivityState::Passive, // Start with passive state
-            focus_info,
-            event_count: 0,
-            triggering_events: Vec::new(),
-        });
-        self.next_record_id += 1;
-        debug!(
-            "Started new record #{}",
-            self.current_record.as_ref().unwrap().record_id
-        );
-    }
-
-    fn start_new_record_with_state(
-        &mut self,
-        focus_info: Option<WindowFocusInfo>,
-        state: ActivityState,
-    ) {
-        let now_utc = Utc::now();
-        self.current_record = Some(ActivityRecord {
-            record_id: self.next_record_id,
-            start_time: now_utc,
-            end_time: None,
-            state,
-            focus_info,
-            event_count: 0,
-            triggering_events: Vec::new(),
-        });
-        self.next_record_id += 1;
-        info!(
-            "State -> {:?} (record #{})",
-            state,
-            self.current_record.as_ref().unwrap().record_id
-        );
-    }
-
-    pub fn check_timeouts(&mut self) -> Option<ActivityRecord> {
-        let now = Instant::now();
-        if self.current_state == ActivityState::Locked {
-            return None;
-        }
-        let time_since_activity = now.duration_since(self.last_activity);
-        let time_since_keyboard = now.duration_since(self.last_keyboard_activity);
-
-        let target_state = match self.current_state {
-            ActivityState::Active if time_since_keyboard >= self.active_timeout => {
-                debug!(
-                    "Timeout: Active -> Passive ({}s since keyboard)",
-                    time_since_keyboard.as_secs()
-                );
-                Some(ActivityState::Passive)
-            }
-            ActivityState::Passive if time_since_activity >= self.idle_timeout => {
-                debug!(
-                    "Timeout: Passive -> Inactive ({}s since activity)",
-                    time_since_activity.as_secs()
-                );
-                Some(ActivityState::Inactive)
-            }
-            _ => None,
-        };
-
-        if let Some(new_state) = target_state {
-            let completed = self.transition_to_state(new_state, None);
-            if let Some(ref record) = completed {
-                info!(
-                    "Timeout record #{}: {:?} completed",
-                    record.record_id, record.state
-                );
-            }
-            completed
-        } else {
-            None
-        }
-    }
-
-    fn handle_keyboard_event(&mut self, event_id: u64) -> Option<ActivityRecord> {
-        let now = Instant::now();
-        if self.current_state == ActivityState::Locked {
-            // Ignore inputs while locked
-            return None;
-        }
-        self.last_activity = now;
-        self.last_keyboard_activity = now;
-
-        if self.current_record.is_none() {
-            self.start_new_record(self.current_focus.clone());
-        }
-
-        debug!("Keyboard event -> transitioning to Active");
-        let completed = self.transition_to_state(ActivityState::Active, Some(event_id));
-        self.add_event_to_current_record(event_id);
-        completed
-    }
-
-    fn handle_mouse_event(&mut self, event_id: u64) -> Option<ActivityRecord> {
-        let now = Instant::now();
-        if self.current_state == ActivityState::Locked {
-            // Ignore inputs while locked
-            return None;
-        }
-        self.last_activity = now;
-
-        if self.current_record.is_none() {
-            self.start_new_record(self.current_focus.clone());
-        }
-
-        let target_state = if now.duration_since(self.last_keyboard_activity) < self.active_timeout
-        {
-            ActivityState::Active
-        } else {
-            ActivityState::Passive
-        };
-
-        debug!("Mouse event -> transitioning to {:?}", target_state);
-        let completed = self.transition_to_state(target_state, Some(event_id));
-        self.add_event_to_current_record(event_id);
-        completed
-    }
-
-    fn handle_focus_change(
-        &mut self,
-        event_id: u64,
-        focus_info: WindowFocusInfo,
-    ) -> Option<ActivityRecord> {
-        info!(
-            "Focus change: '{}' in {} (PID {}, WinID {}, Start {})",
-            focus_info.window_title,
-            focus_info.app_name,
-            focus_info.pid,
-            focus_info.window_id,
-            focus_info.process_start_time
-        );
-
-        let is_same_window = self.current_focus.as_ref().is_some_and(|current| {
-            current.pid == focus_info.pid
-                && current.process_start_time == focus_info.process_start_time
-                && current.window_id == focus_info.window_id
-                && current.window_instance_start == focus_info.window_instance_start
-        });
-
-        self.current_focus = Some(focus_info.clone());
-        // Any real focus signal counts as activity
-        self.last_activity = Instant::now();
-
-        // Handle macOS lock based on loginwindow app name
-        let is_loginwindow = focus_info.app_name.eq_ignore_ascii_case("loginwindow");
-
-        if is_loginwindow {
-            // Entering Locked: finalize current and start Locked record with loginwindow focus
-            let completed_record = if let Some(current) = self.current_record.take() {
-                let mut completed = current;
-                completed.end_time = Some(Utc::now());
-                info!(
-                    "State -> Locked (completed #{}, was {:?})",
-                    completed.record_id, completed.state
-                );
-                Some(completed)
-            } else {
-                None
-            };
-
-            self.current_state = ActivityState::Locked;
-            self.start_new_record_with_state(Some(focus_info), ActivityState::Locked);
-            return completed_record;
-        }
-
-        if self.current_state == ActivityState::Locked {
-            // Exiting Locked on non-loginwindow focus: finalize locked and start Active
-            let completed_record = if let Some(current) = self.current_record.take() {
-                let mut completed = current;
-                completed.end_time = Some(Utc::now());
-                info!(
-                    "State Locked -> Active (completed #{})",
-                    completed.record_id
-                );
-                Some(completed)
-            } else {
-                None
-            };
-
-            self.current_state = ActivityState::Active;
-            self.start_new_record_with_state(Some(focus_info), ActivityState::Active);
-            self.add_event_to_current_record(event_id);
-            return completed_record;
-        }
-
-        if is_same_window {
-            // It's the same window, just a title change. Complete the current record and start a new one
-            // to ensure the UI gets updated with the new title.
-            let completed_record = if let Some(current) = self.current_record.take() {
-                let mut completed = current;
-                completed.end_time = Some(Utc::now());
-                debug!(
-                    "Title change completed record #{}: {:?} ({} events)",
-                    completed.record_id, completed.state, completed.event_count
-                );
-                Some(completed)
-            } else {
-                None
-            };
-
-            // Keep state unchanged on title-only change
-            let state = self.current_state;
-            self.start_new_record_with_state(Some(focus_info), state);
-            self.add_event_to_current_record(event_id);
-            completed_record
-        } else {
-            // It's a different window. Complete the old record and start a new one.
-            let completed_record = if let Some(current) = self.current_record.take() {
-                let mut completed = current;
-                completed.end_time = Some(Utc::now());
-                info!(
-                    "Focus change completed record #{}: {:?} with {} events",
-                    completed.record_id, completed.state, completed.event_count
-                );
-                Some(completed)
-            } else {
-                None
-            };
-
-            // Focus change should mark as Active immediately
-            self.current_state = ActivityState::Active;
-            self.start_new_record_with_state(Some(focus_info), ActivityState::Active);
-            self.add_event_to_current_record(event_id);
-            completed_record
-        }
-    }
-
-    fn transition_to_state(
-        &mut self,
-        new_state: ActivityState,
-        triggering_event: Option<u64>,
-    ) -> Option<ActivityRecord> {
-        if self.current_state == ActivityState::Locked {
-            return None;
-        }
-        if self.current_state == new_state {
-            return None;
-        }
-
-        debug!(
-            "State transition: {:?} -> {:?}",
-            self.current_state, new_state
-        );
-
-        let now_utc = Utc::now();
-        let completed_record = self.finalize_current_record(now_utc);
-
-        self.current_state = new_state;
-        let mut triggering_events = Vec::new();
-        if let Some(event_id) = triggering_event {
-            triggering_events.push(event_id);
-        }
-
-        self.current_record = Some(ActivityRecord {
-            record_id: self.next_record_id,
-            start_time: now_utc,
-            end_time: None,
-            state: new_state,
+            state: self.current_state,
             focus_info: self.current_focus.clone(),
             event_count: 0,
-            triggering_events,
+            triggering_events: Vec::new(),
         });
-
-        info!("State -> {:?} (record #{})", new_state, self.next_record_id);
-
         self.next_record_id += 1;
-        completed_record
     }
 
-    fn add_event_to_current_record(&mut self, event_id: u64) {
-        if self.current_state == ActivityState::Locked {
-            return;
-        }
-        if let Some(ref mut record) = self.current_record {
-            record.event_count += 1;
-            if !record.triggering_events.contains(&event_id) {
-                record.triggering_events.push(event_id);
-            }
-            debug!(
-                "Added event #{} to record #{} (total events: {})",
-                event_id, record.record_id, record.event_count
-            );
-        }
-    }
-
-    fn finalize_current_record(&mut self, end_time: DateTime<Utc>) -> Option<ActivityRecord> {
-        if let Some(mut record) = self.current_record.take() {
-            record.end_time = Some(end_time);
-            Some(record)
+    fn finalize_current(&mut self) -> Option<ActivityRecord> {
+        if let Some(mut rec) = self.current_record.take() {
+            rec.end_time = Some(Utc::now());
+            Some(rec)
         } else {
             None
         }
-    }
-
-    pub fn finalize_all(&mut self) -> Option<ActivityRecord> {
-        let final_record = self.finalize_current_record(Utc::now());
-        // only debug on finalize to keep INFO quiet
-        if let Some(ref record) = final_record {
-            debug!(
-                "Final record #{}: {:?} finalized",
-                record.record_id, record.state
-            );
-        }
-        final_record
     }
 
     pub fn current_state(&self) -> ActivityState {
         self.current_state
     }
+}
 
-    // current_record_info removed; use finalize/current_state instead
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::daemon::event_adapter::EventAdapter;
+    use crate::daemon::event_deriver::StateDeriver;
+    use crate::daemon::event_model::{DefaultStateEngine, EventSource, SignalKind, StateEngine};
+    use crate::daemon::events::RawEvent;
+
+    fn mk_env_signal(kind: SignalKind) -> EventEnvelope {
+        EventEnvelope {
+            id: 1,
+            timestamp: Utc::now(),
+            source: EventSource::Hook,
+            kind: EventKind::Signal(kind),
+            payload: EventPayload::None,
+            derived: false,
+            polling: false,
+            sensitive: false,
+        }
+    }
+
+    fn mk_focus(pid: i32, app: &str, wid: &str, title: &str) -> WindowFocusInfo {
+        WindowFocusInfo {
+            pid,
+            process_start_time: 1,
+            app_name: app.to_string(),
+            window_title: title.to_string(),
+            window_id: wid.to_string(),
+            window_instance_start: Utc::now(),
+            window_position: None,
+            window_size: None,
+        }
+    }
+
+    fn mk_env_focus_changed(fi: WindowFocusInfo) -> EventEnvelope {
+        EventEnvelope {
+            id: 2,
+            timestamp: Utc::now(),
+            source: EventSource::Hook,
+            kind: EventKind::Hint(HintKind::FocusChanged),
+            payload: EventPayload::Focus(fi),
+            derived: false,
+            polling: false,
+            sensitive: false,
+        }
+    }
+
+    fn mk_env_title_changed(wid: &str, title: &str) -> EventEnvelope {
+        EventEnvelope {
+            id: 3,
+            timestamp: Utc::now(),
+            source: EventSource::Polling,
+            kind: EventKind::Hint(HintKind::TitleChanged),
+            payload: EventPayload::Title {
+                window_id: wid.to_string(),
+                title: title.to_string(),
+            },
+            derived: false,
+            polling: true,
+            sensitive: false,
+        }
+    }
+
+    #[test]
+    fn test_state_engine_transitions_keyboard_mouse_timeouts() {
+        let now = Utc::now();
+        let mut engine = DefaultStateEngine::new(now, 30, 300);
+        assert_eq!(engine.current(), ActivityState::Inactive);
+
+        // keyboard input transitions to Active
+        let ev = mk_env_signal(SignalKind::KeyboardInput);
+        let tr = engine.on_signal(&ev, now).expect("transition");
+        assert_eq!(tr.from, ActivityState::Inactive);
+        assert_eq!(tr.to, ActivityState::Active);
+        assert_eq!(engine.current(), ActivityState::Active);
+
+        // after 31s, Active -> Passive
+        let tr = engine
+            .on_tick(now + chrono::Duration::seconds(31))
+            .expect("tick transition to passive");
+        assert_eq!(tr.from, ActivityState::Active);
+        assert_eq!(tr.to, ActivityState::Passive);
+        assert_eq!(engine.current(), ActivityState::Passive);
+
+        // after 301s, Passive -> Inactive
+        let tr = engine
+            .on_tick(now + chrono::Duration::seconds(301))
+            .expect("tick transition to inactive");
+        assert_eq!(tr.from, ActivityState::Passive);
+        assert_eq!(tr.to, ActivityState::Inactive);
+        assert_eq!(engine.current(), ActivityState::Inactive);
+    }
+
+    #[test]
+    fn test_record_builder_focus_title_and_state_splits() {
+        let mut rb = RecordBuilder::new(ActivityState::Inactive);
+
+        // First focus -> start record (Inactive)
+        let f1 = mk_focus(100, "Safari", "w1", "Tab A");
+        let _none = rb.on_hint(&mk_env_focus_changed(f1));
+        assert!(rb.current_record.is_some());
+        assert_eq!(
+            rb.current_record.as_ref().unwrap().state,
+            ActivityState::Inactive
+        );
+
+        // State transition to Active
+        let completed1 = rb.on_state_transition(ActivityState::Active);
+        assert!(completed1.is_some());
+        assert_eq!(completed1.unwrap().state, ActivityState::Inactive);
+        assert_eq!(
+            rb.current_record.as_ref().unwrap().state,
+            ActivityState::Active
+        );
+
+        // Title change on same window
+        let completed2 = rb.on_hint(&mk_env_title_changed("w1", "Tab B"));
+        assert!(completed2.is_some());
+        assert_eq!(completed2.unwrap().state, ActivityState::Active);
+        assert_eq!(
+            rb.current_record.as_ref().unwrap().state,
+            ActivityState::Active
+        );
+
+        // Focus change to another window
+        let f2 = mk_focus(100, "Safari", "w2", "Tab C");
+        let completed3 = rb.on_hint(&mk_env_focus_changed(f2));
+        assert!(completed3.is_some());
+        assert_eq!(completed3.unwrap().state, ActivityState::Active);
+        assert_eq!(
+            rb.current_record.as_ref().unwrap().state,
+            ActivityState::Active
+        );
+
+        // State transition to Passive
+        let completed4 = rb.on_state_transition(ActivityState::Passive);
+        assert!(completed4.is_some());
+        assert_eq!(completed4.unwrap().state, ActivityState::Active);
+        assert_eq!(
+            rb.current_record.as_ref().unwrap().state,
+            ActivityState::Passive
+        );
+    }
+
+    #[test]
+    fn test_integration_adapter_deriver_builder_flow() {
+        let now = Utc::now();
+        let mut adapter = EventAdapter::new();
+        let mut deriver = StateDeriver::new(now, 30, 300);
+        let mut builder = RecordBuilder::new(ActivityState::Inactive);
+
+        // t0: focus change to w1 title A
+        let f1 = mk_focus(200, "Safari", "w1", "A");
+        let ev1 = RawEvent::WindowFocusChange {
+            timestamp: now,
+            event_id: 10,
+            focus_info: f1,
+        };
+        let envs1 = adapter.adapt_batch(&vec![ev1]);
+        let mut completed: Vec<ActivityRecord> = Vec::new();
+        // Apply hints first, then signals for same-timestamp batch
+        for e in envs1
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::Hint(_)))
+        {
+            if let Some(r) = builder.on_hint(e) {
+                completed.push(r);
+            }
+        }
+        for e in envs1
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::Signal(_)))
+        {
+            if let Some(h) = deriver.on_signal(e) {
+                if let Some(r) = builder.on_hint(&h) {
+                    completed.push(r);
+                }
+            }
+        }
+
+        // Expect one completion (Inactive) due to FocusChanged then StateChanged->Active
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].state, ActivityState::Inactive);
+        completed.clear();
+
+        // t0+2s: same window, title changed to B
+        let f1b = mk_focus(200, "Safari", "w1", "B");
+        let ev2 = RawEvent::WindowFocusChange {
+            timestamp: now + chrono::Duration::seconds(2),
+            event_id: 11,
+            focus_info: f1b,
+        };
+        let envs2 = adapter.adapt_batch(&vec![ev2]);
+        for e in envs2
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::Hint(_)))
+        {
+            if let Some(r) = builder.on_hint(e) {
+                completed.push(r);
+            }
+        }
+        for e in envs2
+            .iter()
+            .filter(|e| matches!(e.kind, EventKind::Signal(_)))
+        {
+            if let Some(h) = deriver.on_signal(e) {
+                if let Some(r) = builder.on_hint(&h) {
+                    completed.push(r);
+                }
+            }
+        }
+        // Expect one completion (Active) due to TitleChanged
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].state, ActivityState::Active);
+        completed.clear();
+
+        // Tick at 40s -> Active -> Passive
+        if let Some(h) = deriver.on_tick(now + chrono::Duration::seconds(40)) {
+            if let Some(r) = builder.on_hint(&h) {
+                completed.push(r);
+            }
+        }
+        assert_eq!(completed.len(), 1);
+        assert_eq!(completed[0].state, ActivityState::Active);
+        assert_eq!(builder.current_state(), ActivityState::Passive);
+    }
+
+    #[test]
+    fn test_lock_splits_with_state_hints() {
+        let now = Utc::now();
+        let mut builder = RecordBuilder::new(ActivityState::Inactive);
+        let mut deriver = StateDeriver::new(now, 30, 300);
+
+        // Focus to normal app (start a record)
+        let f = mk_focus(123, "Safari", "w1", "Home");
+        let _ = builder.on_hint(&mk_env_focus_changed(f));
+
+        // Become Active via keyboard
+        if let Some(h) = deriver.on_signal(&mk_env_signal(SignalKind::KeyboardInput)) {
+            let rec = builder.on_hint(&h).expect("split on state active");
+            assert_eq!(rec.state, ActivityState::Inactive);
+        } else {
+            panic!("expected state hint active");
+        }
+
+        // LockStart -> Locked split
+        if let Some(h) = deriver.on_signal(&EventEnvelope {
+            id: 9,
+            timestamp: now + chrono::Duration::seconds(10),
+            source: EventSource::Derived,
+            kind: EventKind::Signal(SignalKind::LockStart),
+            payload: EventPayload::None,
+            derived: true,
+            polling: false,
+            sensitive: false,
+        }) {
+            let rec = builder.on_hint(&h).expect("split on locked");
+            assert_eq!(rec.state, ActivityState::Active);
+            assert_eq!(builder.current_state(), ActivityState::Locked);
+        } else {
+            panic!("expected lock state hint");
+        }
+
+        // Exit lock by ending lock; expect transition to Passive (since > active_grace but < idle_threshold from keyboard)
+        if let Some(h) = deriver.on_signal(&EventEnvelope {
+            id: 10,
+            timestamp: now + chrono::Duration::seconds(120),
+            source: EventSource::Derived,
+            kind: EventKind::Signal(SignalKind::LockEnd),
+            payload: EventPayload::None,
+            derived: true,
+            polling: false,
+            sensitive: false,
+        }) {
+            let rec = builder.on_hint(&h).expect("split on unlock");
+            assert_eq!(rec.state, ActivityState::Locked);
+            assert_eq!(builder.current_state(), ActivityState::Passive);
+        } else {
+            panic!("expected unlock state hint");
+        }
+    }
+
+    #[test]
+    fn test_title_change_ignored_for_different_window() {
+        let mut rb = RecordBuilder::new(ActivityState::Active);
+        let f = mk_focus(1, "Terminal", "w1", "A");
+        let _ = rb.on_hint(&mk_env_focus_changed(f));
+        // Title change for a different window id should not split
+        let none = rb.on_hint(&mk_env_title_changed("w2", "Other"));
+        assert!(none.is_none());
+        // State remains
+        assert_eq!(rb.current_state(), ActivityState::Active);
+    }
+
+    #[test]
+    fn test_aggregation_ephemeral_grouping() {
+        // Build short-lived windows under threshold and ensure grouping
+        let since = Utc::now() - chrono::Duration::minutes(10);
+        let base = since + chrono::Duration::seconds(60);
+        let mk_rec = |id: u64, start: DateTime<Utc>, dur_s: i64, title: &str| -> ActivityRecord {
+            let fi = WindowFocusInfo {
+                pid: 999,
+                process_start_time: 42,
+                app_name: "EphemeralApp".to_string(),
+                window_title: title.to_string(),
+                window_id: format!("win-{}", id),
+                window_instance_start: start,
+                window_position: None,
+                window_size: None,
+            };
+            ActivityRecord {
+                record_id: id,
+                start_time: start,
+                end_time: Some(start + chrono::Duration::seconds(dur_s)),
+                state: ActivityState::Active,
+                focus_info: Some(fi),
+                event_count: 0,
+                triggering_events: vec![],
+            }
+        };
+
+        // Three short windows with similar titles that normalize to same key
+        let r1 = mk_rec(1, base, 5, "Task A");
+        let r2 = mk_rec(2, base + chrono::Duration::seconds(10), 6, "Task A");
+        let r3 = mk_rec(3, base + chrono::Duration::seconds(30), 4, "Task A");
+
+        let now = base + chrono::Duration::minutes(5);
+        let out = aggregate_activities_since(&[r1, r2, r3], since, now, 10, 2, 100);
+        assert_eq!(out.len(), 1);
+        let agg = &out[0];
+        // Expect ephemeral group created (distinct_ids >= 2) and windows lane reduced accordingly
+        assert!(agg.ephemeral_groups.len() >= 1);
+        // No individual windows for grouped short-lived ones
+        assert_eq!(agg.windows.len(), 0);
+        // Total duration sums
+        let g = agg.ephemeral_groups.values().next().unwrap();
+        assert_eq!(g.occurrence_count, 3);
+        assert_eq!(g.total_duration_seconds, (5 + 6 + 4) as u64);
+    }
 }
 
 // Aggregate only the portion of records overlapping [since, now].

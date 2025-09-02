@@ -1,6 +1,5 @@
 use crate::daemon::events::WindowFocusInfo;
 use crate::util::lru::LruCache;
-use active_win_pos_rs::get_active_window;
 use chrono::{DateTime, Utc};
 use log::{debug, error, info, warn};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -8,6 +7,8 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use sysinfo::{Pid, System};
+#[cfg(target_os = "macos")]
+use winshift::{get_active_window_info, ActiveWindowInfo};
 
 #[derive(Debug, Clone, Copy)]
 pub struct FocusCacheCaps {
@@ -141,7 +142,7 @@ impl FocusEventWrapper {
         let now = Instant::now();
 
         if state.app_name == app_name && state.pid == pid {
-            info!("FocusEventWrapper: Duplicate app change ignored");
+            debug!("FocusEventWrapper: Duplicate app change ignored");
             return;
         }
 
@@ -151,47 +152,13 @@ impl FocusEventWrapper {
         state.window_instance_start = Utc::now();
         state.last_app_update = now;
 
-        match get_active_window() {
-            Ok(active_window) => {
-                if active_window.process_id as i32 == pid {
-                    state.window_title = active_window.title;
-                    if state.window_id != active_window.window_id {
-                        state.window_instance_start = Utc::now();
-                    }
-                    state.window_id = active_window.window_id;
-                    state.last_window_update = now;
-
-                    if state.is_complete() {
-                        // Wait a moment for the OS to settle the window title after a switch
-                        std::thread::sleep(Duration::from_millis(100));
-                        // Final refresh to ensure latest data
-                        if let Ok(aw) = get_active_window() {
-                            state.window_title = aw.title;
-                            state.window_id = aw.window_id;
-                        }
-                        let focus_info = state.to_window_focus_info();
-                        info!(
-                            "FocusEventWrapper: Emitting consolidated focus change from app change: {} -> {}",
-                            focus_info.app_name, focus_info.window_title
-                        );
-                        drop(state);
-                        self.callback.on_focus_change(focus_info);
-                    }
-                } else {
-                    warn!(
-                        "FocusEventWrapper: Active window PID ({}) does not match app change PID ({}). Clearing window info.",
-                        active_window.process_id, pid
-                    );
-                    state.window_title = String::new();
-                    state.window_id = String::new();
-                }
-            }
-            Err(e) => {
-                error!("FocusEventWrapper: Could not get active window: {:?}", e);
-                state.window_title = String::new();
-                state.window_id = String::new();
-            }
-        }
+        // Defer emission to let window info settle; a title/window callback is expected soon.
+        drop(state);
+        let wrapper = self.clone();
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(150));
+            wrapper.try_emit_after_delay();
+        });
     }
 
     pub fn handle_window_change(&self, window_title: String) {
@@ -206,52 +173,91 @@ impl FocusEventWrapper {
         let now = Instant::now();
 
         if state.window_title == window_title {
-            info!("FocusEventWrapper: Duplicate window change ignored");
+            debug!("FocusEventWrapper: Duplicate window change ignored");
             return;
         }
 
         state.window_title = window_title;
         state.last_window_update = now;
 
-        // Also update window_id, as it might have changed (e.g., new tab in browser)
-        match get_active_window() {
-            Ok(active_window) => {
-                if active_window.process_id as i32 == state.pid {
-                    if state.window_id != active_window.window_id {
-                        state.window_instance_start = Utc::now();
-                    }
-                    state.window_id = active_window.window_id;
-                }
-            }
-            Err(e) => {
-                error!(
-                    "FocusEventWrapper: Could not get active window on title change: {:?}",
-                    e
-                );
-            }
-        }
+        // On macOS, window_id and other details are supplied by winshift info callbacks
 
         if state.is_complete() {
             // Wait a moment for the OS to settle the window title after a switch
             std::thread::sleep(Duration::from_millis(100));
-            // Final refresh to ensure latest data
-            if let Ok(aw) = get_active_window() {
-                state.window_title = aw.title;
-                state.window_id = aw.window_id;
-            }
+            // On macOS-only support, assume info callback already provided latest details
             let focus_info = state.to_window_focus_info();
+            // Emit immediately on first title after app change; future quick duplicates suppressed by processor
+            drop(state);
             info!(
                 "FocusEventWrapper: Emitting consolidated focus change: {} -> {}",
                 focus_info.app_name, focus_info.window_title
             );
-
-            drop(state);
             self.callback.on_focus_change(focus_info);
         } else {
             warn!(
                 "FocusEventWrapper: Window change but state is incomplete: app={}, pid={}, window={}",
                 state.app_name, state.pid, state.window_title
             );
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn handle_app_change_info(&self, info: ActiveWindowInfo) {
+        // Trust winshift info: no get_active_window needed
+        let mut state = self.current_state.lock().unwrap();
+        state.app_name = info.app_name.clone();
+        state.pid = info.process_id;
+        state.process_start_time = self.get_process_start_time(info.process_id);
+        state.window_title = info.title.clone();
+        state.window_id = format!("{}", info.window_id);
+        state.window_instance_start = Utc::now();
+        state.last_app_update = Instant::now();
+        state.last_window_update = state.last_app_update;
+        if state.is_complete() {
+            let focus_info = state.to_window_focus_info();
+            drop(state);
+            info!(
+                "FocusEventWrapper: Emitting consolidated focus change (app+info): {} -> {}",
+                focus_info.app_name, focus_info.window_title
+            );
+            self.callback.on_focus_change(focus_info);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn handle_window_change_info(&self, info: ActiveWindowInfo) {
+        let mut state = self.current_state.lock().unwrap();
+        if state.pid != info.process_id {
+            state.pid = info.process_id;
+            state.app_name = info.app_name.clone();
+            state.process_start_time = self.get_process_start_time(info.process_id);
+        }
+        state.window_title = info.title.clone();
+        state.window_id = format!("{}", info.window_id);
+        state.last_window_update = Instant::now();
+        if state.is_complete() {
+            let focus_info = state.to_window_focus_info();
+            drop(state);
+            info!(
+                "FocusEventWrapper: Emitting consolidated focus change (win+info): {} -> {}",
+                focus_info.app_name, focus_info.window_title
+            );
+            self.callback.on_focus_change(focus_info);
+        }
+    }
+
+    fn try_emit_after_delay(&self) {
+        // Single attempt to emit a focus change after app change, only if window info has settled
+        let state = self.current_state.lock().unwrap();
+        if state.is_complete() {
+            let focus_info = state.to_window_focus_info();
+            drop(state);
+            info!(
+                "FocusEventWrapper: Emitting consolidated focus change from app change: {} -> {}",
+                focus_info.app_name, focus_info.window_title
+            );
+            self.callback.on_focus_change(focus_info);
         }
     }
 
@@ -273,10 +279,10 @@ impl FocusEventWrapper {
                     break;
                 }
 
-                match get_active_window() {
-                    Ok(active_window) => {
-                        let window_id = active_window.window_id;
-                        let current_title = active_window.title;
+                match get_active_window_info() {
+                    Ok(info) => {
+                        let window_id = format!("{}", info.window_id);
+                        let current_title = info.title.clone();
 
                         let mut titles = last_titles.lock().unwrap();
                         if let Some(last_title) = titles.get_cloned(&window_id) {
@@ -285,7 +291,7 @@ impl FocusEventWrapper {
                                     "Polling detected title change for window {}: '{}' -> '{}'",
                                     window_id, last_title, current_title
                                 );
-                                focus_wrapper.handle_window_change(current_title.clone());
+                                focus_wrapper.handle_window_change_info(info.clone());
                             }
                         }
 

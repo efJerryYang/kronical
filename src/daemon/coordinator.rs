@@ -3,7 +3,7 @@ use crate::daemon::event_adapter::EventAdapter;
 use crate::daemon::event_deriver::LockDeriver;
 use crate::daemon::events::{KeyboardEventData, MouseEventData, MousePosition, WindowFocusInfo};
 use crate::daemon::focus_tracker::{FocusCacheCaps, FocusChangeCallback, FocusEventWrapper};
-use crate::daemon::records::{aggregate_activities_since, ActivityRecord, RecordProcessor};
+use crate::daemon::records::{aggregate_activities_since, ActivityRecord};
 use crate::daemon::socket_server::SocketServer;
 use crate::storage::StorageBackend;
 use anyhow::Result;
@@ -12,6 +12,8 @@ use std::sync::{mpsc, Arc};
 use std::thread;
 use std::time::Duration;
 use uiohook_rs::{EventHandler, Uiohook, UiohookEvent};
+#[cfg(target_os = "macos")]
+use winshift::ActiveWindowInfo;
 use winshift::{FocusChangeHandler, MonitoringMode, WindowFocusHook, WindowHookConfig};
 
 #[derive(Debug, Clone)]
@@ -36,11 +38,12 @@ impl ChronicleEventHandler {
         let callback = Arc::new(FocusCallback {
             sender: sender.clone(),
         });
+        let initial_ms = poll_handle.load(std::sync::atomic::Ordering::Relaxed);
         let focus_wrapper = FocusEventWrapper::new(
             callback,
-            Duration::from_secs(2),
+            Duration::from_millis(initial_ms),
             caps,
-            std::sync::Arc::clone(&poll_handle),
+            poll_handle,
         );
 
         Self {
@@ -110,6 +113,21 @@ impl FocusChangeHandler for ChronicleEventHandler {
     fn on_window_change(&self, window_title: String) {
         debug!("Window changed: {}", window_title);
         self.focus_wrapper.handle_window_change(window_title);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn on_app_change_info(&self, info: ActiveWindowInfo) {
+        debug!(
+            "App+Info: {} pid={} wid={}",
+            info.app_name, info.process_id, info.window_id
+        );
+        self.focus_wrapper.handle_app_change_info(info);
+    }
+
+    #[cfg(target_os = "macos")]
+    fn on_window_change_info(&self, info: ActiveWindowInfo) {
+        debug!("Win+Info: '{}' wid={}", info.title, info.window_id);
+        self.focus_wrapper.handle_window_change_info(info);
     }
 }
 
@@ -223,8 +241,6 @@ impl EventCoordinator {
         let data_thread = {
             let mut compression_engine =
                 CompressionEngine::with_focus_cap(self.focus_interner_max_strings);
-            let mut record_processor =
-                RecordProcessor::with_thresholds(self.active_grace_secs, self.idle_threshold_secs);
             let mut adapter = EventAdapter::new();
             let mut lock_deriver = LockDeriver::new();
             let mut store = data_store;
@@ -240,6 +256,8 @@ impl EventCoordinator {
             let max_windows = self.max_windows_per_app;
 
             let poll_handle_arc2 = std::sync::Arc::clone(&poll_handle_arc);
+            let ags = self.active_grace_secs;
+            let its = self.idle_threshold_secs;
             thread::spawn(move || {
                 info!("Background data processing thread started");
                 let mut event_count = 0;
@@ -270,6 +288,13 @@ impl EventCoordinator {
                     Err(e) => error!("Failed to hydrate records from DB: {}", e),
                 }
 
+                // Initialize new state + record components
+                let mut state_deriver =
+                    crate::daemon::event_deriver::StateDeriver::new(now0, ags as i64, its as i64);
+                let mut record_builder = crate::daemon::records::RecordBuilder::new(
+                    crate::daemon::records::ActivityState::Inactive,
+                );
+
                 loop {
                     match receiver.recv_timeout(Duration::from_millis(50)) {
                         Ok(ChronicleEvent::Shutdown) => {
@@ -278,15 +303,32 @@ impl EventCoordinator {
                             );
                             if !pending_raw_events.is_empty() {
                                 let raw_events_to_process = std::mem::take(&mut pending_raw_events);
-                                // Adapt to EventEnvelope + derive lock boundaries (scaffold for future pipeline)
+                                // Adapt to EventEnvelope + derive lock boundaries
                                 let envelopes = adapter.adapt_batch(&raw_events_to_process);
-                                let _envelopes_with_lock = lock_deriver.derive(&envelopes);
-                                let new_records = record_processor
-                                    .process_envelopes(_envelopes_with_lock.clone());
-                                if !new_records.is_empty() {
-                                    let _ = store.add_records(new_records.clone());
-                                    for r in new_records {
-                                        recent_records.push_back(r);
+                                let envelopes_with_lock = lock_deriver.derive(&envelopes);
+                                // Persist all envelopes
+                                let _ = store.add_envelopes(envelopes_with_lock.clone());
+                                // Feed pipeline (hint-first ordering per timestamp)
+                                for env in envelopes_with_lock.iter().filter(|e| {
+                                    matches!(e.kind, crate::daemon::event_model::EventKind::Hint(_))
+                                }) {
+                                    if let Some(rec) = record_builder.on_hint(env) {
+                                        let _ = store.add_records(vec![rec.clone()]);
+                                        recent_records.push_back(rec);
+                                    }
+                                }
+                                for env in envelopes_with_lock.iter().filter(|e| {
+                                    matches!(
+                                        e.kind,
+                                        crate::daemon::event_model::EventKind::Signal(_)
+                                    )
+                                }) {
+                                    if let Some(h) = state_deriver.on_signal(env) {
+                                        let _ = store.add_envelopes(vec![h.clone()]);
+                                        if let Some(rec) = record_builder.on_hint(&h) {
+                                            let _ = store.add_records(vec![rec.clone()]);
+                                            recent_records.push_back(rec);
+                                        }
                                     }
                                 }
                                 let now = chrono::Utc::now();
@@ -311,7 +353,7 @@ impl EventCoordinator {
                                 );
                                 socket_server_clone.update_aggregated_data(agg);
                                 // State-aware polling cadence
-                                let ms = match record_processor.current_state() {
+                                let ms = match record_builder.current_state() {
                                     crate::daemon::records::ActivityState::Active => 2000,
                                     crate::daemon::records::ActivityState::Passive => 10000,
                                     crate::daemon::records::ActivityState::Inactive => 20000,
@@ -342,19 +384,43 @@ impl EventCoordinator {
 
                                 let raw_events_to_process = std::mem::take(&mut pending_raw_events);
 
-                                // Adapt to EventEnvelope + derive lock boundaries (scaffold for future pipeline)
+                                // Adapt to EventEnvelope + derive lock boundaries
                                 let envelopes = adapter.adapt_batch(&raw_events_to_process);
-                                let _envelopes_with_lock = lock_deriver.derive(&envelopes);
+                                let envelopes_with_lock = lock_deriver.derive(&envelopes);
 
                                 // Persist envelopes for replay diagnostics
-                                if let Err(e) = store.add_envelopes(_envelopes_with_lock.clone()) {
+                                if let Err(e) = store.add_envelopes(envelopes_with_lock.clone()) {
                                     error!("Failed to store envelopes: {}", e);
                                 }
-                                let new_records = record_processor
-                                    .process_envelopes(_envelopes_with_lock.clone());
+
+                                // New pipeline: feed signals to StateDeriver, hints to RecordBuilder
+                                let mut new_records = Vec::new();
+                                // Hints first
+                                for env in envelopes_with_lock.iter().filter(|e| {
+                                    matches!(e.kind, crate::daemon::event_model::EventKind::Hint(_))
+                                }) {
+                                    if let Some(rec) = record_builder.on_hint(env) {
+                                        new_records.push(rec);
+                                    }
+                                }
+                                // Then signals (which may derive state-change hints)
+                                for env in envelopes_with_lock.iter().filter(|e| {
+                                    matches!(
+                                        e.kind,
+                                        crate::daemon::event_model::EventKind::Signal(_)
+                                    )
+                                }) {
+                                    if let Some(h) = state_deriver.on_signal(env) {
+                                        if let Err(e) = store.add_envelopes(vec![h.clone()]) {
+                                            error!("Failed to store derived state hint: {}", e);
+                                        }
+                                        if let Some(rec) = record_builder.on_hint(&h) {
+                                            new_records.push(rec);
+                                        }
+                                    }
+                                }
                                 if !new_records.is_empty() {
                                     info!("Generated {} new records", new_records.len());
-                                    // Update state history from new record states
                                     for r in &new_records {
                                         let ch = match r.state {
                                             crate::daemon::records::ActivityState::Active => 'A',
@@ -374,7 +440,6 @@ impl EventCoordinator {
                                     if let Err(e) = store.add_records(new_records.clone()) {
                                         error!("Failed to store records: {}", e);
                                     }
-
                                     for r in new_records.into_iter() {
                                         recent_records.push_back(r);
                                     }
@@ -397,7 +462,7 @@ impl EventCoordinator {
                                             let mut suppress: std::collections::HashSet<u64> =
                                                 std::collections::HashSet::new();
                                             let mut locked = false;
-                                            for env in &_envelopes_with_lock {
+                                            for env in &envelopes_with_lock {
                                                 match &env.kind {
                                                     EventKind::Signal(SignalKind::LockStart) => {
                                                         locked = true
@@ -453,7 +518,7 @@ impl EventCoordinator {
                                 );
                                 socket_server_clone.update_aggregated_data(agg);
                                 // State-aware polling cadence
-                                let ms = match record_processor.current_state() {
+                                let ms = match record_builder.current_state() {
                                     crate::daemon::records::ActivityState::Active => 2000,
                                     crate::daemon::records::ActivityState::Passive => 10000,
                                     crate::daemon::records::ActivityState::Inactive => 20000,
@@ -468,19 +533,16 @@ impl EventCoordinator {
                         }
                     }
 
-                    if let Some(timeout_record) = record_processor.check_timeouts() {
-                        info!(
-                            "Timeout detected, storing record: {:?}",
-                            timeout_record.state
-                        );
-                        if let Err(e) = store.add_records(vec![timeout_record.clone()]) {
-                            error!("Failed to store timeout record: {}", e);
+                    if let Some(state_hint) = state_deriver.on_tick(chrono::Utc::now()) {
+                        if let Err(e) = store.add_envelopes(vec![state_hint.clone()]) {
+                            error!("Failed to store tick-derived state hint: {}", e);
                         }
-
-                        recent_records.push_back(timeout_record);
-                        // Update state history
-                        if let Some(last) = recent_records.back() {
-                            let ch = match last.state {
+                        if let Some(rec) = record_builder.on_hint(&state_hint) {
+                            if let Err(e) = store.add_records(vec![rec.clone()]) {
+                                error!("Failed to store timeout record: {}", e);
+                            }
+                            recent_records.push_back(rec.clone());
+                            let ch = match rec.state {
                                 crate::daemon::records::ActivityState::Active => 'A',
                                 crate::daemon::records::ActivityState::Passive => 'P',
                                 crate::daemon::records::ActivityState::Inactive => 'I',
@@ -516,7 +578,7 @@ impl EventCoordinator {
                             max_windows,
                         );
                         socket_server_clone.update_aggregated_data(agg);
-                        let ms = match record_processor.current_state() {
+                        let ms = match record_builder.current_state() {
                             crate::daemon::records::ActivityState::Active => 2000,
                             crate::daemon::records::ActivityState::Passive => 10000,
                             crate::daemon::records::ActivityState::Inactive => 20000,
@@ -526,7 +588,7 @@ impl EventCoordinator {
                     }
                 }
 
-                if let Some(final_record) = record_processor.finalize_all() {
+                if let Some(final_record) = record_builder.finalize_all() {
                     info!("Storing final record: {:?}", final_record.state);
                     if let Err(e) = store.add_records(vec![final_record.clone()]) {
                         error!("Failed to store final record: {}", e);
@@ -604,6 +666,7 @@ impl EventCoordinator {
             handler,
             WindowHookConfig {
                 monitoring_mode: MonitoringMode::Combined,
+                embed_active_info: true,
             },
         );
 

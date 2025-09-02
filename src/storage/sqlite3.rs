@@ -125,10 +125,13 @@ impl SqliteStorage {
                             SignalKind::MouseInput => "signal:mouse",
                             SignalKind::AppChanged => "signal:app_changed",
                             SignalKind::WindowChanged => "signal:window_changed",
+                            SignalKind::ActivityPulse => "signal:activity_pulse",
                             SignalKind::LockStart => "signal:lock_start",
                             SignalKind::LockEnd => "signal:lock_end",
                         },
                         EventKind::Hint(hk) => match hk {
+                            HintKind::FocusChanged => "hint:focus_changed",
+                            HintKind::StateChanged => "hint:state_changed",
                             HintKind::TitleChanged => "hint:title_changed",
                             HintKind::PositionChanged => "hint:position",
                             HintKind::SizeChanged => "hint:size",
@@ -141,6 +144,11 @@ impl SqliteStorage {
                         EventPayload::Lock { reason } => serde_json::to_string(reason).ok(),
                         EventPayload::Title { window_id, title } => {
                             serde_json::to_string(&(window_id, title)).ok()
+                        }
+                        EventPayload::State { from, to } => {
+                            let from_s = format!("{:?}", from);
+                            let to_s = format!("{:?}", to);
+                            serde_json::to_string(&(from_s, to_s)).ok()
                         }
                         EventPayload::None => None,
                     };
@@ -315,6 +323,7 @@ impl StorageBackend for SqliteStorage {
                     "mouse" => SignalKind::MouseInput,
                     "app_changed" => SignalKind::AppChanged,
                     "window_changed" => SignalKind::WindowChanged,
+                    "activity_pulse" => SignalKind::ActivityPulse,
                     "lock_start" => SignalKind::LockStart,
                     "lock_end" => SignalKind::LockEnd,
                     _ => SignalKind::AppChanged,
@@ -323,6 +332,8 @@ impl StorageBackend for SqliteStorage {
             } else if kind_s.starts_with("hint:") {
                 let k = &kind_s[5..];
                 let hk = match k {
+                    "focus_changed" => HintKind::FocusChanged,
+                    "state_changed" => HintKind::StateChanged,
                     "title_changed" => HintKind::TitleChanged,
                     "position" => HintKind::PositionChanged,
                     "size" => HintKind::SizeChanged,
@@ -352,6 +363,24 @@ impl StorageBackend for SqliteStorage {
                                 window_id: wid,
                                 title,
                             },
+                            Err(_) => EventPayload::None,
+                        }
+                    } else if kind_s.contains("state_changed") {
+                        match serde_json::from_str::<(String, String)>(&js) {
+                            Ok((from_s, to_s)) => {
+                                use crate::daemon::records::ActivityState as S;
+                                let parse = |s: &str| match s {
+                                    "Active" => S::Active,
+                                    "Passive" => S::Passive,
+                                    "Inactive" => S::Inactive,
+                                    "Locked" => S::Locked,
+                                    _ => S::Inactive,
+                                };
+                                EventPayload::State {
+                                    from: parse(&from_s),
+                                    to: parse(&to_s),
+                                }
+                            }
                             Err(_) => EventPayload::None,
                         }
                     } else {

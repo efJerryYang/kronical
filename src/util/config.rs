@@ -53,7 +53,6 @@ impl AppConfig {
 
         let mut builder = Config::builder()
             .set_default("workspace_dir", workspace_dir.to_str().unwrap())?
-            .set_default("polling_interval_seconds", 2)?
             .set_default("retention_minutes", 10)?
             .set_default("active_grace_secs", 30)?
             .set_default("idle_threshold_secs", 300)?
