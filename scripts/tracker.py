@@ -8,10 +8,12 @@ Features:
 - Lock file mechanism to prevent concurrent tracking
 - CSV output with automatic compression
 - Auto-detection of Kronical daemon PID
+- Reads from ~/.kronical/system-tracker.zip by default
 
 Usage:
   python tracker.py [PID]              # Track specified PID or auto-detect
-  python tracker.py --watch [logfile]  # Live plot existing log file
+  python tracker.py --watch            # Live plot from ~/.kronical/system-tracker.zip
+  python tracker.py --watch [logfile]  # Live plot specific log file
 """
 
 import argparse
@@ -39,7 +41,7 @@ class ProcessTracker:
     def __init__(self, pid: int, zip_file: str = "system-info.zip", interval: float = 1.0):
         self.pid = pid
         self.zip_file = zip_file
-        self.csv_name = "system-info.csv"
+        self.csv_name = "system-metrics.csv"
         self.interval = interval
         self.lock_file = f"{zip_file}.lock"
         self.lock_fd = None
@@ -138,7 +140,7 @@ class ProcessTracker:
     
     def load_existing_data(self) -> list:
         if not Path(self.zip_file).exists():
-            return [["ts", "cpu_pct", "rss_bytes", "disk_io_bytes"]]
+            return [["timestamp", "cpu_percent", "memory_bytes", "disk_io_bytes"]]
         
         try:
             with zipfile.ZipFile(self.zip_file, 'r') as zf:
@@ -146,7 +148,7 @@ class ProcessTracker:
                     reader = csv.reader(io.TextIOWrapper(csvfile, encoding='utf-8'))
                     return list(reader)
         except (zipfile.BadZipFile, KeyError):
-            return [["ts", "cpu_pct", "rss_bytes", "disk_io_bytes"]]
+            return [["timestamp", "cpu_percent", "memory_bytes", "disk_io_bytes"]]
     
     def save_data(self, data: list):
         csv_buffer = io.StringIO()
@@ -206,7 +208,7 @@ class ProcessTracker:
 class LivePlotter:
     def __init__(self, zip_file: str, period: str = "day", interval_ms: int = 1000):
         self.zip_file = zip_file
-        self.csv_name = "system-info.csv"
+        self.csv_name = "system-metrics.csv"
         self.period = period
         self.interval_ms = interval_ms
         self.last_mtime = 0.0
@@ -241,6 +243,35 @@ class LivePlotter:
                     df = pd.read_csv(io.TextIOWrapper(csvfile, encoding='utf-8'))
             
             df = df.dropna(how="all")
+            
+            # Handle both old and new column formats
+            time_col = None
+            cpu_col = None 
+            memory_col = None
+            disk_col = None
+            
+            if "timestamp" in df.columns:
+                time_col = "timestamp"
+                cpu_col = "cpu_percent" 
+                memory_col = "memory_bytes"
+                disk_col = "disk_io_bytes"
+            elif "ts" in df.columns:
+                time_col = "ts"
+                cpu_col = "cpu_pct"
+                memory_col = "rss_bytes" 
+                disk_col = "disk_io_bytes"
+            else:
+                print("Error: Neither 'timestamp' nor 'ts' column found", file=sys.stderr)
+                return pd.DataFrame()
+            
+            # Normalize column names for consistent processing
+            df = df.rename(columns={
+                time_col: "ts",
+                cpu_col: "cpu_pct", 
+                memory_col: "rss_bytes",
+                disk_col: "disk_io_bytes"
+            })
+            
             df = df[df["ts"].notna()].copy()
             
             df["ts"] = pd.to_datetime(df["ts"], utc=True, errors="coerce")
@@ -376,24 +407,41 @@ def find_kronical_pid() -> Optional[int]:
     return None
 
 
+def get_default_zip_path() -> str:
+    home = Path.home()
+    kronical_dir = home / ".kronical"
+    return str(kronical_dir / "system-tracker.zip")
+
+
 def main():
     parser = argparse.ArgumentParser(description="System monitoring and plotting for Kronical")
     parser.add_argument("pid", nargs="?", type=int, help="PID to monitor (auto-detect Kronical if omitted)")
-    parser.add_argument("--watch", "-w", metavar="ZIPFILE", help="Live plot mode for existing ZIP file")
+    parser.add_argument("--watch", "-w", nargs="?", const=True, metavar="ZIPFILE", help="Live plot mode (default: ~/.kronical/system-tracker.zip)")
     parser.add_argument("--hour", action="store_true", help="Show last hour with second resolution (use with --watch)")
     parser.add_argument("--day", action="store_true", help="Show last day with 24-second resolution (use with --watch)")
     parser.add_argument("--week", action="store_true", help="Show last week with 7*24-second resolution (use with --watch)")
     parser.add_argument("--month", action="store_true", help="Show last month with 30*7*24-second resolution (use with --watch)")
     parser.add_argument("--detect", "-d", action="store_true", help="Auto-detect and start tracking Kronical daemon if running")
     parser.add_argument("--interval", "-i", type=float, default=1.0, help="Sampling interval in seconds (default: 1.0)")
-    parser.add_argument("--output", "-o", default="system-info.zip", help="Output ZIP file (default: system-info.zip)")
+    parser.add_argument("--output", "-o", help="Output ZIP file (default: ~/.kronical/system-tracker.zip)")
     
     args = parser.parse_args()
     
+    # Set default output path if not specified
+    if not args.output:
+        args.output = get_default_zip_path()
+    
     if args.watch:
-        zip_file = args.watch
+        # If --watch is specified without a file, use the default kronical path
+        if args.watch == True:  # This happens when --watch is used without an argument
+            zip_file = get_default_zip_path()
+        else:
+            zip_file = args.watch
+        
         if not Path(zip_file).exists():
             print(f"Error: ZIP file not found: {zip_file}", file=sys.stderr)
+            if zip_file == get_default_zip_path():
+                print("Make sure tracker_enabled = true in config and kronid is running", file=sys.stderr)
             sys.exit(1)
         
         period = "day"
