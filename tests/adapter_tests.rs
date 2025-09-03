@@ -1,7 +1,8 @@
-use chronicle::daemon::event_adapter::EventAdapter;
-use chronicle::daemon::event_model::{EventKind, HintKind};
-use chronicle::daemon::events::{RawEvent, WindowFocusInfo};
 use chrono::Utc;
+use kronical::daemon::event_adapter::EventAdapter;
+use kronical::daemon::event_model::{EventKind, HintKind};
+use kronical::daemon::events::{RawEvent, WindowFocusInfo};
+use std::sync::Arc;
 
 #[test]
 fn title_only_change_emits_only_hint() {
@@ -10,9 +11,9 @@ fn title_only_change_emits_only_hint() {
     let base = WindowFocusInfo {
         pid: 999,
         process_start_time: 1,
-        app_name: "Safari".into(),
-        window_title: "A".into(),
-        window_id: "w1".into(),
+        app_name: Arc::new("Safari".to_string()),
+        window_title: Arc::new("A".to_string()),
+        window_id: 1,
         window_instance_start: t0,
         window_position: None,
         window_size: None,
@@ -28,7 +29,7 @@ fn title_only_change_emits_only_hint() {
 
     // Second observation: same app/window, different title
     let mut second_fi = base.clone();
-    second_fi.window_title = "B".into();
+    second_fi.window_title = Arc::new("B".to_string());
     let second = RawEvent::WindowFocusChange {
         timestamp: t0 + chrono::Duration::seconds(1),
         event_id: 2,

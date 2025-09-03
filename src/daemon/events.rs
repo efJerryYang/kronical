@@ -1,21 +1,21 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use size_of::SizeOf;
+use std::sync::Arc;
 
-#[derive(Debug, Clone, Serialize, Deserialize, SizeOf)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MousePosition {
     pub x: i32,
     pub y: i32,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, SizeOf)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeyboardEventData {
     pub key_code: Option<u16>,
     pub key_char: Option<char>,
     pub modifiers: Vec<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, SizeOf)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MouseEventData {
     pub position: MousePosition,
     pub button: Option<String>,
@@ -23,19 +23,19 @@ pub struct MouseEventData {
     pub wheel_delta: Option<i16>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, SizeOf)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WindowFocusInfo {
     pub pid: i32,
     pub process_start_time: u64,
-    pub app_name: String,
-    pub window_title: String,
-    pub window_id: String,
+    pub app_name: Arc<String>,
+    pub window_title: Arc<String>,
+    pub window_id: u32,
     pub window_instance_start: DateTime<Utc>,
     pub window_position: Option<MousePosition>,
     pub window_size: Option<(u32, u32)>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, SizeOf)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum RawEvent {
     KeyboardInput {
         timestamp: DateTime<Utc>,

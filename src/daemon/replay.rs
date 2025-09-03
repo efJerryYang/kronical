@@ -1,25 +1,21 @@
 use crate::daemon::event_model::{EventKind, HintKind};
-use crate::daemon::records::{aggregate_activities_since, ActivityRecord, RecordBuilder};
-use crate::daemon::socket_server::SocketServer;
+use crate::daemon::records::{ActivityRecord, RecordBuilder, aggregate_activities_since};
 use crate::storage::StorageBackend;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use log::info;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 pub fn run_replay(
     mut store: Box<dyn StorageBackend>,
-    workspace_sock_dir: PathBuf,
+    _workspace_sock_dir: PathBuf,
     speed: f64,
     retention_minutes: u64,
     thresholds: (u64, u64),
 ) -> Result<()> {
-    let socket_path = workspace_sock_dir.join("chronicle.replay.sock");
-    let server = Arc::new(SocketServer::new(socket_path, 60, 3));
-    server.start()?;
+    // legacy monitor socket removed for replay
 
     let now = Utc::now();
     let since = now - chrono::Duration::minutes(retention_minutes as i64);
@@ -100,7 +96,7 @@ pub fn run_replay(
                     state_hist.pop_front();
                 }
                 let hist_str: String = state_hist.iter().collect();
-                server.update_state_history(hist_str);
+                let _ = hist_str;
             }
             recent_records.push_back(r);
         }
@@ -116,18 +112,28 @@ pub fn run_replay(
                     break;
                 }
             }
-            let recs: Vec<ActivityRecord> = recent_records.iter().cloned().collect();
-            let agg = aggregate_activities_since(&recs, since_sim, now_sim, 60, 3, 30);
-            server.update_aggregated_data(agg);
+            let _agg = aggregate_activities_since(
+                recent_records.make_contiguous(),
+                since_sim,
+                now_sim,
+                60,
+                3,
+                30,
+            );
             last_push = std::time::Instant::now();
         }
     }
 
     if let Some(now_sim) = last_ts {
         let since_sim = now_sim - chrono::Duration::minutes(retention_minutes as i64);
-        let recs: Vec<ActivityRecord> = recent_records.iter().cloned().collect();
-        let agg = aggregate_activities_since(&recs, since_sim, now_sim, 60, 3, 30);
-        server.update_aggregated_data(agg);
+        let _agg = aggregate_activities_since(
+            recent_records.make_contiguous(),
+            since_sim,
+            now_sim,
+            60,
+            3,
+            30,
+        );
     }
 
     Ok(())

@@ -34,6 +34,8 @@ impl StringInterner {
         if self.strings.len() >= self.max_strings {
             self.strings.clear();
             self.lookup.clear();
+            self.strings.shrink_to_fit();
+            self.lookup.shrink_to_fit();
         }
         let id = self.strings.len() as StringId;
         self.strings.push(s.to_string());

@@ -1,0 +1,95 @@
+syntax = "proto3";
+
+package kroni.v1;
+
+message SnapshotRequest {
+  repeated string sections = 1;
+  string detail = 2; // e.g., "summary"|"full"
+}
+
+message SnapshotReply {
+  uint64 seq = 1;
+  uint64 mono_ns = 2;
+  enum ActivityState {
+    UNKNOWN = 0;
+    ACTIVE = 1;
+    PASSIVE = 2;
+    INACTIVE = 3;
+    LOCKED = 4;
+  }
+  ActivityState activity_state = 3;
+  message Focus {
+    string app = 1;
+    int32 pid = 2;
+    string window_id = 3;
+    string title = 4;
+    string since_rfc3339 = 5;
+  }
+  Focus focus = 4;
+  message Transition {
+    ActivityState from = 1;
+    ActivityState to = 2;
+    string at_rfc3339 = 3;
+  }
+  Transition last_transition = 5;
+  message Counts {
+    uint64 signals_seen = 1;
+    uint64 hints_seen = 2;
+    uint64 records_emitted = 3;
+  }
+  Counts counts = 6;
+  message Cadence {
+    uint32 current_ms = 1;
+    string reason = 2;
+  }
+  Cadence cadence = 7;
+  string next_timeout_rfc3339 = 8;
+  message Storage {
+    uint64 backlog_count = 1;
+    string last_flush_rfc3339 = 2;
+  }
+  Storage storage = 9;
+  message Config {
+    uint64 active_grace_secs = 1;
+    uint64 idle_threshold_secs = 2;
+    uint64 retention_minutes = 3;
+    uint64 ephemeral_max_duration_secs = 4;
+    uint32 ephemeral_min_distinct_ids = 5;
+    uint64 ephemeral_app_max_duration_secs = 6;
+    uint32 ephemeral_app_min_distinct_procs = 7;
+  }
+  Config config = 10;
+  message Replay {
+    string mode = 1; // "live" | "replay"
+    uint64 position = 2; // 0 if not applicable
+  }
+  Replay replay = 11;
+  repeated string health = 12;
+  message SnapshotWindow {
+    string window_id = 1;
+    string window_title = 2;
+    string first_seen_rfc3339 = 3;
+    string last_seen_rfc3339 = 4;
+    uint64 duration_seconds = 5;
+    bool is_group = 6;
+  }
+  message SnapshotApp {
+    string app_name = 1;
+    int32 pid = 2;
+    uint64 process_start_time = 3;
+    repeated SnapshotWindow windows = 4;
+    uint64 total_duration_secs = 5;
+    string total_duration_pretty = 6;
+  }
+  repeated SnapshotApp aggregated_apps = 13;
+}
+
+message WatchRequest {
+  repeated string sections = 1;
+  string detail = 2;
+}
+
+service Kroni {
+  rpc Snapshot (SnapshotRequest) returns (SnapshotReply);
+  rpc Watch (WatchRequest) returns (stream SnapshotReply);
+}

@@ -152,3 +152,10 @@ rust-project.json
 
 *.log
 pidio
+*.zip
+*.csv
+
+**/__pycache__/
+
+*.zip.lock
+

@@ -7,4 +7,12 @@ pub mod events;
 pub mod focus_tracker;
 pub mod records;
 pub mod replay;
-pub mod socket_server;
+pub mod system_tracker;
+// legacy socket_server removed
+pub mod snapshot;
+
+#[cfg(feature = "kroni-api")]
+pub mod kroni_server;
+
+#[cfg(feature = "http-admin")]
+pub mod http_admin;

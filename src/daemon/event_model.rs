@@ -49,7 +49,7 @@ pub enum EventPayload {
         reason: String,
     },
     Title {
-        window_id: String,
+        window_id: u32,
         title: String,
     },
     State {
