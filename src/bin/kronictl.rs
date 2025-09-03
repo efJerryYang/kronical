@@ -7,6 +7,7 @@ use crossterm::{
 #[cfg(feature = "kroni-api")]
 use hyper_util::rt::TokioIo;
 use kronical as _; // ensure library is linked
+use kronical::daemon::system_tracker::trigger_tracker_flush;
 #[cfg(feature = "kroni-api")]
 use kronical::kroni_api::kroni::v1::kroni_client::KroniClient;
 #[cfg(feature = "kroni-api")]
@@ -14,7 +15,7 @@ use kronical::kroni_api::kroni::v1::{SnapshotRequest, WatchRequest};
 use kronical::storage::StorageBackend;
 use kronical::storage::sqlite3::SqliteStorage;
 use kronical::util::config::AppConfig;
-use log::error;
+use log::{debug, error};
 use ratatui::{
     Terminal,
     prelude::{Backend, Constraint, CrosstermBackend, Direction, Layout},
@@ -77,7 +78,7 @@ enum Commands {
 enum TrackerAction {
     Show {
         #[arg(long)]
-        follow: bool,
+        watch: bool,
     },
     Status,
 }
@@ -571,7 +572,9 @@ fn main() {
         }
         Commands::ReplayMonitor => monitor_replay(data_file),
         Commands::Tracker { action } => match action {
-            TrackerAction::Show { follow } => tracker_show(&config.workspace_dir, follow),
+            TrackerAction::Show { watch } => {
+                tracker_show(&config.workspace_dir, watch, config.tracker_refresh_secs)
+            }
             TrackerAction::Status => tracker_status(&config),
         },
     };
@@ -1069,33 +1072,38 @@ fn cleanup_stale_tracker_pid(workspace_dir: &PathBuf) {
     }
 }
 
-fn tracker_show(workspace_dir: &PathBuf, follow: bool) -> Result<()> {
+fn tracker_show(workspace_dir: &PathBuf, watch: bool, refresh_interval_secs: f64) -> Result<()> {
     let zip_path = workspace_dir.join("system-tracker.zip");
-
-    if !zip_path.exists() {
-        return Err(anyhow::anyhow!(
-            "No tracker data found at {}. Make sure tracker_enabled = true in config and daemon is running.",
-            zip_path.display()
-        ));
-    }
 
     cleanup_stale_tracker_pid(workspace_dir);
 
-    if follow {
-        println!("Following tracker data (press Ctrl+C to exit)...");
-        use std::fs;
-        let mut last_size = fs::metadata(&zip_path)?.len();
+    let trigger_flush_and_show = || -> Result<()> {
+        if let Err(_) = trigger_tracker_flush(workspace_dir) {
+            debug!("Could not trigger tracker flush (daemon may not be running)");
+        }
+
+        std::thread::sleep(Duration::from_millis(100));
+
+        if !zip_path.exists() {
+            return Err(anyhow::anyhow!(
+                "No tracker data found at {}. Make sure tracker_enabled = true in config and daemon is running.",
+                zip_path.display()
+            ));
+        }
+
+        show_tracker_data(&zip_path)
+    };
+
+    if watch {
+        println!("Watching tracker data (press Ctrl+C to exit)...");
+        let refresh_duration = Duration::from_secs_f64(refresh_interval_secs);
 
         loop {
-            std::thread::sleep(Duration::from_secs(1));
-            let current_size = fs::metadata(&zip_path)?.len();
-            if current_size != last_size {
-                show_tracker_data(&zip_path)?;
-                last_size = current_size;
-            }
+            trigger_flush_and_show()?;
+            std::thread::sleep(refresh_duration);
         }
     } else {
-        show_tracker_data(&zip_path)?;
+        trigger_flush_and_show()?;
     }
 
     Ok(())

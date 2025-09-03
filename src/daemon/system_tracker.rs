@@ -27,16 +27,19 @@ pub struct SystemTracker {
     batch_size: usize,
     zip_path: PathBuf,
     running: Arc<Mutex<bool>>,
+    flush_signal_path: PathBuf,
 }
 
 impl SystemTracker {
     pub fn new(pid: u32, interval_secs: f64, batch_size: usize, zip_path: PathBuf) -> Self {
+        let flush_signal_path = zip_path.with_file_name("tracker-flush-signal");
         Self {
             pid,
             interval: Duration::from_secs_f64(interval_secs),
             batch_size,
             zip_path,
             running: Arc::new(Mutex::new(false)),
+            flush_signal_path,
         }
     }
 
@@ -58,6 +61,7 @@ impl SystemTracker {
         let interval = self.interval;
         let batch_size = self.batch_size;
         let zip_path = self.zip_path.clone();
+        let flush_signal_path = self.flush_signal_path.clone();
         let running = Arc::clone(&self.running);
 
         thread::spawn(move || {
@@ -65,12 +69,27 @@ impl SystemTracker {
             let mut last_disk_io = 0u64;
             let mut batch_count = 0;
 
+            let flush_buffer = |buffer: &mut Vec<SystemMetrics>| {
+                if !buffer.is_empty() {
+                    if let Err(e) = write_metrics_to_zip(&zip_path, buffer) {
+                        error!("Failed to write metrics batch to ZIP: {}", e);
+                    } else {
+                        debug!("Written {} metrics to ZIP file", buffer.len());
+                        buffer.clear();
+                    }
+                }
+            };
+
             while *running.lock().unwrap() {
+                if flush_signal_path.exists() {
+                    flush_buffer(&mut metrics_buffer);
+                    let _ = std::fs::remove_file(&flush_signal_path);
+                }
+
                 let start_time = Instant::now();
 
                 match collect_system_metrics(pid, last_disk_io) {
-                    Ok((cpu_percent, memory_bytes, disk_io_delta)) => {
-                        let current_total_disk_io = get_disk_io(pid).unwrap_or(0);
+                    Ok((cpu_percent, memory_bytes, disk_io_delta, current_total_disk_io)) => {
                         last_disk_io = current_total_disk_io;
 
                         let metrics = SystemMetrics {
@@ -84,12 +103,7 @@ impl SystemTracker {
                         batch_count += 1;
 
                         if batch_count % batch_size == 0 {
-                            if let Err(e) = write_metrics_to_zip(&zip_path, &metrics_buffer) {
-                                error!("Failed to write metrics batch to ZIP: {}", e);
-                            } else {
-                                debug!("Written {} metrics to ZIP file", metrics_buffer.len());
-                                metrics_buffer.clear();
-                            }
+                            flush_buffer(&mut metrics_buffer);
                         }
                     }
                     Err(e) => {
@@ -107,13 +121,7 @@ impl SystemTracker {
                 }
             }
 
-            if !metrics_buffer.is_empty() {
-                if let Err(e) = write_metrics_to_zip(&zip_path, &metrics_buffer) {
-                    error!("Failed to write final metrics batch: {}", e);
-                } else {
-                    info!("System tracker stopped, final metrics written successfully");
-                }
-            }
+            flush_buffer(&mut metrics_buffer);
         });
 
         Ok(())
@@ -135,9 +143,22 @@ impl SystemTracker {
     pub fn is_running(&self) -> bool {
         *self.running.lock().unwrap()
     }
+
+    pub fn flush(&self) -> Result<()> {
+        std::fs::write(&self.flush_signal_path, "")
+            .map_err(|e| anyhow::anyhow!("Failed to create flush signal file: {}", e))?;
+        Ok(())
+    }
 }
 
-fn collect_system_metrics(pid: u32, last_disk_io: u64) -> Result<(f64, u64, u64)> {
+pub fn trigger_tracker_flush(workspace_dir: &PathBuf) -> Result<()> {
+    let flush_signal_path = workspace_dir.join("tracker-flush-signal");
+    std::fs::write(&flush_signal_path, "")
+        .map_err(|e| anyhow::anyhow!("Failed to create flush signal file: {}", e))?;
+    Ok(())
+}
+
+fn collect_system_metrics(pid: u32, last_disk_io: u64) -> Result<(f64, u64, u64, u64)> {
     let cpu_percent = get_cpu_usage(pid)?;
     let memory_bytes = get_memory_usage(pid)?;
     let current_disk_io = get_disk_io(pid)?;
@@ -148,7 +169,7 @@ fn collect_system_metrics(pid: u32, last_disk_io: u64) -> Result<(f64, u64, u64)
         current_disk_io
     };
 
-    Ok((cpu_percent, memory_bytes, disk_io_delta))
+    Ok((cpu_percent, memory_bytes, disk_io_delta, current_disk_io))
 }
 
 #[cfg(target_os = "macos")]

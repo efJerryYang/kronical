@@ -21,6 +21,7 @@ pub struct AppConfig {
     pub tracker_enabled: bool,
     pub tracker_interval_secs: f64,
     pub tracker_batch_size: usize,
+    pub tracker_refresh_secs: f64,
 }
 
 impl Default for AppConfig {
@@ -48,6 +49,7 @@ impl Default for AppConfig {
             tracker_enabled: false,
             tracker_interval_secs: 1.0,
             tracker_batch_size: 60,
+            tracker_refresh_secs: 1.0,
         }
     }
 }
@@ -73,7 +75,8 @@ impl AppConfig {
             .set_default("focus_interner_max_strings", 4096)?
             .set_default("tracker_enabled", false)?
             .set_default("tracker_interval_secs", 1.0)?
-            .set_default("tracker_batch_size", 60)?;
+            .set_default("tracker_batch_size", 60)?
+            .set_default("tracker_refresh_secs", 1.0)?;
 
         // Load config file if it exists
         if config_path.exists() {
