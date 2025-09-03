@@ -190,7 +190,7 @@ def main():
         return cpu_line, mem_line, io_line
 
     # cache_frame_data=False removes the warning and avoids unbounded cache
-    ani = FuncAnimation(fig, update, interval=args.interval, blit=False, cache_frame_data=False)
+    FuncAnimation(fig, update, interval=args.interval, blit=False, cache_frame_data=False)
 
     # Draw the first frame explicitly
     update(0)

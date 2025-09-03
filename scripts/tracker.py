@@ -388,7 +388,7 @@ class LivePlotter:
             fig.autofmt_xdate(rotation=0)
             return cpu_line, mem_line, io_line
         
-        ani = FuncAnimation(fig, update, interval=self.interval_ms, blit=False, cache_frame_data=False)
+        FuncAnimation(fig, update, interval=self.interval_ms, blit=False, cache_frame_data=False)
         
         update(0)
         plt.suptitle(f"Live Monitor: {Path(self.zip_file).name} ({self.period})", fontsize=12)
@@ -433,7 +433,7 @@ def main():
     
     if args.watch:
         # If --watch is specified without a file, use the default kronical path
-        if args.watch == True:  # This happens when --watch is used without an argument
+        if args.watch:  # This happens when --watch is used without an argument
             zip_file = get_default_zip_path()
         else:
             zip_file = args.watch
