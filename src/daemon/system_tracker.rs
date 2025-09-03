@@ -10,6 +10,9 @@ use std::time::{Duration, Instant};
 use tracing::{debug, error, info, warn};
 use zip::{CompressionMethod, ZipArchive, ZipWriter, write::FileOptions};
 
+#[cfg(target_os = "macos")]
+use libc::pid_t;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemMetrics {
     pub timestamp: DateTime<Utc>,
@@ -66,14 +69,15 @@ impl SystemTracker {
                 let start_time = Instant::now();
 
                 match collect_system_metrics(pid, last_disk_io) {
-                    Ok((cpu_percent, memory_bytes, disk_io_bytes)) => {
-                        last_disk_io = disk_io_bytes;
+                    Ok((cpu_percent, memory_bytes, disk_io_delta)) => {
+                        let current_total_disk_io = get_disk_io(pid).unwrap_or(0);
+                        last_disk_io = current_total_disk_io;
 
                         let metrics = SystemMetrics {
                             timestamp: Utc::now(),
                             cpu_percent,
                             memory_bytes,
-                            disk_io_bytes,
+                            disk_io_bytes: disk_io_delta,
                         };
 
                         metrics_buffer.push(metrics);
@@ -138,13 +142,13 @@ fn collect_system_metrics(pid: u32, last_disk_io: u64) -> Result<(f64, u64, u64)
     let memory_bytes = get_memory_usage(pid)?;
     let current_disk_io = get_disk_io(pid)?;
 
-    let _disk_io_delta = if current_disk_io >= last_disk_io {
+    let disk_io_delta = if current_disk_io >= last_disk_io {
         current_disk_io - last_disk_io
     } else {
         current_disk_io
     };
 
-    Ok((cpu_percent, memory_bytes, current_disk_io))
+    Ok((cpu_percent, memory_bytes, disk_io_delta))
 }
 
 #[cfg(target_os = "macos")]
@@ -186,18 +190,28 @@ fn get_memory_usage(pid: u32) -> Result<u64> {
 }
 
 #[cfg(target_os = "macos")]
+#[allow(non_camel_case_types)]
+mod libproc_bindings {
+    include!(concat!(env!("OUT_DIR"), "/libproc_bindings.rs"));
+}
+
+#[cfg(target_os = "macos")]
 fn get_disk_io(pid: u32) -> Result<u64> {
-    use std::process::Command;
+    use libproc_bindings::*;
+    use std::mem::MaybeUninit;
 
-    let output = Command::new("ps")
-        .args(["-o", "pid,comm", "-p", &pid.to_string()])
-        .output()?;
+    unsafe {
+        let mut rusage_info = MaybeUninit::<rusage_info_v4>::uninit();
+        let mut ptr = rusage_info.as_mut_ptr() as rusage_info_t;
+        let result = proc_pid_rusage(pid as pid_t, RUSAGE_INFO_V4 as i32, &mut ptr);
 
-    if !output.status.success() {
-        return Ok(0);
+        if result == 0 {
+            let info = rusage_info.assume_init();
+            Ok(info.ri_diskio_bytesread + info.ri_diskio_byteswritten)
+        } else {
+            Ok(0)
+        }
     }
-
-    Ok(0)
 }
 
 fn is_process_running(pid: u32) -> bool {
@@ -211,34 +225,35 @@ fn is_process_running(pid: u32) -> bool {
 }
 
 fn write_metrics_to_zip(zip_path: &PathBuf, metrics_buffer: &[SystemMetrics]) -> Result<()> {
-    let mut existing_metrics = Vec::new();
+    let temp_path = zip_path.with_extension("tmp");
 
+    let mut existing_metrics = Vec::new();
     if zip_path.exists() {
         existing_metrics = read_existing_metrics(zip_path)?;
     }
 
     existing_metrics.extend_from_slice(metrics_buffer);
 
-    let file = File::create(zip_path)?;
-    let mut zip = ZipWriter::new(BufWriter::new(file));
-    let options: FileOptions<()> =
-        FileOptions::default().compression_method(CompressionMethod::Deflated);
-    zip.start_file("system-metrics.csv", options)?;
+    {
+        let file = File::create(&temp_path)?;
+        let mut zip = ZipWriter::new(BufWriter::new(file));
+        let options: FileOptions<()> =
+            FileOptions::default().compression_method(CompressionMethod::Deflated);
 
-    let mut csv_writer = csv::Writer::from_writer(zip);
+        zip.start_file("system-metrics.csv", options)?;
 
-    for metric in &existing_metrics {
-        csv_writer.serialize(metric)?;
+        {
+            let mut csv_writer = csv::Writer::from_writer(&mut zip);
+            for metric in &existing_metrics {
+                csv_writer.serialize(metric)?;
+            }
+            csv_writer.flush()?;
+        }
+
+        zip.finish()?;
     }
 
-    csv_writer.flush()?;
-    let zip_writer = match csv_writer.into_inner() {
-        Ok(writer) => writer,
-        Err(e) => return Err(anyhow::anyhow!("Failed to get inner ZIP writer: {}", e)),
-    };
-
-    zip_writer.finish()?;
-
+    std::fs::rename(&temp_path, zip_path)?;
     Ok(())
 }
 

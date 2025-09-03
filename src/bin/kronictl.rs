@@ -1117,17 +1117,17 @@ fn show_tracker_data(zip_path: &PathBuf) -> Result<()> {
 
     println!(
         "{:<20} {:>8} {:>12} {:>12}",
-        "Timestamp", "CPU %", "Memory MB", "Disk IO"
+        "Timestamp", "CPU %", "Memory KB", "Disk IO KB"
     );
-    println!("{}", "-".repeat(60));
+    println!("{}", "-".repeat(64));
 
     for result in reader.records() {
         let record = result?;
         if record.len() >= 4 {
             let timestamp = &record[0];
             let cpu = record[1].parse::<f64>().unwrap_or(0.0);
-            let memory = record[2].parse::<u64>().unwrap_or(0) / 1024 / 1024; // Convert to MB
-            let disk_io = record[3].parse::<u64>().unwrap_or(0);
+            let memory_kb = record[2].parse::<u64>().unwrap_or(0) / 1024;
+            let disk_io_kb = record[3].parse::<u64>().unwrap_or(0) / 1024;
 
             let time_part = timestamp
                 .split('T')
@@ -1137,8 +1137,8 @@ fn show_tracker_data(zip_path: &PathBuf) -> Result<()> {
                 .next()
                 .unwrap_or("");
             println!(
-                "{:<20} {:>8.1} {:>12} {:>12}",
-                time_part, cpu, memory, disk_io
+                "{:<20} {:>8.1} {:>12.1} {:>12.1}",
+                time_part, cpu, memory_kb as f64, disk_io_kb as f64
             );
         }
     }

@@ -15,9 +15,44 @@ fn ensure_workspace_dir(workspace_dir: &PathBuf) -> Result<()> {
     Ok(())
 }
 
+fn is_process_running(pid: u32) -> bool {
+    use std::process::Command;
+
+    Command::new("ps")
+        .args(["-p", &pid.to_string()])
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
 fn write_pid_file(pid_file: &PathBuf) -> Result<()> {
-    let pid = std::process::id();
-    std::fs::write(pid_file, pid.to_string()).context("Failed to write PID file")?;
+    if pid_file.exists() {
+        match std::fs::read_to_string(pid_file) {
+            Ok(content) => {
+                if let Ok(existing_pid) = content.trim().parse::<u32>() {
+                    if is_process_running(existing_pid) {
+                        return Err(anyhow::anyhow!(
+                            "Kronical daemon is already running (PID: {})",
+                            existing_pid
+                        ));
+                    } else {
+                        info!(
+                            "Removing stale PID file (process {} no longer exists)",
+                            existing_pid
+                        );
+                        let _ = std::fs::remove_file(pid_file);
+                    }
+                }
+            }
+            Err(_) => {
+                info!("Removing unreadable PID file");
+                let _ = std::fs::remove_file(pid_file);
+            }
+        }
+    }
+
+    let current_pid = std::process::id();
+    std::fs::write(pid_file, current_pid.to_string()).context("Failed to write PID file")?;
     Ok(())
 }
 
