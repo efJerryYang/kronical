@@ -14,21 +14,27 @@ Activity tracking daemon (kronid) with dual-stream pattern and state transitions
 ## Commands
 ```bash
 # Daemon control
-kronical start                    # Start kronid daemon
-kronical status                   # Check daemon status
-kronical stop                     # Stop daemon
+kronictl start                    # Start kronid daemon
+kronictl status                   # Check daemon status
+kronictl stop                     # Stop daemon
+kronictl restart                  # Restart daemon
 
-# Data export
-kronical export --output data.json
-kronical export --format csv
+# Monitoring and data access
+kronictl snapshot                 # Get current snapshot
+kronictl snapshot --pretty        # Get formatted snapshot
+kronictl watch                    # Watch for changes
+kronictl watch --pretty           # Watch with pretty output
+kronictl monitor                  # Live TUI (press 'q' to quit)
 
-# Monitoring
-kronical monitor                  # Live TUI (press 'q' to quit)
-kronical debug                    # Debug information
+# Replay functionality
+kronictl replay                   # Replay with default speed
+kronictl replay --speed 2.0       # Replay at 2x speed
+kronictl replay-monitor           # Monitor replay mode
 
-# System tracking
-kronical system start --output metrics.csv
-kronical system plot --input metrics.csv
+# System tracking (when enabled in config)
+kronictl tracker status           # Show tracker status
+kronictl tracker show             # Show tracker data
+kronictl tracker show --follow    # Follow tracker updates
 ```
 
 ## Permissions (macOS)
