@@ -1,10 +1,10 @@
 use crate::daemon::compression::CompressionEngine;
+use crate::daemon::duckdb_system_tracker::DuckDbSystemTracker;
 use crate::daemon::event_adapter::EventAdapter;
 use crate::daemon::event_deriver::LockDeriver;
 use crate::daemon::events::{KeyboardEventData, MouseEventData, MousePosition, WindowFocusInfo};
 use crate::daemon::focus_tracker::{FocusCacheCaps, FocusChangeCallback, FocusEventWrapper};
 use crate::daemon::records::{ActivityRecord, aggregate_activities_since};
-use crate::daemon::system_tracker::SystemTracker;
 // legacy socket server removed
 use crate::storage::StorageBackend;
 use anyhow::Result;
@@ -286,20 +286,31 @@ impl EventCoordinator {
 
         if self.tracker_enabled {
             let current_pid = std::process::id();
-            let tracker_zip_path = pid_file.parent().unwrap().join("system-tracker.zip");
-            let tracker = SystemTracker::new(
+            let tracker_db_path = pid_file.parent().unwrap().join("system-tracker.duckdb");
+            let tracker = DuckDbSystemTracker::new(
                 current_pid,
                 self.tracker_interval_secs,
                 self.tracker_batch_size,
-                tracker_zip_path,
+                tracker_db_path.clone(),
             );
             if let Err(e) = tracker.start() {
-                error!("Failed to start system tracker: {}", e);
+                error!("Failed to start DuckDB system tracker: {}", e);
             } else {
                 info!(
-                    "System tracker started successfully for PID {}",
+                    "DuckDB system tracker started successfully for PID {}",
                     current_pid
                 );
+
+                #[cfg(feature = "kroni-api")]
+                {
+                    crate::daemon::kroni_server::set_system_tracker_db_path(
+                        tracker_db_path.clone(),
+                    );
+                    info!(
+                        "System tracker DB path set for gRPC API: {:?}",
+                        tracker_db_path
+                    );
+                }
             }
         }
 

@@ -1,16 +1,21 @@
 #![cfg(feature = "kroni-api")]
 
+use crate::daemon::duckdb_system_tracker::DuckDbSystemMetricsStore;
 use crate::daemon::snapshot;
 use crate::kroni_api::kroni::v1::kroni_server::{Kroni, KroniServer};
 use crate::kroni_api::kroni::v1::{
-    SnapshotReply, SnapshotRequest, WatchRequest, snapshot_reply::ActivityState as PbState,
-    snapshot_reply::Cadence, snapshot_reply::Config, snapshot_reply::Counts, snapshot_reply::Focus,
-    snapshot_reply::Replay, snapshot_reply::SnapshotApp as PbApp,
-    snapshot_reply::SnapshotWindow as PbWin, snapshot_reply::Storage, snapshot_reply::Transition,
+    SnapshotReply, SnapshotRequest, SystemMetric, SystemMetricsReply, SystemMetricsRequest,
+    WatchRequest, snapshot_reply::ActivityState as PbState, snapshot_reply::Cadence,
+    snapshot_reply::Config, snapshot_reply::Counts, snapshot_reply::Focus, snapshot_reply::Replay,
+    snapshot_reply::SnapshotApp as PbApp, snapshot_reply::SnapshotWindow as PbWin,
+    snapshot_reply::Storage, snapshot_reply::Transition,
 };
 use anyhow::Result;
+use chrono::{DateTime, Utc};
 use futures_core::Stream;
 use log::{info, warn};
+use once_cell::sync::OnceCell;
+use prost_types::Timestamp;
 use std::path::PathBuf;
 use std::pin::Pin;
 use tokio::net::UnixListener;
@@ -18,8 +23,14 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::IntervalStream;
 use tonic::{Request, Response, Status, transport::Server};
 
+static SYSTEM_TRACKER_DB_PATH: OnceCell<PathBuf> = OnceCell::new();
+
+pub fn set_system_tracker_db_path(db_path: PathBuf) {
+    let _ = SYSTEM_TRACKER_DB_PATH.set(db_path);
+}
+
 #[derive(Clone, Default)]
-struct KroniSvc {}
+pub struct KroniSvc {}
 
 #[tonic::async_trait]
 impl Kroni for KroniSvc {
@@ -42,6 +53,88 @@ impl Kroni for KroniSvc {
                 .map(|_| Ok(to_pb(&snapshot::get_current())));
         Ok(Response::new(Box::pin(stream)))
     }
+
+    async fn get_system_metrics(
+        &self,
+        req: Request<SystemMetricsRequest>,
+    ) -> Result<Response<SystemMetricsReply>, Status> {
+        let request = req.into_inner();
+
+        let db_path = match SYSTEM_TRACKER_DB_PATH.get() {
+            Some(path) => path,
+            None => return Err(Status::unavailable("System tracker not configured")),
+        };
+
+        let store = DuckDbSystemMetricsStore::new_file(db_path)
+            .map_err(|e| Status::internal(format!("Failed to open system tracker DB: {}", e)))?;
+
+        // Proactively request a tracker flush so we read fresh data.
+        let flush_signal_path = db_path.with_file_name("tracker-flush-signal");
+        let _ = std::fs::write(&flush_signal_path, "");
+        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+
+        let pid = request.pid;
+
+        let metrics = if request.limit > 0 {
+            // Fetch the most recent N rows for this PID; return ascending by timestamp
+            let mut rows = store
+                .get_metrics_for_pid(pid, Some(request.limit as usize))
+                .map_err(|e| Status::internal(format!("Failed to query metrics: {}", e)))?;
+            rows.reverse();
+            rows
+        } else {
+            let start_time = match request.start_time.as_ref() {
+                Some(ts) => ts_to_utc(ts)
+                    .map_err(|e| Status::invalid_argument(format!("Invalid start_time: {}", e)))?,
+                None => Utc::now() - chrono::Duration::minutes(5),
+            };
+            let end_time = match request.end_time.as_ref() {
+                Some(ts) => ts_to_utc(ts)
+                    .map_err(|e| Status::invalid_argument(format!("Invalid end_time: {}", e)))?,
+                None => Utc::now(),
+            };
+
+            store
+                .get_metrics_in_time_range(pid, start_time, end_time)
+                .map_err(|e| Status::internal(format!("Failed to query metrics: {}", e)))?
+        };
+
+        let pb_metrics = metrics
+            .into_iter()
+            .map(|m| SystemMetric {
+                timestamp: Some(utc_to_ts(m.timestamp)),
+                cpu_percent: m.cpu_percent,
+                memory_bytes: m.memory_bytes,
+                disk_io_bytes: m.disk_io_bytes,
+            })
+            .collect::<Vec<_>>();
+
+        let total_count = pb_metrics.len() as u32;
+
+        let reply = SystemMetricsReply {
+            metrics: pb_metrics,
+            total_count,
+        };
+
+        Ok(Response::new(reply))
+    }
+}
+
+fn ts_to_utc(ts: &Timestamp) -> Result<DateTime<Utc>, &'static str> {
+    // Clamp nanos to u32 and use chrono’s from_timestamp
+    let secs = ts.seconds;
+    let nanos = ts.nanos;
+    if nanos < 0 || nanos >= 1_000_000_000 {
+        return Err("nanos out of range");
+    }
+    DateTime::<Utc>::from_timestamp(secs, nanos as u32).ok_or("invalid timestamp range")
+}
+
+fn utc_to_ts(dt: DateTime<Utc>) -> Timestamp {
+    Timestamp {
+        seconds: dt.timestamp(),
+        nanos: dt.timestamp_subsec_nanos() as i32,
+    }
 }
 
 pub fn to_pb(s: &snapshot::Snapshot) -> SnapshotReply {
@@ -56,7 +149,7 @@ pub fn to_pb(s: &snapshot::Snapshot) -> SnapshotReply {
         pid: f.pid,
         window_id: f.window_id.to_string(),
         title: (*f.window_title).clone(),
-        since_rfc3339: f.window_instance_start.to_rfc3339(),
+        since: Some(utc_to_ts(f.window_instance_start)),
     });
     let last_transition = s.last_transition.as_ref().map(|t| Transition {
         from: match t.from {
@@ -71,7 +164,7 @@ pub fn to_pb(s: &snapshot::Snapshot) -> SnapshotReply {
             crate::daemon::records::ActivityState::Inactive => PbState::Inactive as i32,
             crate::daemon::records::ActivityState::Locked => PbState::Locked as i32,
         },
-        at_rfc3339: t.at.to_rfc3339(),
+        at: Some(utc_to_ts(t.at)),
     });
     let counts = Some(Counts {
         signals_seen: s.counts.signals_seen,
@@ -84,12 +177,7 @@ pub fn to_pb(s: &snapshot::Snapshot) -> SnapshotReply {
     });
     let storage = Some(Storage {
         backlog_count: s.storage.backlog_count,
-        last_flush_rfc3339: s
-            .storage
-            .last_flush_at
-            .as_ref()
-            .map(|t| t.to_rfc3339())
-            .unwrap_or_default(),
+        last_flush: s.storage.last_flush_at.as_ref().map(|t| utc_to_ts(*t)),
     });
     let config = Some(Config {
         active_grace_secs: s.config.active_grace_secs,
@@ -117,8 +205,8 @@ pub fn to_pb(s: &snapshot::Snapshot) -> SnapshotReply {
                 .map(|w| PbWin {
                     window_id: w.window_id.clone(),
                     window_title: w.window_title.clone(),
-                    first_seen_rfc3339: w.first_seen.to_rfc3339(),
-                    last_seen_rfc3339: w.last_seen.to_rfc3339(),
+                    first_seen: Some(utc_to_ts(w.first_seen)),
+                    last_seen: Some(utc_to_ts(w.last_seen)),
                     duration_seconds: w.duration_seconds,
                     is_group: w.is_group,
                 })
@@ -135,11 +223,7 @@ pub fn to_pb(s: &snapshot::Snapshot) -> SnapshotReply {
         last_transition,
         counts,
         cadence,
-        next_timeout_rfc3339: s
-            .next_timeout
-            .as_ref()
-            .map(|t| t.to_rfc3339())
-            .unwrap_or_default(),
+        next_timeout: s.next_timeout.as_ref().map(|t| utc_to_ts(*t)),
         storage,
         config,
         replay,
@@ -182,3 +266,5 @@ pub fn spawn_server(uds_path: PathBuf) -> Result<std::thread::JoinHandle<()>> {
     rx.recv().ok();
     Ok(handle)
 }
+
+// Note: gRPC integration tests live under tests/ to avoid OnceCell contention.

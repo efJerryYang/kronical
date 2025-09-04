@@ -1,5 +1,6 @@
 pub mod compression;
 pub mod coordinator;
+pub mod duckdb_system_tracker;
 pub mod event_adapter;
 pub mod event_deriver;
 pub mod event_model;
