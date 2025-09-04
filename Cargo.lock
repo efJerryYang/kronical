@@ -3851,9 +3851,9 @@ dependencies = [
 
 [[package]]
 name = "winshift"
-version = "0.0.3"
+version = "0.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c5c5ce74852d7773004879c20092bdd41f9514635757b9396341cede1111bf3e"
+checksum = "37b597cec2082c328a59c706b295d3f9f730f48a545fa0b98fed2751d0e1bf01"
 dependencies = [
  "accessibility",
  "accessibility-sys",

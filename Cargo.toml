@@ -16,7 +16,7 @@ path = "src/bin/kronid.rs"
 
 
 [dependencies]
-winshift = "0.0.3" # { path = "../vendor/winshift-rs" }
+winshift = "0.0.4" # { path = "../vendor/winshift-rs" }
 uiohook-rs = "0.2" # { path = "../vendor/uiohook-rs" }
 clap = { version = "4.4", features = ["derive"] }
 serde = { version = "1.0", features = ["derive", "rc"] }
