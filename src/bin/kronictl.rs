@@ -7,7 +7,7 @@ use crossterm::{
 };
 #[cfg(feature = "kroni-api")]
 use hyper_util::rt::TokioIo;
-use kronical as _; // ensure library is linked
+use kronical as _;
 use kronical::daemon::duckdb_system_tracker::trigger_tracker_flush;
 #[cfg(feature = "kroni-api")]
 use kronical::kroni_api::kroni::v1::{
@@ -1241,7 +1241,7 @@ fn show_tracker_data_grpc(workspace_dir: &PathBuf, count: Option<usize>) -> Resu
 }
 
 #[cfg(not(feature = "kroni-api"))]
-fn show_tracker_data_grpc(_workspace_dir: &PathBuf) -> Result<()> {
+fn show_tracker_data_grpc(_workspace_dir: &PathBuf, _count: Option<usize>) -> Result<()> {
     Err(anyhow::anyhow!(
         "gRPC API not available. Compile with --features kroni-api to enable system tracker access."
     ))

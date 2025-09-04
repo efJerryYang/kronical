@@ -5,7 +5,6 @@ use crate::daemon::event_deriver::LockDeriver;
 use crate::daemon::events::{KeyboardEventData, MouseEventData, MousePosition, WindowFocusInfo};
 use crate::daemon::focus_tracker::{FocusCacheCaps, FocusChangeCallback, FocusEventWrapper};
 use crate::daemon::records::{ActivityRecord, aggregate_activities_since};
-// legacy socket server removed
 use crate::storage::StorageBackend;
 use anyhow::Result;
 use log::{debug, error, info, trace};

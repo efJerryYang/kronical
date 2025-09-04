@@ -282,7 +282,7 @@ impl MouseTrajectoryCompressor {
         if max_distance > epsilon {
             let mut left = self.douglas_peucker(&points[0..=max_index], epsilon);
             let right = self.douglas_peucker(&points[max_index..], epsilon);
-            left.pop(); // Remove duplicate point
+            left.pop();
             left.extend(right);
             left
         } else {
