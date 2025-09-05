@@ -258,10 +258,6 @@ impl EventCoordinator {
 
         let (sender, receiver) = mpsc::channel();
 
-        // Legacy monitor socket (to be removed): now using kroni.* names
-        // legacy monitor socket removed
-        // legacy monitor socket removed
-
         #[cfg(feature = "kroni-api")]
         {
             // Start Kroni gRPC API over UDS alongside the legacy socket.
@@ -320,7 +316,6 @@ impl EventCoordinator {
             let mut adapter = EventAdapter::new();
             let mut lock_deriver = LockDeriver::new();
             let mut store = data_store;
-            // legacy socket server removed
             let mut pending_raw_events = Vec::new();
             let mut state_hist: std::collections::VecDeque<char> =
                 std::collections::VecDeque::new();

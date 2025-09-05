@@ -8,7 +8,6 @@ use crossterm::{
 #[cfg(feature = "kroni-api")]
 use hyper_util::rt::TokioIo;
 use kronical as _;
-use kronical::daemon::duckdb_system_tracker::trigger_tracker_flush;
 #[cfg(feature = "kroni-api")]
 use kronical::kroni_api::kroni::v1::{
     SnapshotRequest, SystemMetricsRequest, WatchRequest, kroni_client::KroniClient,
@@ -1089,19 +1088,20 @@ fn tracker_show(
 
     let show_data = || -> Result<()> {
         let daemon_pid_file = workspace_dir.join("kronid.pid");
-        if let Ok(Some(pid)) = read_pid_file(&daemon_pid_file) {
+        let pid = if let Ok(Some(pid)) = read_pid_file(&daemon_pid_file) {
             if !is_process_running(pid) {
                 return Err(anyhow::anyhow!(
                     "Daemon not running. Start the daemon first with 'kronictl start'"
                 ));
             }
+            pid
         } else {
             return Err(anyhow::anyhow!(
                 "Daemon not running. Start the daemon first with 'kronictl start'"
             ));
-        }
+        };
 
-        show_tracker_data_grpc(workspace_dir, count)
+        show_tracker_data_grpc(workspace_dir, count, pid)
     };
 
     if watch {
@@ -1120,15 +1120,16 @@ fn tracker_show(
 }
 
 #[cfg(feature = "kroni-api")]
-fn show_tracker_data_grpc(workspace_dir: &PathBuf, count: Option<usize>) -> Result<()> {
+fn show_tracker_data_grpc(
+    workspace_dir: &PathBuf,
+    count: Option<usize>,
+    daemon_pid: u32,
+) -> Result<()> {
     use tonic::transport::Endpoint;
     use tower::service_fn;
 
-    // Ask the daemon tracker to flush any pending batch before querying.
-    // The tracker checks for the signal at the top of its loop (interval ~1s),
-    // so wait long enough to cross an iteration boundary.
-    let _ = trigger_tracker_flush(workspace_dir);
-    std::thread::sleep(Duration::from_millis(1200));
+    // Server is responsible for flush-before-query to avoid client/server
+    // workspace drift and snapshot ordering issues.
 
     let uds_grpc = workspace_dir.join("kroni.sock");
     let rt = runtime::Builder::new_current_thread()
@@ -1136,6 +1137,7 @@ fn show_tracker_data_grpc(workspace_dir: &PathBuf, count: Option<usize>) -> Resu
         .build()?;
 
     rt.block_on(async move {
+        let uds_grpc_dbg = uds_grpc.clone();
         let ep = Endpoint::try_from("http://localhost")?;
         let channel = ep
             .connect_with_connector(service_fn(move |_| {
@@ -1151,13 +1153,7 @@ fn show_tracker_data_grpc(workspace_dir: &PathBuf, count: Option<usize>) -> Resu
 
         // Default to the last 10 rows from the current daemon run (by PID).
         let limit_rows: usize = count.unwrap_or(10);
-
-        // Prefer the daemon PID for querying, since the tracker collects for the daemon
-        let pid_file = workspace_dir.join("kronid.pid");
-        let pid_to_query = match read_pid_file(&pid_file).ok().flatten() {
-            Some(pid) => pid,
-            None => std::process::id(),
-        };
+        let pid_to_query = daemon_pid;
 
         // Ask the server for the latest N rows for this PID (no time range).
         let request = SystemMetricsRequest {
@@ -1166,6 +1162,13 @@ fn show_tracker_data_grpc(workspace_dir: &PathBuf, count: Option<usize>) -> Resu
             end_time: None,
             limit: limit_rows as u32,
         };
+
+        println!(
+            "Debug: UDS={} PID={} limit={} (server flush-before-query)",
+            uds_grpc_dbg.display(),
+            pid_to_query,
+            limit_rows
+        );
 
         let response = client
             .get_system_metrics(tonic::Request::new(request))
@@ -1232,6 +1235,20 @@ fn show_tracker_data_grpc(workspace_dir: &PathBuf, count: Option<usize>) -> Resu
                 first_time,
                 last_time
             );
+            // Help users diagnose mismatches: show the PID and the expected DB path
+            let db_path = workspace_dir.join("system-tracker.duckdb");
+            println!("Source: PID={} DB={}", pid_to_query, db_path.display());
+
+            // Diagnostic: show recency delta
+            if let Some(ts) = last.timestamp.as_ref() {
+                if let Some(last_dt) =
+                    chrono::DateTime::<chrono::Utc>::from_timestamp(ts.seconds, ts.nanos as u32)
+                {
+                    let now = chrono::Utc::now();
+                    let delta = now.signed_duration_since(last_dt).num_seconds();
+                    println!("Debug: last_ts_age={}s (now={})", delta, now.to_rfc3339());
+                }
+            }
         }
 
         Ok::<(), anyhow::Error>(())
@@ -1241,7 +1258,11 @@ fn show_tracker_data_grpc(workspace_dir: &PathBuf, count: Option<usize>) -> Resu
 }
 
 #[cfg(not(feature = "kroni-api"))]
-fn show_tracker_data_grpc(_workspace_dir: &PathBuf, _count: Option<usize>) -> Result<()> {
+fn show_tracker_data_grpc(
+    _workspace_dir: &PathBuf,
+    _count: Option<usize>,
+    _daemon_pid: u32,
+) -> Result<()> {
     Err(anyhow::anyhow!(
         "gRPC API not available. Compile with --features kroni-api to enable system tracker access."
     ))

@@ -2,6 +2,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::info;
@@ -14,6 +15,29 @@ pub struct SystemMetrics {
     pub cpu_percent: f64,
     pub memory_bytes: u64,
     pub disk_io_bytes: u64,
+}
+
+// Query channel types to run reads on the same in-process DuckDB instance
+// that the tracker uses.
+#[cfg(feature = "kroni-api")]
+#[derive(Debug)]
+pub enum MetricsQuery {
+    ByLimit {
+        pid: u32,
+        limit: usize,
+    },
+    ByRange {
+        pid: u32,
+        start: DateTime<Utc>,
+        end: DateTime<Utc>,
+    },
+}
+
+#[cfg(feature = "kroni-api")]
+#[derive(Debug)]
+pub struct MetricsQueryReq {
+    pub query: MetricsQuery,
+    pub reply: std::sync::mpsc::Sender<Result<Vec<SystemMetrics>, String>>,
 }
 
 use std::thread;
@@ -60,6 +84,15 @@ impl DuckDbSystemTracker {
         let db_path = self.db_path.clone();
         let flush_signal_path = self.flush_signal_path.clone();
         let running = Arc::clone(&self.running);
+
+        // Create the DuckDB store instance once within this thread.
+        // Also set up a query channel so the gRPC server can ask this
+        // thread to execute reads on the same in-process instance.
+        let (query_tx, query_rx) = mpsc::channel::<MetricsQueryReq>();
+        #[cfg(feature = "kroni-api")]
+        {
+            crate::daemon::kroni_server::set_system_tracker_query_tx(query_tx.clone());
+        }
 
         thread::spawn(move || {
             let mut store = match DuckDbSystemMetricsStore::new_file(&db_path) {
@@ -120,21 +153,56 @@ impl DuckDbSystemTracker {
                         }
 
                         if flush_requested {
+                            tracing::info!(
+                                "Tracker flush requested (normal path); flushing {} buffered samples",
+                                metrics_buffer.len()
+                            );
                             flush_buffer(&mut metrics_buffer, &mut store);
                             let _ = std::fs::remove_file(&flush_signal_path);
                         }
                     }
                     Err(e) => {
-                        if !is_process_running(pid) {
-                            info!("Process {} exited, stopping DuckDB tracker", pid);
-                            break;
-                        }
                         tracing::warn!("Failed to collect system metrics: {}", e);
                         // Even if collection failed, honor a pending flush to persist any buffered samples
                         if flush_requested {
+                            tracing::info!(
+                                "Tracker flush requested (error path); flushing {} buffered samples",
+                                metrics_buffer.len()
+                            );
                             flush_buffer(&mut metrics_buffer, &mut store);
                             let _ = std::fs::remove_file(&flush_signal_path);
                         }
+                    }
+                }
+
+                // Process any pending queries from the gRPC server quickly.
+                loop {
+                    match query_rx.try_recv() {
+                        Ok(req) => {
+                            let result = match req.query {
+                                MetricsQuery::ByLimit { pid, limit } => {
+                                    let mut rows = match store.get_metrics_for_pid(pid, Some(limit))
+                                    {
+                                        Ok(v) => v,
+                                        Err(e) => {
+                                            let _ = req.reply.send(Err(e.to_string()));
+                                            continue;
+                                        }
+                                    };
+                                    rows.reverse();
+                                    Ok(rows)
+                                }
+                                MetricsQuery::ByRange { pid, start, end } => {
+                                    match store.get_metrics_in_time_range(pid, start, end) {
+                                        Ok(v) => Ok(v),
+                                        Err(e) => Err(e.to_string()),
+                                    }
+                                }
+                            };
+                            let _ = req.reply.send(result);
+                        }
+                        Err(mpsc::TryRecvError::Empty) => break,
+                        Err(mpsc::TryRecvError::Disconnected) => break,
                     }
                 }
 
@@ -265,16 +333,6 @@ fn get_disk_io(pid: u32) -> Result<u64> {
             Ok(0)
         }
     }
-}
-
-fn is_process_running(pid: u32) -> bool {
-    use std::process::Command;
-
-    Command::new("ps")
-        .args(["-p", &pid.to_string()])
-        .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
 }
 
 pub struct DuckDbSystemMetricsStore {

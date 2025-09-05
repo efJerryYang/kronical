@@ -1,6 +1,4 @@
 #![cfg(feature = "kroni-api")]
-
-use crate::daemon::duckdb_system_tracker::DuckDbSystemMetricsStore;
 use crate::daemon::snapshot;
 use crate::kroni_api::kroni::v1::kroni_server::{Kroni, KroniServer};
 use crate::kroni_api::kroni::v1::{
@@ -18,15 +16,25 @@ use once_cell::sync::OnceCell;
 use prost_types::Timestamp;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::mpsc::Sender;
 use tokio::net::UnixListener;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::IntervalStream;
 use tonic::{Request, Response, Status, transport::Server};
 
 static SYSTEM_TRACKER_DB_PATH: OnceCell<PathBuf> = OnceCell::new();
+static SYSTEM_TRACKER_QUERY_TX: OnceCell<
+    Sender<crate::daemon::duckdb_system_tracker::MetricsQueryReq>,
+> = OnceCell::new();
 
 pub fn set_system_tracker_db_path(db_path: PathBuf) {
     let _ = SYSTEM_TRACKER_DB_PATH.set(db_path);
+}
+
+pub fn set_system_tracker_query_tx(
+    tx: Sender<crate::daemon::duckdb_system_tracker::MetricsQueryReq>,
+) {
+    let _ = SYSTEM_TRACKER_QUERY_TX.set(tx);
 }
 
 #[derive(Clone, Default)]
@@ -65,23 +73,48 @@ impl Kroni for KroniSvc {
             None => return Err(Status::unavailable("System tracker not configured")),
         };
 
-        let store = DuckDbSystemMetricsStore::new_file(db_path)
-            .map_err(|e| Status::internal(format!("Failed to open system tracker DB: {}", e)))?;
-
         // Proactively request a tracker flush so we read fresh data.
+        // IMPORTANT: trigger/wait BEFORE opening a DB connection so the
+        // connection snapshot includes flushed rows.
         let flush_signal_path = db_path.with_file_name("tracker-flush-signal");
         let _ = std::fs::write(&flush_signal_path, "");
-        tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+        // Wait until the tracker removes the signal (or timeout)
+        let mut waited_ms = 0u64;
+        loop {
+            if !flush_signal_path.exists() {
+                break;
+            }
+            if waited_ms >= 2000 {
+                // Give up after ~2s; tracker interval is ~1s by default
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            waited_ms += 100;
+        }
+
+        // Route the read through the tracker thread using a query channel so
+        // the query runs against the same in-process DB instance as the writer.
+        let tx = SYSTEM_TRACKER_QUERY_TX
+            .get()
+            .ok_or_else(|| Status::unavailable("System tracker not configured (query tx)"))?;
 
         let pid = request.pid;
 
+        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         let metrics = if request.limit > 0 {
-            // Fetch the most recent N rows for this PID; return ascending by timestamp
-            let mut rows = store
-                .get_metrics_for_pid(pid, Some(request.limit as usize))
-                .map_err(|e| Status::internal(format!("Failed to query metrics: {}", e)))?;
-            rows.reverse();
-            rows
+            let query = crate::daemon::duckdb_system_tracker::MetricsQuery::ByLimit {
+                pid,
+                limit: request.limit as usize,
+            };
+            tx.send(crate::daemon::duckdb_system_tracker::MetricsQueryReq {
+                query,
+                reply: reply_tx,
+            })
+            .map_err(|_| Status::internal("Failed to send query to tracker thread"))?;
+            reply_rx
+                .recv_timeout(std::time::Duration::from_millis(1500))
+                .map_err(|_| Status::deadline_exceeded("Timed out waiting for tracker reply"))?
+                .map_err(|e| Status::internal(format!("Tracker query error: {}", e)))?
         } else {
             let start_time = match request.start_time.as_ref() {
                 Some(ts) => ts_to_utc(ts)
@@ -93,10 +126,20 @@ impl Kroni for KroniSvc {
                     .map_err(|e| Status::invalid_argument(format!("Invalid end_time: {}", e)))?,
                 None => Utc::now(),
             };
-
-            store
-                .get_metrics_in_time_range(pid, start_time, end_time)
-                .map_err(|e| Status::internal(format!("Failed to query metrics: {}", e)))?
+            let query = crate::daemon::duckdb_system_tracker::MetricsQuery::ByRange {
+                pid,
+                start: start_time,
+                end: end_time,
+            };
+            tx.send(crate::daemon::duckdb_system_tracker::MetricsQueryReq {
+                query,
+                reply: reply_tx,
+            })
+            .map_err(|_| Status::internal("Failed to send query to tracker thread"))?;
+            reply_rx
+                .recv_timeout(std::time::Duration::from_millis(1500))
+                .map_err(|_| Status::deadline_exceeded("Timed out waiting for tracker reply"))?
+                .map_err(|e| Status::internal(format!("Tracker query error: {}", e)))?
         };
 
         let pb_metrics = metrics
