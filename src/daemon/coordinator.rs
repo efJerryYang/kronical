@@ -12,11 +12,10 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 use uiohook_rs::{EventHandler, Uiohook, UiohookEvent};
-#[cfg(target_os = "macos")]
+
 use winshift::ActiveWindowInfo;
 use winshift::{FocusChangeHandler, MonitoringMode, WindowFocusHook, WindowHookConfig};
 
-#[cfg(feature = "kroni-api")]
 fn pretty_format_duration(seconds: u64) -> String {
     if seconds == 0 {
         return "0s".to_string();
@@ -140,7 +139,6 @@ impl FocusChangeHandler for KronicalEventHandler {
         self.focus_wrapper.handle_window_change(window_title);
     }
 
-    #[cfg(target_os = "macos")]
     fn on_app_change_info(&self, info: ActiveWindowInfo) {
         debug!(
             "App+Info: {} pid={} wid={}",
@@ -149,7 +147,6 @@ impl FocusChangeHandler for KronicalEventHandler {
         self.focus_wrapper.handle_app_change_info(info);
     }
 
-    #[cfg(target_os = "macos")]
     fn on_window_change_info(&self, info: ActiveWindowInfo) {
         debug!("Win+Info: '{}' wid={}", info.title, info.window_id);
         self.focus_wrapper.handle_window_change_info(info);
@@ -249,6 +246,7 @@ impl EventCoordinator {
         }
     }
 
+    // TODO: the pid file should not be passed here, we should have a constant rust file. and we can then get the workspace directory from there too
     pub fn start_main_thread(
         &self,
         data_store: Box<dyn StorageBackend>,
@@ -258,25 +256,21 @@ impl EventCoordinator {
 
         let (sender, receiver) = mpsc::channel();
 
-        #[cfg(feature = "kroni-api")]
-        {
-            // Start Kroni gRPC API over UDS alongside the legacy socket.
-            let uds_path = pid_file.parent().unwrap().join("kroni.sock");
-            if let Err(e) = crate::daemon::kroni_server::spawn_server(uds_path) {
-                error!("Failed to start kroni API server: {}", e);
-            } else {
-                info!("Kroni API server started successfully");
-            }
+        // TODO: what does it mean by the "legacy socket"?
+        // Start Kroni gRPC API over UDS alongside the legacy socket.
+        let uds_path = pid_file.parent().unwrap().join("kroni.sock");
+        if let Err(e) = crate::daemon::kroni_server::spawn_server(uds_path) {
+            error!("Failed to start kroni API server: {}", e);
+        } else {
+            info!("Kroni API server started successfully");
         }
 
-        #[cfg(feature = "http-admin")]
-        {
-            let http_sock = pid_file.parent().unwrap().join("kroni.http.sock");
-            if let Err(e) = crate::daemon::http_admin::spawn_http_admin(http_sock) {
-                error!("Failed to start HTTP admin: {}", e);
-            } else {
-                info!("HTTP admin server started successfully");
-            }
+        // TODO: what does http-admin stands for?
+        let http_sock = pid_file.parent().unwrap().join("kroni.http.sock");
+        if let Err(e) = crate::daemon::http_server::spawn_http_server(http_sock) {
+            error!("Failed to start HTTP admin: {}", e);
+        } else {
+            info!("HTTP admin server started successfully");
         }
 
         if self.tracker_enabled {
@@ -296,7 +290,6 @@ impl EventCoordinator {
                     current_pid
                 );
 
-                #[cfg(feature = "kroni-api")]
                 {
                     crate::daemon::kroni_server::set_system_tracker_db_path(
                         tracker_db_path.clone(),
@@ -325,23 +318,23 @@ impl EventCoordinator {
             let eph_max = self.ephemeral_max_duration_secs;
             let eph_min = self.ephemeral_min_distinct_ids;
             let max_windows = self.max_windows_per_app;
-            #[cfg(feature = "kroni-api")]
+
             let app_eph_max = self.ephemeral_app_max_duration_secs;
-            #[cfg(feature = "kroni-api")]
+
             let app_eph_min = self.ephemeral_app_min_distinct_procs;
-            #[cfg(feature = "kroni-api")]
+
             let mut counts = crate::daemon::snapshot::Counts {
                 signals_seen: 0,
                 hints_seen: 0,
                 records_emitted: 0,
             };
-            #[cfg(feature = "kroni-api")]
+
             let mut last_transition: Option<crate::daemon::snapshot::Transition> = None;
 
             let poll_handle_arc2 = std::sync::Arc::clone(&poll_handle_arc);
             let ags = self.active_grace_secs;
             let its = self.idle_threshold_secs;
-            #[cfg(feature = "kroni-api")]
+
             let cfg_summary = crate::daemon::snapshot::ConfigSummary {
                 active_grace_secs: self.active_grace_secs,
                 idle_threshold_secs: self.idle_threshold_secs,
@@ -352,7 +345,6 @@ impl EventCoordinator {
                 ephemeral_app_min_distinct_procs: self.ephemeral_app_min_distinct_procs,
             };
 
-            #[cfg(feature = "kroni-api")]
             fn build_app_tree(
                 aggregated_activities: &[crate::daemon::records::AggregatedActivity],
                 app_short_max_duration_secs: u64,
@@ -588,7 +580,7 @@ impl EventCoordinator {
                                         let _ = store.add_records(vec![rec.clone()]);
                                         recent_records.push_back(rec);
                                     }
-                                    #[cfg(feature = "kroni-api")]
+
                                     {
                                         counts.hints_seen += 1;
                                         if let crate::daemon::event_model::EventPayload::State {
@@ -611,7 +603,6 @@ impl EventCoordinator {
                                         crate::daemon::event_model::EventKind::Signal(_)
                                     )
                                 }) {
-                                    #[cfg(feature = "kroni-api")]
                                     {
                                         counts.signals_seen += 1;
                                     }
@@ -621,7 +612,7 @@ impl EventCoordinator {
                                             let _ = store.add_records(vec![rec.clone()]);
                                             recent_records.push_back(rec);
                                         }
-                                        #[cfg(feature = "kroni-api")]
+
                                         {
                                             counts.hints_seen += 1;
                                             if let crate::daemon::event_model::EventPayload::State { from, to } = &h.payload {
@@ -640,7 +631,7 @@ impl EventCoordinator {
                                         break;
                                     }
                                 }
-                                #[cfg(feature = "kroni-api")]
+
                                 let agg = {
                                     aggregate_activities_since(
                                         recent_records.make_contiguous(),
@@ -659,7 +650,7 @@ impl EventCoordinator {
                                     crate::daemon::records::ActivityState::Locked => 30000,
                                 };
                                 poll_handle_arc2.store(ms, std::sync::atomic::Ordering::Relaxed);
-                                #[cfg(feature = "kroni-api")]
+
                                 {
                                     let aggregated_apps =
                                         build_app_tree(&agg, app_eph_max, app_eph_min);
@@ -743,7 +734,7 @@ impl EventCoordinator {
                                     if let Some(rec) = record_builder.on_hint(env) {
                                         new_records.push(rec);
                                     }
-                                    #[cfg(feature = "kroni-api")]
+
                                     {
                                         counts.hints_seen += 1;
                                         if let crate::daemon::event_model::EventPayload::State {
@@ -767,7 +758,6 @@ impl EventCoordinator {
                                         crate::daemon::event_model::EventKind::Signal(_)
                                     )
                                 }) {
-                                    #[cfg(feature = "kroni-api")]
                                     {
                                         counts.signals_seen += 1;
                                     }
@@ -782,7 +772,7 @@ impl EventCoordinator {
                                         if let Some(rec) = record_builder.on_hint(&h) {
                                             new_records.push(rec);
                                         }
-                                        #[cfg(feature = "kroni-api")]
+
                                         {
                                             counts.hints_seen += 1;
                                             if let crate::daemon::event_model::EventPayload::State { from, to } = &h.payload {
@@ -817,7 +807,7 @@ impl EventCoordinator {
                                     }
                                     for r in new_records.into_iter() {
                                         recent_records.push_back(r);
-                                        #[cfg(feature = "kroni-api")]
+
                                         {
                                             counts.records_emitted += 1;
                                         }
@@ -889,7 +879,7 @@ impl EventCoordinator {
                                         break;
                                     }
                                 }
-                                #[cfg(feature = "kroni-api")]
+
                                 let agg = {
                                     aggregate_activities_since(
                                         recent_records.make_contiguous(),
@@ -908,7 +898,7 @@ impl EventCoordinator {
                                     crate::daemon::records::ActivityState::Locked => 30000,
                                 };
                                 poll_handle_arc2.store(ms, std::sync::atomic::Ordering::Relaxed);
-                                #[cfg(feature = "kroni-api")]
+
                                 {
                                     let aggregated_apps =
                                         build_app_tree(&agg, app_eph_max, app_eph_min);
@@ -985,7 +975,7 @@ impl EventCoordinator {
                                 let _hist_str: String = state_hist.iter().collect();
                             }
                         }
-                        #[cfg(feature = "kroni-api")]
+
                         {
                             counts.hints_seen += 1;
                             if let crate::daemon::event_model::EventPayload::State { from, to } =
@@ -1008,7 +998,7 @@ impl EventCoordinator {
                                 break;
                             }
                         }
-                        #[cfg(feature = "kroni-api")]
+
                         let agg = {
                             aggregate_activities_since(
                                 recent_records.make_contiguous(),
@@ -1026,7 +1016,7 @@ impl EventCoordinator {
                             crate::daemon::records::ActivityState::Locked => 30000,
                         };
                         poll_handle_arc2.store(ms, std::sync::atomic::Ordering::Relaxed);
-                        #[cfg(feature = "kroni-api")]
+
                         {
                             let aggregated_apps = build_app_tree(&agg, app_eph_max, app_eph_min);
                             let reason = match record_builder.current_state() {
@@ -1084,7 +1074,7 @@ impl EventCoordinator {
                             break;
                         }
                     }
-                    #[cfg(feature = "kroni-api")]
+
                     let agg = {
                         aggregate_activities_since(
                             recent_records.make_contiguous(),
@@ -1095,7 +1085,7 @@ impl EventCoordinator {
                             max_windows,
                         )
                     };
-                    #[cfg(feature = "kroni-api")]
+
                     {
                         let aggregated_apps = build_app_tree(&agg, app_eph_max, app_eph_min);
                         let ms = match record_builder.current_state() {
@@ -1148,7 +1138,6 @@ impl EventCoordinator {
                 error!("Step S: Failed to send shutdown: {}", e);
             }
 
-            #[cfg(target_os = "macos")]
             {
                 info!("Step S: Stopping winshift hook");
                 if let Err(e) = winshift::stop_hook() {

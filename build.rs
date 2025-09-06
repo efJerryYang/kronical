@@ -17,7 +17,7 @@ fn main() {
     }
 
     // macOS libproc bindings generation
-    #[cfg(target_os = "macos")]
+
     {
         use std::env;
         use std::path::PathBuf;

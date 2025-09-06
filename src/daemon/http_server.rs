@@ -1,5 +1,3 @@
-#![cfg(feature = "http-admin")]
-
 use crate::daemon::snapshot;
 use anyhow::Result;
 use axum::response::sse::{Event, Sse};
@@ -31,7 +29,7 @@ async fn stream_handler() -> Sse<impl Stream<Item = Result<Event, Infallible>>> 
     Sse::new(stream)
 }
 
-pub fn spawn_http_admin(uds_path: PathBuf) -> Result<std::thread::JoinHandle<()>> {
+pub fn spawn_http_server(uds_path: PathBuf) -> Result<std::thread::JoinHandle<()>> {
     if uds_path.exists() {
         warn!("Removing stale HTTP admin UDS: {:?}", uds_path);
         let _ = std::fs::remove_file(&uds_path);

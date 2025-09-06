@@ -1,4 +1,3 @@
-#![cfg(feature = "kroni-api")]
 use crate::daemon::snapshot;
 use crate::kroni_api::kroni::v1::kroni_server::{Kroni, KroniServer};
 use crate::kroni_api::kroni::v1::{

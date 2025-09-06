@@ -1,5 +1,3 @@
-#![cfg(feature = "kroni-api")]
-
 use chrono::Utc;
 use kronical::daemon::duckdb_system_tracker::DuckDbSystemTracker;
 use kronical::daemon::kroni_server::set_system_tracker_db_path;

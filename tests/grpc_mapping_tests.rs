@@ -1,5 +1,3 @@
-#![cfg(feature = "kroni-api")]
-
 use kronical::daemon::records::ActivityState;
 use kronical::daemon::snapshot::{
     ConfigSummary, Counts, ReplayInfo, Snapshot, SnapshotApp, SnapshotWindow, StorageInfo,

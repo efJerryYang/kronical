@@ -8,7 +8,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 use sysinfo::{Pid, System};
-#[cfg(target_os = "macos")]
+
 use winshift::{ActiveWindowInfo, get_active_window_info};
 
 #[derive(Debug, Clone, Copy)]
@@ -207,7 +207,6 @@ impl FocusEventWrapper {
         }
     }
 
-    #[cfg(target_os = "macos")]
     pub fn handle_app_change_info(&self, info: ActiveWindowInfo) {
         // Trust winshift info: no get_active_window needed
         let mut state = self.current_state.lock().unwrap();
@@ -232,7 +231,6 @@ impl FocusEventWrapper {
         }
     }
 
-    #[cfg(target_os = "macos")]
     pub fn handle_window_change_info(&self, info: ActiveWindowInfo) {
         let mut state = self.current_state.lock().unwrap();
         if state.pid != info.process_id {

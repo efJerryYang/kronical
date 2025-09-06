@@ -5,10 +5,10 @@ use crossterm::{
     event as crossterm_event, execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-#[cfg(feature = "kroni-api")]
+
 use hyper_util::rt::TokioIo;
 use kronical as _;
-#[cfg(feature = "kroni-api")]
+
 use kronical::kroni_api::kroni::v1::{
     SnapshotRequest, SystemMetricsRequest, WatchRequest, kroni_client::KroniClient,
 };
@@ -29,11 +29,11 @@ use std::process::{self, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
-#[cfg(feature = "kroni-api")]
+
 use tokio::runtime;
-#[cfg(feature = "kroni-api")]
+
 use tonic::transport::Endpoint;
-#[cfg(feature = "kroni-api")]
+
 use tower::service_fn;
 
 #[derive(Parser)]
@@ -47,6 +47,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+// TODO: add journalctl like functionality.
 enum Commands {
     Start,
     Stop,
@@ -591,7 +592,6 @@ fn main() {
 }
 
 fn snapshot_autoselect(uds_http: &PathBuf, pretty: bool) -> Result<()> {
-    #[cfg(feature = "kroni-api")]
     {
         if let Ok(snap) = grpc_snapshot(uds_http) {
             if pretty {
@@ -707,7 +707,6 @@ fn sse_watch_via_http(uds_path: &PathBuf, pretty: bool) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "kroni-api")]
 fn grpc_snapshot(uds_http: &PathBuf) -> Result<kronical::daemon::snapshot::Snapshot> {
     let uds_grpc = uds_http.with_file_name("kroni.sock");
     let rt = runtime::Builder::new_current_thread()
@@ -736,7 +735,6 @@ fn grpc_snapshot(uds_http: &PathBuf) -> Result<kronical::daemon::snapshot::Snaps
     })
 }
 
-#[cfg(feature = "kroni-api")]
 fn map_pb_snapshot(
     reply: kronical::kroni_api::kroni::v1::SnapshotReply,
 ) -> kronical::daemon::snapshot::Snapshot {
@@ -917,7 +915,6 @@ fn map_pb_snapshot(
 }
 
 fn sse_watch_via_grpc_then_http(uds_path: &PathBuf, pretty: bool) -> Result<()> {
-    #[cfg(feature = "kroni-api")]
     {
         if let Err(_e) = grpc_watch(uds_path, pretty) {
             // Fallback to HTTP SSE
@@ -930,7 +927,6 @@ fn sse_watch_via_grpc_then_http(uds_path: &PathBuf, pretty: bool) -> Result<()> 
     sse_watch_via_http(uds_path, pretty)
 }
 
-#[cfg(feature = "kroni-api")]
 fn grpc_watch(_uds_http_sock: &PathBuf, pretty: bool) -> Result<()> {
     // The gRPC UDS is at kroni.sock next to http.sock
     let uds_grpc = _uds_http_sock.with_file_name("kroni.sock");
@@ -1119,7 +1115,6 @@ fn tracker_show(
     Ok(())
 }
 
-#[cfg(feature = "kroni-api")]
 fn show_tracker_data_grpc(
     workspace_dir: &PathBuf,
     count: Option<usize>,

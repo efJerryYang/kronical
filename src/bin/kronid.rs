@@ -15,10 +15,9 @@ fn ensure_workspace_dir(workspace_dir: &PathBuf) -> Result<()> {
     Ok(())
 }
 
+// TODO: bad code, we should use certain library to check
 fn is_process_running(pid: u32) -> bool {
-    use std::process::Command;
-
-    Command::new("ps")
+    std::process::Command::new("ps")
         .args(["-p", &pid.to_string()])
         .output()
         .map(|output| output.status.success())

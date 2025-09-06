@@ -12,8 +12,6 @@ pub mod system_tracker;
 // legacy socket_server removed
 pub mod snapshot;
 
-#[cfg(feature = "kroni-api")]
 pub mod kroni_server;
 
-#[cfg(feature = "http-admin")]
-pub mod http_admin;
+pub mod http_server;

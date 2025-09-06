@@ -19,7 +19,7 @@ pub struct SystemMetrics {
 
 // Query channel types to run reads on the same in-process DuckDB instance
 // that the tracker uses.
-#[cfg(feature = "kroni-api")]
+
 #[derive(Debug)]
 pub enum MetricsQuery {
     ByLimit {
@@ -33,7 +33,6 @@ pub enum MetricsQuery {
     },
 }
 
-#[cfg(feature = "kroni-api")]
 #[derive(Debug)]
 pub struct MetricsQueryReq {
     pub query: MetricsQuery,
@@ -89,7 +88,7 @@ impl DuckDbSystemTracker {
         // Also set up a query channel so the gRPC server can ask this
         // thread to execute reads on the same in-process instance.
         let (query_tx, query_rx) = mpsc::channel::<MetricsQueryReq>();
-        #[cfg(feature = "kroni-api")]
+
         {
             crate::daemon::kroni_server::set_system_tracker_query_tx(query_tx.clone());
         }
@@ -269,7 +268,6 @@ fn collect_system_metrics(pid: u32, last_disk_io: u64) -> Result<(f64, u64, u64,
     Ok((cpu_percent, memory_bytes, disk_io_delta, current_disk_io))
 }
 
-#[cfg(target_os = "macos")]
 fn get_cpu_usage(pid: u32) -> Result<f64> {
     use std::process::Command;
 
@@ -287,7 +285,6 @@ fn get_cpu_usage(pid: u32) -> Result<f64> {
         .map_err(|e| anyhow::anyhow!("Failed to parse CPU usage: {}", e))
 }
 
-#[cfg(target_os = "macos")]
 fn get_memory_usage(pid: u32) -> Result<u64> {
     use std::process::Command;
 
@@ -307,16 +304,13 @@ fn get_memory_usage(pid: u32) -> Result<u64> {
     Ok(rss_kb * 1024)
 }
 
-#[cfg(target_os = "macos")]
 use libc::pid_t;
 
-#[cfg(target_os = "macos")]
 #[allow(non_camel_case_types)]
 mod libproc_bindings {
     include!(concat!(env!("OUT_DIR"), "/libproc_bindings.rs"));
 }
 
-#[cfg(target_os = "macos")]
 fn get_disk_io(pid: u32) -> Result<u64> {
     use libproc_bindings::*;
     use std::mem::MaybeUninit;
