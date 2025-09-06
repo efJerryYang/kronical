@@ -16,6 +16,8 @@ pub struct Snapshot {
     pub activity_state: ActivityState,
     pub focus: Option<WindowFocusInfo>,
     pub last_transition: Option<Transition>,
+    #[serde(default)]
+    pub transitions_recent: Vec<Transition>,
     pub counts: Counts,
     pub cadence_ms: u32,
     pub cadence_reason: String,
@@ -31,6 +33,8 @@ pub struct Transition {
     pub from: ActivityState,
     pub to: ActivityState,
     pub at: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    pub by_signal: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -48,6 +52,7 @@ impl Snapshot {
             activity_state: ActivityState::Inactive,
             focus: None,
             last_transition: None,
+            transitions_recent: Vec::new(),
             counts: Counts::default(),
             cadence_ms: 0,
             cadence_reason: String::new(),
@@ -102,6 +107,40 @@ fn monotonic_ns() -> u64 {
     now.as_nanos() as u64
 }
 
+// Channel-first transitions buffer holding recent transitions with optional signal info
+static TRANSITIONS_WATCH: OnceCell<(
+    watch::Sender<VecDeque<Transition>>,
+    watch::Receiver<VecDeque<Transition>>,
+)> = OnceCell::new();
+
+fn init_transitions_watch() -> &'static (
+    watch::Sender<VecDeque<Transition>>,
+    watch::Receiver<VecDeque<Transition>>,
+) {
+    TRANSITIONS_WATCH.get_or_init(|| {
+        let initial: VecDeque<Transition> = VecDeque::with_capacity(64);
+        watch::channel(initial)
+    })
+}
+
+pub fn push_transition(t: Transition) {
+    let (tx, rx) = init_transitions_watch();
+    let mut buf = rx.borrow().clone();
+    if buf.len() >= 64 {
+        let _ = buf.pop_front();
+    }
+    buf.push_back(t);
+    let _ = tx.send(buf);
+}
+
+pub fn recent_transitions(limit: usize) -> Vec<Transition> {
+    let (_tx, rx) = init_transitions_watch();
+    let buf = rx.borrow();
+    let len = buf.len();
+    let n = limit.min(len);
+    buf.iter().rev().take(n).cloned().collect()
+}
+
 pub fn publish_basic(
     state: ActivityState,
     focus: Option<WindowFocusInfo>,
@@ -122,6 +161,7 @@ pub fn publish_basic(
         activity_state: state,
         focus,
         last_transition,
+        transitions_recent: recent_transitions(5),
         counts,
         cadence_ms,
         cadence_reason,

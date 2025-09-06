@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{Local, Utc};
 use clap::{Parser, Subcommand};
 use crossterm::{
     event as crossterm_event, execute,
@@ -27,12 +27,37 @@ use std::process::{self, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use tokio::runtime;
 
 use tonic::transport::Endpoint;
 
 use tower::service_fn;
+
+fn pretty_duration(seconds: u64) -> String {
+    if seconds == 0 {
+        return "0s".to_string();
+    }
+    let days = seconds / (24 * 3600);
+    let hours = (seconds % (24 * 3600)) / 3600;
+    let minutes = (seconds % 3600) / 60;
+    let secs = seconds % 60;
+    let mut result = String::new();
+    if days > 0 {
+        result.push_str(&format!("{}d", days));
+    }
+    if hours > 0 {
+        result.push_str(&format!("{}h", hours));
+    }
+    if minutes > 0 {
+        result.push_str(&format!("{}m", minutes));
+    }
+    if secs > 0 || result.is_empty() {
+        result.push_str(&format!("{}s", secs));
+    }
+    result
+}
 
 #[derive(Parser)]
 #[command(author, version, about, long_about = None)]
@@ -390,26 +415,158 @@ fn run_monitor_loop<B: Backend>(terminal: &mut Terminal<B>, data_file: PathBuf) 
                                     // Middle: Details (moved above Apps)
                                     let mut app_lines: Vec<Line> = Vec::new();
                                     if !snap.aggregated_apps.is_empty() {
-                                        app_lines.push(Line::from("Apps (latest first):"));
                                         let mut shown = 0usize;
                                         for app in &snap.aggregated_apps {
-                                            let label = format!(
-                                                "{} [{}] • {}",
-                                                app.app_name, app.pid, app.total_duration_pretty
-                                            );
-                                            app_lines.push(Line::from(label));
-                                            // Show last-seen window for this app if available
-                                            if let Some(win) = app.windows.first() {
-                                                let wt = format!(
-                                                    "  └─ {} • {}s{}",
+                                            // Header: [pid] AppName • Total
+                                            let header = vec![
+                                                Span::styled(
+                                                    format!("[{}]", app.pid),
+                                                    Style::default()
+                                                        .fg(Color::Green)
+                                                        .add_modifier(Modifier::BOLD),
+                                                ),
+                                                Span::raw(" "),
+                                                Span::styled(
+                                                    format!("{}", app.app_name),
+                                                    Style::default()
+                                                        .fg(Color::Yellow)
+                                                        .add_modifier(Modifier::BOLD),
+                                                ),
+                                                Span::raw(" • "),
+                                                Span::styled(
+                                                    format!("{}", app.total_duration_pretty),
+                                                    Style::default().fg(Color::Cyan),
+                                                ),
+                                            ];
+                                            app_lines.push(Line::from(header));
+
+                                            // Lines: windows (up to 5), aligned with right info
+                                            let mut count = 0usize;
+                                            let total = app.windows.len();
+                                            let width = layout[2].width.saturating_sub(2) as usize; // minus borders
+                                            for (i, win) in app.windows.iter().take(5).enumerate() {
+                                                let local_first = win
+                                                    .first_seen
+                                                    .with_timezone(&chrono::Local)
+                                                    .format("%H:%M:%S")
+                                                    .to_string();
+                                                let dur_pretty =
+                                                    pretty_duration(win.duration_seconds);
+
+                                                let prefix = if i + 1 < total && i < 4 {
+                                                    "  ├── "
+                                                } else {
+                                                    "  └── "
+                                                };
+
+                                                let left_main = format!(
+                                                    "<#{}> {}{}",
+                                                    win.window_id,
                                                     win.window_title,
-                                                    win.duration_seconds,
-                                                    if win.is_group { " (group)" } else { "" }
+                                                    if win.is_group { " [group]" } else { "" },
                                                 );
-                                                app_lines.push(Line::from(wt));
+                                                // Right info shown as: "{duration} • since {time}"
+                                                let right_info = format!(
+                                                    "{} • since {}",
+                                                    dur_pretty, local_first
+                                                );
+
+                                                // Use display width (CJK wide = 2, latin = 1) for alignment
+                                                let visible_left = UnicodeWidthStr::width(prefix)
+                                                    + UnicodeWidthStr::width(left_main.as_str());
+                                                let visible_right =
+                                                    UnicodeWidthStr::width(right_info.as_str());
+
+                                                // Truncate title if needed to fit
+                                                let mut left_trunc = left_main.clone();
+                                                if visible_left + visible_right > width {
+                                                    let budget = width.saturating_sub(
+                                                        UnicodeWidthStr::width(prefix)
+                                                            + visible_right
+                                                            + 2,
+                                                    ); // space after id before title
+                                                    let id_part = format!("<#{}> ", win.window_id);
+                                                    let remain = budget.saturating_sub(
+                                                        UnicodeWidthStr::width(id_part.as_str()),
+                                                    );
+                                                    let mut truncated_title = String::new();
+                                                    let mut acc = 0usize;
+                                                    for ch in win.window_title.chars() {
+                                                        let ch_w = UnicodeWidthChar::width(ch)
+                                                            .unwrap_or(0);
+                                                        if acc + ch_w > remain.max(0) as usize {
+                                                            truncated_title.push('…');
+                                                            break;
+                                                        }
+                                                        acc += ch_w;
+                                                        truncated_title.push(ch);
+                                                    }
+                                                    left_trunc = format!(
+                                                        "{}{}{}",
+                                                        id_part.trim_end(),
+                                                        truncated_title,
+                                                        if win.is_group { " [group]" } else { "" },
+                                                    );
+                                                }
+
+                                                // Recompute padding after any truncation
+                                                let visible_left2 = UnicodeWidthStr::width(prefix)
+                                                    + UnicodeWidthStr::width(left_trunc.as_str());
+                                                let pad_spaces =
+                                                    if width > visible_left2 + visible_right {
+                                                        width - visible_left2 - visible_right
+                                                    } else {
+                                                        1
+                                                    };
+
+                                                let mut parts: Vec<Span> = Vec::new();
+                                                parts.push(Span::styled(
+                                                    prefix,
+                                                    Style::default().fg(Color::DarkGray),
+                                                ));
+                                                // Render <#id> in green bold
+                                                let id_chunk = format!("<#{}>", win.window_id);
+                                                parts.push(Span::styled(
+                                                    id_chunk,
+                                                    Style::default().fg(Color::Green),
+                                                ));
+                                                // Title chunk after id
+                                                let title_chunk = left_trunc
+                                                    .trim_start_matches(&format!(
+                                                        "<#{}>",
+                                                        win.window_id
+                                                    ))
+                                                    .trim_start()
+                                                    .to_string();
+                                                parts.push(Span::styled(
+                                                    format!(" {}", title_chunk),
+                                                    if win.is_group {
+                                                        Style::default().fg(Color::Magenta)
+                                                    } else {
+                                                        Style::default().fg(Color::White)
+                                                    },
+                                                ));
+                                                // Padding and right info
+                                                parts.push(Span::raw(" ".repeat(pad_spaces)));
+                                                // Right: show duration (cyan) • since time (gray)
+                                                parts.push(Span::styled(
+                                                    dur_pretty,
+                                                    Style::default().fg(Color::Cyan),
+                                                ));
+                                                parts.push(Span::raw(" • "));
+                                                let right_time = format!("since {}", local_first);
+                                                parts.push(Span::styled(
+                                                    right_time,
+                                                    Style::default().fg(Color::Gray),
+                                                ));
+                                                app_lines.push(Line::from(parts));
+                                                count += 1;
+                                                if count >= 5 {
+                                                    break;
+                                                }
                                             }
                                             shown += 1;
-                                            if shown >= 5 {
+                                            if shown >= 8 {
                                                 break;
                                             }
                                         }
@@ -433,10 +590,105 @@ fn run_monitor_loop<B: Backend>(terminal: &mut Terminal<B>, data_file: PathBuf) 
                                             .unwrap_or_else(|| "".into())
                                     )));
                                     if let Some(t) = &snap.last_transition {
-                                        details.push(Line::from(format!(
-                                            "Last transition: {:?}->{:?} at {}",
-                                            t.from, t.to, t.at
-                                        )));
+                                        details.push(Line::from(vec![
+                                            Span::styled(
+                                                "Last transition: ",
+                                                Style::default().fg(Color::Gray),
+                                            ),
+                                            Span::styled(
+                                                format!("{:?}", t.from),
+                                                Style::default()
+                                                    .fg(Color::Yellow)
+                                                    .add_modifier(Modifier::BOLD),
+                                            ),
+                                            Span::raw(" → "),
+                                            Span::styled(
+                                                format!("{:?}", t.to),
+                                                Style::default()
+                                                    .fg(Color::Green)
+                                                    .add_modifier(Modifier::BOLD),
+                                            ),
+                                            Span::raw(" at "),
+                                            Span::styled(
+                                                t.at.with_timezone(&chrono::Local)
+                                                    .format("%H:%M:%S")
+                                                    .to_string(),
+                                                Style::default().fg(Color::Gray),
+                                            ),
+                                            if t.by_signal.is_some() {
+                                                Span::raw("  ")
+                                            } else {
+                                                Span::raw("")
+                                            },
+                                            if t.by_signal.is_some() {
+                                                Span::styled(
+                                                    "● ",
+                                                    Style::default().fg(Color::Green),
+                                                )
+                                            } else {
+                                                Span::raw("")
+                                            },
+                                            if let Some(sig) = &t.by_signal {
+                                                Span::styled(
+                                                    sig.clone(),
+                                                    Style::default().fg(Color::Green),
+                                                )
+                                            } else {
+                                                Span::raw("")
+                                            },
+                                        ]));
+                                    }
+                                    // Recent transitions (last 5)
+                                    if !snap.transitions_recent.is_empty() {
+                                        details.push(Line::from("Recent transitions:"));
+                                        for tr in snap.transitions_recent.iter().take(5) {
+                                            let dot_color = match tr.by_signal.as_deref() {
+                                                Some("KeyboardInput") => Color::Yellow,
+                                                Some("MouseInput") => Color::Cyan,
+                                                Some("AppChanged") => Color::Green,
+                                                Some("WindowChanged") => Color::Magenta,
+                                                Some("ActivityPulse") => Color::Green,
+                                                Some("LockStart") => Color::Red,
+                                                Some("LockEnd") => Color::Green,
+                                                _ => Color::Gray,
+                                            };
+                                            details.push(Line::from(vec![
+                                                Span::styled(
+                                                    "  ● ",
+                                                    Style::default().fg(dot_color),
+                                                ),
+                                                Span::styled(
+                                                    format!("{:?}", tr.from),
+                                                    Style::default().fg(Color::Yellow),
+                                                ),
+                                                Span::raw(" → "),
+                                                Span::styled(
+                                                    format!("{:?}", tr.to),
+                                                    Style::default().fg(Color::Green),
+                                                ),
+                                                Span::raw(" at "),
+                                                Span::styled(
+                                                    tr.at
+                                                        .with_timezone(&chrono::Local)
+                                                        .format("%H:%M:%S")
+                                                        .to_string(),
+                                                    Style::default().fg(Color::Gray),
+                                                ),
+                                                if let Some(sig) = &tr.by_signal {
+                                                    Span::raw("  ")
+                                                } else {
+                                                    Span::raw("")
+                                                },
+                                                if let Some(sig) = &tr.by_signal {
+                                                    Span::styled(
+                                                        sig.clone(),
+                                                        Style::default().fg(dot_color),
+                                                    )
+                                                } else {
+                                                    Span::raw("")
+                                                },
+                                            ]));
+                                        }
                                     }
                                     if !snap.health.is_empty() {
                                         details.push(Line::from("Health:"));
@@ -723,6 +975,7 @@ fn map_pb_snapshot(
                 .at
                 .and_then(|ts| chrono::DateTime::<Utc>::from_timestamp(ts.seconds, ts.nanos as u32))
                 .unwrap_or_else(Utc::now),
+            by_signal: None,
         });
     let counts = reply
         .counts
@@ -832,6 +1085,7 @@ fn map_pb_snapshot(
         activity_state: state,
         focus,
         last_transition,
+        transitions_recent: Vec::new(),
         counts,
         cadence_ms,
         cadence_reason,

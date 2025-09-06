@@ -736,12 +736,14 @@ impl EventCoordinator {
                                             if let EventPayload::State { from, to } =
                                                 env.payload.clone()
                                             {
-                                                last_transition =
-                                                    Some(crate::daemon::snapshot::Transition {
-                                                        from,
-                                                        to,
-                                                        at: env.timestamp,
-                                                    });
+                                                let tr = crate::daemon::snapshot::Transition {
+                                                    from,
+                                                    to,
+                                                    at: env.timestamp,
+                                                    by_signal: None,
+                                                };
+                                                last_transition = Some(tr.clone());
+                                                crate::daemon::snapshot::push_transition(tr);
                                                 current_state = to;
                                             }
                                             let _ = hints_tx.send(env.clone());
@@ -759,12 +761,21 @@ impl EventCoordinator {
                                                 if let EventPayload::State { from, to } =
                                                     h.payload.clone()
                                                 {
-                                                    last_transition =
-                                                        Some(crate::daemon::snapshot::Transition {
-                                                            from,
-                                                            to,
-                                                            at: h.timestamp,
-                                                        });
+                                                    // Capture the signal kind that led to this transition
+                                                    let sig = match &env.kind {
+                                                        EventKind::Signal(sk) => {
+                                                            Some(format!("{:?}", sk))
+                                                        }
+                                                        _ => None,
+                                                    };
+                                                    let tr = crate::daemon::snapshot::Transition {
+                                                        from,
+                                                        to,
+                                                        at: h.timestamp,
+                                                        by_signal: sig,
+                                                    };
+                                                    last_transition = Some(tr.clone());
+                                                    crate::daemon::snapshot::push_transition(tr);
                                                     current_state = to;
                                                 }
                                                 let _ = hints_tx.send(h);
@@ -878,12 +889,14 @@ impl EventCoordinator {
                                             if let EventPayload::State { from, to } =
                                                 env.payload.clone()
                                             {
-                                                last_transition =
-                                                    Some(crate::daemon::snapshot::Transition {
-                                                        from,
-                                                        to,
-                                                        at: env.timestamp,
-                                                    });
+                                                let tr = crate::daemon::snapshot::Transition {
+                                                    from,
+                                                    to,
+                                                    at: env.timestamp,
+                                                    by_signal: None,
+                                                };
+                                                last_transition = Some(tr.clone());
+                                                crate::daemon::snapshot::push_transition(tr);
                                                 current_state = to;
                                             }
                                             let _ = hints_tx.send(env.clone());
@@ -900,12 +913,20 @@ impl EventCoordinator {
                                                 if let EventPayload::State { from, to } =
                                                     h.payload.clone()
                                                 {
-                                                    last_transition =
-                                                        Some(crate::daemon::snapshot::Transition {
-                                                            from,
-                                                            to,
-                                                            at: h.timestamp,
-                                                        });
+                                                    let sig = match &env.kind {
+                                                        EventKind::Signal(sk) => {
+                                                            Some(format!("{:?}", sk))
+                                                        }
+                                                        _ => None,
+                                                    };
+                                                    let tr = crate::daemon::snapshot::Transition {
+                                                        from,
+                                                        to,
+                                                        at: h.timestamp,
+                                                        by_signal: sig,
+                                                    };
+                                                    last_transition = Some(tr.clone());
+                                                    crate::daemon::snapshot::push_transition(tr);
                                                     current_state = to;
                                                 }
                                                 let _ = hints_tx.send(h);
@@ -1058,11 +1079,14 @@ impl EventCoordinator {
                     if let Some(state_hint) = state_deriver.on_tick(chrono::Utc::now()) {
                         counts.hints_seen += 1;
                         if let EventPayload::State { from, to } = state_hint.payload.clone() {
-                            last_transition = Some(crate::daemon::snapshot::Transition {
+                            let tr = crate::daemon::snapshot::Transition {
                                 from,
                                 to,
                                 at: state_hint.timestamp,
-                            });
+                                by_signal: None,
+                            };
+                            last_transition = Some(tr.clone());
+                            crate::daemon::snapshot::push_transition(tr);
                             current_state = to;
                         }
                         let _ = hints_tx.send(state_hint);
