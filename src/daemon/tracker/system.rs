@@ -8,6 +8,7 @@ use std::time::Duration;
 use tracing::info;
 
 use duckdb::{Connection, params};
+use rusqlite as rsql;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SystemMetrics {
@@ -48,6 +49,8 @@ pub struct DuckDbSystemTracker {
     db_path: PathBuf,
     started: AtomicBool,
     control_tx: Option<mpsc::Sender<ControlMsg>>,
+    backend: crate::util::config::DatabaseBackendConfig,
+    duckdb_memory_limit_mb: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -60,7 +63,14 @@ pub enum ControlMsg {
 }
 
 impl DuckDbSystemTracker {
-    pub fn new(pid: u32, interval_secs: f64, batch_size: usize, db_path: PathBuf) -> Self {
+    pub fn new(
+        pid: u32,
+        interval_secs: f64,
+        batch_size: usize,
+        db_path: PathBuf,
+        backend: crate::util::config::DatabaseBackendConfig,
+        duckdb_memory_limit_mb: u64,
+    ) -> Self {
         Self {
             pid,
             interval: Duration::from_secs_f64(interval_secs),
@@ -68,6 +78,8 @@ impl DuckDbSystemTracker {
             db_path,
             started: AtomicBool::new(false),
             control_tx: None,
+            backend,
+            duckdb_memory_limit_mb,
         }
     }
 
@@ -85,6 +97,8 @@ impl DuckDbSystemTracker {
         let interval = self.interval;
         let batch_size = self.batch_size;
         let db_path = self.db_path.clone();
+        let backend = self.backend.clone();
+        let duckdb_limit = self.duckdb_memory_limit_mb;
         let (control_tx, control_rx) = mpsc::channel::<ControlMsg>();
         self.control_tx = Some(control_tx.clone());
         // Expose control channel to APIs (e.g., gRPC) so they can request a flush.
@@ -98,11 +112,25 @@ impl DuckDbSystemTracker {
         crate::daemon::api::set_system_tracker_query_tx(query_tx.clone());
 
         thread::spawn(move || {
-            let mut store = match DuckDbSystemMetricsStore::new_file(&db_path) {
-                Ok(store) => store,
-                Err(e) => {
-                    tracing::error!("Failed to create DuckDB store: {}", e);
-                    return;
+            // Open the store according to configured backend
+            let mut store: Box<dyn SystemMetricsStore + Send> = match backend {
+                crate::util::config::DatabaseBackendConfig::Duckdb => {
+                    match DuckDbSystemMetricsStore::new_file_with_limit(&db_path, duckdb_limit) {
+                        Ok(s) => Box::new(s),
+                        Err(e) => {
+                            tracing::error!("Failed to create DuckDB store: {}", e);
+                            return;
+                        }
+                    }
+                }
+                crate::util::config::DatabaseBackendConfig::Sqlite3 => {
+                    match SqliteSystemMetricsStore::new_file(&db_path) {
+                        Ok(s) => Box::new(s),
+                        Err(e) => {
+                            tracing::error!("Failed to create SQLite store: {}", e);
+                            return;
+                        }
+                    }
                 }
             };
 
@@ -111,7 +139,8 @@ impl DuckDbSystemTracker {
             let mut batch_count = 0;
 
             let flush_buffer =
-                |buffer: &mut Vec<SystemMetrics>, store: &mut DuckDbSystemMetricsStore| {
+                |buffer: &mut Vec<SystemMetrics>,
+                 store: &mut Box<dyn SystemMetricsStore + Send>| {
                     if !buffer.is_empty() {
                         if let Err(e) = store.insert_metrics_batch(buffer, pid) {
                             tracing::error!("Failed to flush metrics batch: {}", e);
@@ -371,13 +400,29 @@ fn get_disk_io(pid: u32) -> Result<u64> {
     }
 }
 
+// Storage backend abstraction for tracker metrics
+trait SystemMetricsStore {
+    fn insert_metrics_batch(&mut self, metrics: &[SystemMetrics], pid: u32) -> Result<()>;
+    fn get_metrics_for_pid(&self, pid: u32, limit: Option<usize>) -> Result<Vec<SystemMetrics>>;
+    fn get_metrics_in_time_range(
+        &self,
+        pid: u32,
+        start_time: DateTime<Utc>,
+        end_time: DateTime<Utc>,
+    ) -> Result<Vec<SystemMetrics>>;
+}
+
 pub struct DuckDbSystemMetricsStore {
     connection: Connection,
 }
 
 impl DuckDbSystemMetricsStore {
-    pub fn new_in_memory() -> Result<Self> {
+    pub fn new_in_memory_with_limit(limit_mb: u64) -> Result<Self> {
         let conn = Connection::open_in_memory()?;
+        conn.execute_batch(&format!(
+            "PRAGMA memory_limit='{}MB'; PRAGMA threads=2;",
+            limit_mb
+        ))?;
 
         conn.execute_batch(
             r"CREATE TABLE system_metrics (
@@ -396,8 +441,12 @@ impl DuckDbSystemMetricsStore {
         Ok(Self { connection: conn })
     }
 
-    pub fn new_file(db_path: &PathBuf) -> Result<Self> {
+    pub fn new_file_with_limit(db_path: &PathBuf, limit_mb: u64) -> Result<Self> {
         let conn = Connection::open(db_path)?;
+        conn.execute_batch(&format!(
+            "PRAGMA memory_limit='{}MB'; PRAGMA threads=2;",
+            limit_mb
+        ))?;
 
         conn.execute_batch(
             r"CREATE TABLE IF NOT EXISTS system_metrics (
@@ -415,8 +464,10 @@ impl DuckDbSystemMetricsStore {
 
         Ok(Self { connection: conn })
     }
+}
 
-    pub fn insert_metrics_batch(&mut self, metrics: &[SystemMetrics], pid: u32) -> Result<()> {
+impl SystemMetricsStore for DuckDbSystemMetricsStore {
+    fn insert_metrics_batch(&mut self, metrics: &[SystemMetrics], pid: u32) -> Result<()> {
         if metrics.is_empty() {
             return Ok(());
         }
@@ -442,11 +493,7 @@ impl DuckDbSystemMetricsStore {
         Ok(())
     }
 
-    pub fn get_metrics_for_pid(
-        &self,
-        pid: u32,
-        limit: Option<usize>,
-    ) -> Result<Vec<SystemMetrics>> {
+    fn get_metrics_for_pid(&self, pid: u32, limit: Option<usize>) -> Result<Vec<SystemMetrics>> {
         let mut sql = "SELECT timestamp, cpu_percent, memory_bytes, disk_io_bytes 
                        FROM system_metrics WHERE pid = ? ORDER BY timestamp DESC"
             .to_string();
@@ -473,7 +520,7 @@ impl DuckDbSystemMetricsStore {
         Ok(metrics)
     }
 
-    pub fn get_metrics_in_time_range(
+    fn get_metrics_in_time_range(
         &self,
         pid: u32,
         start_time: DateTime<Utc>,
@@ -502,7 +549,9 @@ impl DuckDbSystemMetricsStore {
 
         Ok(metrics)
     }
+}
 
+impl DuckDbSystemMetricsStore {
     pub fn get_aggregated_metrics(
         &self,
         pid: u32,
@@ -550,6 +599,122 @@ impl DuckDbSystemMetricsStore {
     pub fn vacuum_database(&mut self) -> Result<()> {
         self.connection.execute("VACUUM", [])?;
         Ok(())
+    }
+}
+
+// SQLite implementation for tracker (low overhead)
+pub struct SqliteSystemMetricsStore {
+    connection: rsql::Connection,
+}
+
+impl SqliteSystemMetricsStore {
+    pub fn new_file(db_path: &PathBuf) -> Result<Self> {
+        let conn = rsql::Connection::open(db_path)?;
+        conn.execute_batch(
+            r#"CREATE TABLE IF NOT EXISTS system_metrics (
+                timestamp TEXT NOT NULL,
+                pid INTEGER NOT NULL,
+                cpu_percent REAL NOT NULL,
+                memory_bytes INTEGER NOT NULL,
+                disk_io_bytes INTEGER NOT NULL,
+                PRIMARY KEY (timestamp, pid)
+            );
+            CREATE INDEX IF NOT EXISTS idx_system_metrics_timestamp ON system_metrics(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_system_metrics_pid ON system_metrics(pid);
+            "#,
+        )?;
+        Ok(Self { connection: conn })
+    }
+}
+
+impl SystemMetricsStore for SqliteSystemMetricsStore {
+    fn insert_metrics_batch(&mut self, metrics: &[SystemMetrics], pid: u32) -> Result<()> {
+        if metrics.is_empty() {
+            return Ok(());
+        }
+        let tx = self.connection.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT OR REPLACE INTO system_metrics (timestamp, pid, cpu_percent, memory_bytes, disk_io_bytes) VALUES (?, ?, ?, ?, ?)",
+            )?;
+            for m in metrics {
+                stmt.execute(rsql::params![
+                    m.timestamp.to_rfc3339(),
+                    pid as i64,
+                    m.cpu_percent,
+                    m.memory_bytes as i64,
+                    m.disk_io_bytes as i64
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn get_metrics_for_pid(&self, pid: u32, limit: Option<usize>) -> Result<Vec<SystemMetrics>> {
+        let mut sql = String::from(
+            "SELECT timestamp, cpu_percent, memory_bytes, disk_io_bytes FROM system_metrics WHERE pid = ? ORDER BY timestamp DESC",
+        );
+        if let Some(n) = limit {
+            sql.push_str(&format!(" LIMIT {}", n));
+        }
+        let mut stmt = self.connection.prepare(&sql)?;
+        let rows = stmt.query_map([pid as i64], |row| {
+            let ts_s: String = row.get(0)?;
+            let ts = chrono::DateTime::parse_from_rfc3339(&ts_s)
+                .map(|dt| dt.with_timezone(&Utc))
+                .map_err(|e| {
+                    rsql::Error::FromSqlConversionFailure(0, rsql::types::Type::Text, Box::new(e))
+                })?;
+            Ok(SystemMetrics {
+                timestamp: ts,
+                cpu_percent: row.get::<_, f64>(1)?,
+                memory_bytes: row.get::<_, i64>(2)? as u64,
+                disk_io_bytes: row.get::<_, i64>(3)? as u64,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    fn get_metrics_in_time_range(
+        &self,
+        pid: u32,
+        start_time: DateTime<Utc>,
+        end_time: DateTime<Utc>,
+    ) -> Result<Vec<SystemMetrics>> {
+        let mut stmt = self.connection.prepare(
+            "SELECT timestamp, cpu_percent, memory_bytes, disk_io_bytes FROM system_metrics WHERE pid = ? AND timestamp >= ? AND timestamp <= ? ORDER BY timestamp ASC",
+        )?;
+        let rows = stmt.query_map(
+            rsql::params![pid as i64, start_time.to_rfc3339(), end_time.to_rfc3339()],
+            |row| {
+                let ts_s: String = row.get(0)?;
+                let ts = chrono::DateTime::parse_from_rfc3339(&ts_s)
+                    .map(|dt| dt.with_timezone(&Utc))
+                    .map_err(|e| {
+                        rsql::Error::FromSqlConversionFailure(
+                            0,
+                            rsql::types::Type::Text,
+                            Box::new(e),
+                        )
+                    })?;
+                Ok(SystemMetrics {
+                    timestamp: ts,
+                    cpu_percent: row.get::<_, f64>(1)?,
+                    memory_bytes: row.get::<_, i64>(2)? as u64,
+                    disk_io_bytes: row.get::<_, i64>(3)? as u64,
+                })
+            },
+        )?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
     }
 }
 

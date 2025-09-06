@@ -217,6 +217,8 @@ pub struct EventCoordinator {
     tracker_enabled: bool,
     tracker_interval_secs: f64,
     tracker_batch_size: usize,
+    tracker_db_backend: crate::util::config::DatabaseBackendConfig,
+    duckdb_memory_limit_mb_tracker: u64,
 }
 
 impl EventCoordinator {
@@ -236,6 +238,8 @@ impl EventCoordinator {
         tracker_enabled: bool,
         tracker_interval_secs: f64,
         tracker_batch_size: usize,
+        tracker_db_backend: crate::util::config::DatabaseBackendConfig,
+        duckdb_memory_limit_mb_tracker: u64,
     ) -> Self {
         Self {
             retention_minutes,
@@ -253,6 +257,8 @@ impl EventCoordinator {
             tracker_enabled,
             tracker_interval_secs,
             tracker_batch_size,
+            tracker_db_backend,
+            duckdb_memory_limit_mb_tracker,
         }
     }
 
@@ -355,12 +361,17 @@ impl EventCoordinator {
 
         if self.tracker_enabled {
             let current_pid = std::process::id();
-            let tracker_db_path = crate::util::paths::tracker_db(&workspace_dir);
+            let tracker_db_path = crate::util::paths::tracker_db_with_backend(
+                &workspace_dir,
+                &self.tracker_db_backend,
+            );
             let mut tracker = DuckDbSystemTracker::new(
                 current_pid,
                 self.tracker_interval_secs,
                 self.tracker_batch_size,
                 tracker_db_path.clone(),
+                self.tracker_db_backend.clone(),
+                self.duckdb_memory_limit_mb_tracker,
             );
             if let Err(e) = tracker.start() {
                 error!("Failed to start DuckDB system tracker: {}", e);

@@ -993,7 +993,10 @@ fn tracker_status(config: &AppConfig) -> Result<()> {
             println!("Interval: {} seconds", config.tracker_interval_secs);
             println!("Batch size: {}", config.tracker_batch_size);
 
-            let db_path = kronical::util::paths::tracker_db(&config.workspace_dir);
+            let db_path = kronical::util::paths::tracker_db_with_backend(
+                &config.workspace_dir,
+                &config.tracker_db_backend,
+            );
             if db_path.exists() {
                 let metadata = std::fs::metadata(&db_path)?;
                 println!(
@@ -1180,9 +1183,8 @@ fn show_tracker_data_grpc(
                 first_time,
                 last_time
             );
-            // Help users diagnose mismatches: show the PID and the expected DB path
-            let db_path = kronical::util::paths::tracker_db(workspace_dir);
-            println!("Source: PID={} DB={}", pid_to_query, db_path.display());
+            // Help users diagnose mismatches: show the PID we queried
+            println!("Source: PID={}", pid_to_query);
 
             // Diagnostic: show recency delta
             if let Some(ts) = last.timestamp.as_ref() {
