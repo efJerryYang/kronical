@@ -34,11 +34,12 @@ pub struct AppConfig {
 
 impl Default for AppConfig {
     fn default() -> Self {
-        let workspace_dir = if let Some(home) = dirs::home_dir() {
-            home.join(".kronical")
-        } else {
-            panic!("Failed to determine home directory")
-        };
+        // Be resilient in environments without HOME by falling back to CWD.
+        let base_dir = dirs::home_dir()
+            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let workspace_dir = base_dir.join(".kronical");
 
         Self {
             workspace_dir,
@@ -69,7 +70,8 @@ impl AppConfig {
         let config_path = workspace_dir.join("config.toml");
 
         let mut builder = Config::builder()
-            .set_default("workspace_dir", workspace_dir.to_str().unwrap())?
+            // Avoid panics on non-UTF8 paths by using lossy conversion.
+            .set_default("workspace_dir", workspace_dir.to_string_lossy().as_ref())?
             .set_default("db_backend", "duckdb")?
             .set_default("retention_minutes", 72 * 60)?
             .set_default("active_grace_secs", 30)?

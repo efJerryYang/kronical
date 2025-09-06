@@ -1,13 +1,13 @@
 use crate::daemon::compression::CompressionEngine;
-use crate::daemon::duckdb_system_tracker::DuckDbSystemTracker;
 use crate::daemon::events::adapter::EventAdapter;
 use crate::daemon::events::deriver::{LockDeriver, StateDeriver};
 use crate::daemon::events::model::{EventKind, EventPayload, SignalKind};
 use crate::daemon::events::{
     KeyboardEventData, MouseEventData, MouseEventKind, MousePosition, WindowFocusInfo,
 };
-use crate::daemon::focus_tracker::{FocusCacheCaps, FocusChangeCallback, FocusEventWrapper};
 use crate::daemon::records::{ActivityRecord, aggregate_activities_since};
+use crate::daemon::tracker::DuckDbSystemTracker;
+use crate::daemon::tracker::{FocusCacheCaps, FocusChangeCallback, FocusEventWrapper};
 use crate::storage::StorageBackend;
 use anyhow::Result;
 use log::{debug, error, info, trace};
@@ -347,7 +347,17 @@ impl EventCoordinator {
         let (sender, receiver) = mpsc::channel();
 
         // Start API servers (gRPC + HTTP/SSE) via unified API facade.
-        let workspace_dir = pid_file.parent().unwrap();
+        let workspace_dir = match pid_file.parent() {
+            Some(dir) => dir,
+            None => {
+                error!(
+                    "PID file has no parent; cannot derive workspace dir. Skipping API startup."
+                );
+                return Err(anyhow::anyhow!(
+                    "invalid PID file path; missing parent directory"
+                ));
+            }
+        };
         let uds_grpc = crate::util::paths::grpc_uds(workspace_dir);
         let uds_http = crate::util::paths::http_uds(workspace_dir);
         if let Err(e) = crate::daemon::api::spawn_all(uds_grpc, uds_http) {
@@ -1235,24 +1245,27 @@ impl EventCoordinator {
         }
 
         info!("Step C: Cleaning up socket files");
-        let socket_dir = pid_file.parent().unwrap();
-        let grpc_sock = socket_dir.join("kroni.sock");
-        let http_sock = socket_dir.join("kroni.http.sock");
+        if let Some(socket_dir) = pid_file.parent() {
+            let grpc_sock = socket_dir.join("kroni.sock");
+            let http_sock = socket_dir.join("kroni.http.sock");
 
-        if grpc_sock.exists() {
-            if let Err(e) = std::fs::remove_file(&grpc_sock) {
-                error!("Failed to remove gRPC socket: {}", e);
-            } else {
-                info!("Removed gRPC socket file");
+            if grpc_sock.exists() {
+                if let Err(e) = std::fs::remove_file(&grpc_sock) {
+                    error!("Failed to remove gRPC socket: {}", e);
+                } else {
+                    info!("Removed gRPC socket file");
+                }
             }
-        }
 
-        if http_sock.exists() {
-            if let Err(e) = std::fs::remove_file(&http_sock) {
-                error!("Failed to remove HTTP socket: {}", e);
-            } else {
-                info!("Removed HTTP socket file");
+            if http_sock.exists() {
+                if let Err(e) = std::fs::remove_file(&http_sock) {
+                    error!("Failed to remove HTTP socket: {}", e);
+                } else {
+                    info!("Removed HTTP socket file");
+                }
             }
+        } else {
+            error!("PID file has no parent; skipping socket cleanup");
         }
 
         info!("Step C: Kronical shutdown complete");

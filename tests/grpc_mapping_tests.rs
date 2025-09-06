@@ -56,7 +56,7 @@ fn maps_aggregated_apps_in_grpc_snapshot_reply() {
         }],
     };
 
-    let reply = kronical::daemon::kroni_server::to_pb(&s);
+    let reply = kronical::daemon::server::grpc::to_pb(&s);
     assert_eq!(reply.seq, 42);
     assert_eq!(reply.aggregated_apps.len(), 1);
     let a = &reply.aggregated_apps[0];

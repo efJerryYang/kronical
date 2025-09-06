@@ -1,6 +1,6 @@
 use chrono::Utc;
-use kronical::daemon::duckdb_system_tracker::DuckDbSystemTracker;
-use kronical::daemon::kroni_server::set_system_tracker_db_path;
+use kronical::daemon::server::grpc::set_system_tracker_db_path;
+use kronical::daemon::tracker::DuckDbSystemTracker;
 use kronical::kroni_api::kroni::v1::SystemMetricsRequest;
 use kronical::kroni_api::kroni::v1::kroni_server::Kroni;
 use prost_types::Timestamp;
@@ -28,7 +28,7 @@ async fn metrics_increase_across_consecutive_requests_after_flush() {
     // Allow a couple of samples to be collected
     tokio::time::sleep(Duration::from_millis(1200)).await;
 
-    let svc = kronical::daemon::kroni_server::KroniSvc::default();
+    let svc = kronical::daemon::server::grpc::KroniSvc::default();
 
     // First request; server performs a flush before querying and sets end_time = now internally
     let start = Utc::now() - chrono::Duration::minutes(5);

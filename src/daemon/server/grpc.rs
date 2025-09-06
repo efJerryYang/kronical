@@ -22,17 +22,14 @@ use tokio_stream::wrappers::IntervalStream;
 use tonic::{Request, Response, Status, transport::Server};
 
 static SYSTEM_TRACKER_DB_PATH: OnceCell<PathBuf> = OnceCell::new();
-static SYSTEM_TRACKER_QUERY_TX: OnceCell<
-    Sender<crate::daemon::duckdb_system_tracker::MetricsQueryReq>,
-> = OnceCell::new();
+static SYSTEM_TRACKER_QUERY_TX: OnceCell<Sender<crate::daemon::tracker::MetricsQueryReq>> =
+    OnceCell::new();
 
 pub fn set_system_tracker_db_path(db_path: PathBuf) {
     let _ = SYSTEM_TRACKER_DB_PATH.set(db_path);
 }
 
-pub fn set_system_tracker_query_tx(
-    tx: Sender<crate::daemon::duckdb_system_tracker::MetricsQueryReq>,
-) {
+pub fn set_system_tracker_query_tx(tx: Sender<crate::daemon::tracker::MetricsQueryReq>) {
     let _ = SYSTEM_TRACKER_QUERY_TX.set(tx);
 }
 
@@ -101,11 +98,11 @@ impl Kroni for KroniSvc {
 
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         let metrics = if request.limit > 0 {
-            let query = crate::daemon::duckdb_system_tracker::MetricsQuery::ByLimit {
+            let query = crate::daemon::tracker::MetricsQuery::ByLimit {
                 pid,
                 limit: request.limit as usize,
             };
-            tx.send(crate::daemon::duckdb_system_tracker::MetricsQueryReq {
+            tx.send(crate::daemon::tracker::MetricsQueryReq {
                 query,
                 reply: reply_tx,
             })
@@ -125,12 +122,12 @@ impl Kroni for KroniSvc {
                     .map_err(|e| Status::invalid_argument(format!("Invalid end_time: {}", e)))?,
                 None => Utc::now(),
             };
-            let query = crate::daemon::duckdb_system_tracker::MetricsQuery::ByRange {
+            let query = crate::daemon::tracker::MetricsQuery::ByRange {
                 pid,
                 start: start_time,
                 end: end_time,
             };
-            tx.send(crate::daemon::duckdb_system_tracker::MetricsQueryReq {
+            tx.send(crate::daemon::tracker::MetricsQueryReq {
                 query,
                 reply: reply_tx,
             })
