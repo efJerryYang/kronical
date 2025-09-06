@@ -1,4 +1,4 @@
-use crate::daemon::compression::CompressionEngine;
+use crate::daemon::compressor::CompressionEngine;
 use crate::daemon::events::adapter::EventAdapter;
 use crate::daemon::events::deriver::{LockDeriver, StateDeriver};
 use crate::daemon::events::model::{EventKind, EventPayload, SignalKind};

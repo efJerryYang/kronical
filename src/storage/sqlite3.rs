@@ -211,7 +211,7 @@ impl StorageBackend for SqliteStorage {
 
     fn add_compact_events(
         &mut self,
-        _events: Vec<crate::daemon::compression::CompactEvent>,
+        _events: Vec<crate::daemon::compressor::CompactEvent>,
     ) -> Result<()> {
         Ok(())
     }

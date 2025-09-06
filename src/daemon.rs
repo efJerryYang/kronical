@@ -1,4 +1,4 @@
-pub mod compression;
+pub mod compressor;
 pub mod coordinator;
 pub mod events;
 pub mod records;
