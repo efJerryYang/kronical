@@ -1,5 +1,5 @@
-use crate::daemon::event_model::{EventEnvelope, EventKind, EventPayload, HintKind};
 use crate::daemon::events::WindowFocusInfo;
+use crate::daemon::events::model::{EventEnvelope, EventKind, EventPayload, HintKind};
 use crate::util::maps::{HashMap, HashSet};
 use chrono::{DateTime, Utc};
 // no-op: keep minimal imports to avoid unused warnings
@@ -182,10 +182,10 @@ impl RecordBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::event_adapter::EventAdapter;
-    use crate::daemon::event_deriver::StateDeriver;
-    use crate::daemon::event_model::{DefaultStateEngine, EventSource, SignalKind, StateEngine};
     use crate::daemon::events::RawEvent;
+    use crate::daemon::events::adapter::EventAdapter;
+    use crate::daemon::events::deriver::StateDeriver;
+    use crate::daemon::events::model::{DefaultStateEngine, EventSource, SignalKind, StateEngine};
 
     fn mk_env_signal(kind: SignalKind) -> EventEnvelope {
         EventEnvelope {

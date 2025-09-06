@@ -1,5 +1,5 @@
-use crate::daemon::event_model::{DefaultStateEngine, StateEngine};
-use crate::daemon::event_model::{
+use crate::daemon::events::model::{DefaultStateEngine, StateEngine};
+use crate::daemon::events::model::{
     EventEnvelope, EventKind, EventPayload, EventSource, HintKind, SignalKind,
 };
 use crate::daemon::records::ActivityState;
@@ -182,7 +182,7 @@ impl StateDeriver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::daemon::event_model::{EventEnvelope, EventKind, EventSource, SignalKind};
+    use crate::daemon::events::model::{EventEnvelope, EventKind, EventSource, SignalKind};
 
     fn mk_sig(kind: SignalKind, ts: DateTime<Utc>) -> EventEnvelope {
         EventEnvelope {

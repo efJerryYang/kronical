@@ -1,7 +1,7 @@
-use crate::daemon::event_model::{
+use crate::daemon::events::RawEvent;
+use crate::daemon::events::model::{
     EventEnvelope, EventKind, EventPayload, EventSource, HintKind, SignalKind,
 };
-use crate::daemon::events::RawEvent;
 use crate::daemon::records::ActivityRecord;
 use crate::storage::StorageBackend;
 use anyhow::{Context, Result};

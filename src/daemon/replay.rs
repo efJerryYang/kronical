@@ -1,4 +1,4 @@
-use crate::daemon::event_model::{EventKind, HintKind};
+use crate::daemon::events::model::{EventKind, HintKind};
 use crate::daemon::records::{ActivityRecord, RecordBuilder, aggregate_activities_since};
 use crate::storage::StorageBackend;
 use anyhow::Result;
@@ -30,7 +30,7 @@ pub fn run_replay(
     let mut state_deriver = if has_state_hints {
         None
     } else {
-        Some(crate::daemon::event_deriver::StateDeriver::new(
+        Some(crate::daemon::events::deriver::StateDeriver::new(
             since,
             thresholds.0 as i64,
             thresholds.1 as i64,

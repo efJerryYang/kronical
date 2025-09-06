@@ -1,7 +1,8 @@
 use crate::daemon::compression::CompressionEngine;
 use crate::daemon::duckdb_system_tracker::DuckDbSystemTracker;
-use crate::daemon::event_adapter::EventAdapter;
-use crate::daemon::event_deriver::LockDeriver;
+use crate::daemon::events::adapter::EventAdapter;
+use crate::daemon::events::deriver::{LockDeriver, StateDeriver};
+use crate::daemon::events::model::{EventKind, EventPayload, SignalKind};
 use crate::daemon::events::{KeyboardEventData, MouseEventData, MousePosition, WindowFocusInfo};
 use crate::daemon::focus_tracker::{FocusCacheCaps, FocusChangeCallback, FocusEventWrapper};
 use crate::daemon::records::{ActivityRecord, aggregate_activities_since};
@@ -549,8 +550,7 @@ impl EventCoordinator {
                 }
 
                 // Initialize new state + record components
-                let mut state_deriver =
-                    crate::daemon::event_deriver::StateDeriver::new(now0, ags as i64, its as i64);
+                let mut state_deriver = StateDeriver::new(now0, ags as i64, its as i64);
                 let mut record_builder = crate::daemon::records::RecordBuilder::new(
                     crate::daemon::records::ActivityState::Inactive,
                 );
@@ -569,20 +569,17 @@ impl EventCoordinator {
                                 // Persist all envelopes
                                 let _ = store.add_envelopes(envelopes_with_lock.clone());
                                 // Feed pipeline (hint-first ordering per timestamp)
-                                for env in envelopes_with_lock.iter().filter(|e| {
-                                    matches!(e.kind, crate::daemon::event_model::EventKind::Hint(_))
-                                }) {
+                                for env in envelopes_with_lock
+                                    .iter()
+                                    .filter(|e| matches!(e.kind, EventKind::Hint(_)))
+                                {
                                     if let Some(rec) = record_builder.on_hint(env) {
                                         let _ = store.add_records(vec![rec.clone()]);
                                         recent_records.push_back(rec);
                                     }
 
                                     counts.hints_seen += 1;
-                                    if let crate::daemon::event_model::EventPayload::State {
-                                        from,
-                                        to,
-                                    } = &env.payload
-                                    {
+                                    if let EventPayload::State { from, to } = &env.payload {
                                         last_transition =
                                             Some(crate::daemon::snapshot::Transition {
                                                 from: *from,
@@ -591,12 +588,10 @@ impl EventCoordinator {
                                             });
                                     }
                                 }
-                                for env in envelopes_with_lock.iter().filter(|e| {
-                                    matches!(
-                                        e.kind,
-                                        crate::daemon::event_model::EventKind::Signal(_)
-                                    )
-                                }) {
+                                for env in envelopes_with_lock
+                                    .iter()
+                                    .filter(|e| matches!(e.kind, EventKind::Signal(_)))
+                                {
                                     counts.signals_seen += 1;
                                     if let Some(h) = state_deriver.on_signal(env) {
                                         let _ = store.add_envelopes(vec![h.clone()]);
@@ -606,11 +601,7 @@ impl EventCoordinator {
                                         }
 
                                         counts.hints_seen += 1;
-                                        if let crate::daemon::event_model::EventPayload::State {
-                                            from,
-                                            to,
-                                        } = &h.payload
-                                        {
+                                        if let EventPayload::State { from, to } = &h.payload {
                                             last_transition =
                                                 Some(crate::daemon::snapshot::Transition {
                                                     from: *from,
@@ -727,19 +718,16 @@ impl EventCoordinator {
                                 // New pipeline: feed signals to StateDeriver, hints to RecordBuilder
                                 let mut new_records = Vec::new();
                                 // Hints first
-                                for env in envelopes_with_lock.iter().filter(|e| {
-                                    matches!(e.kind, crate::daemon::event_model::EventKind::Hint(_))
-                                }) {
+                                for env in envelopes_with_lock
+                                    .iter()
+                                    .filter(|e| matches!(e.kind, EventKind::Hint(_)))
+                                {
                                     if let Some(rec) = record_builder.on_hint(env) {
                                         new_records.push(rec);
                                     }
 
                                     counts.hints_seen += 1;
-                                    if let crate::daemon::event_model::EventPayload::State {
-                                        from,
-                                        to,
-                                    } = &env.payload
-                                    {
+                                    if let EventPayload::State { from, to } = &env.payload {
                                         last_transition =
                                             Some(crate::daemon::snapshot::Transition {
                                                 from: *from,
@@ -749,12 +737,10 @@ impl EventCoordinator {
                                     }
                                 }
                                 // Then signals (which may derive state-change hints)
-                                for env in envelopes_with_lock.iter().filter(|e| {
-                                    matches!(
-                                        e.kind,
-                                        crate::daemon::event_model::EventKind::Signal(_)
-                                    )
-                                }) {
+                                for env in envelopes_with_lock
+                                    .iter()
+                                    .filter(|e| matches!(e.kind, EventKind::Signal(_)))
+                                {
                                     counts.signals_seen += 1;
                                     if let Some(h) = state_deriver.on_signal(env) {
                                         if let Err(e) = store.add_envelopes(vec![h.clone()]) {
@@ -769,11 +755,7 @@ impl EventCoordinator {
                                         }
 
                                         counts.hints_seen += 1;
-                                        if let crate::daemon::event_model::EventPayload::State {
-                                            from,
-                                            to,
-                                        } = &h.payload
-                                        {
+                                        if let EventPayload::State { from, to } = &h.payload {
                                             last_transition =
                                                 Some(crate::daemon::snapshot::Transition {
                                                     from: *from,
@@ -825,9 +807,7 @@ impl EventCoordinator {
 
                                         if !processed_events.is_empty() {
                                             // Suppress input events during Locked period using derived envelopes
-                                            use crate::daemon::event_model::{
-                                                EventKind, SignalKind,
-                                            };
+                                            use {EventKind, SignalKind};
                                             let mut suppress: std::collections::HashSet<u64> =
                                                 std::collections::HashSet::new();
                                             let mut locked = false;
@@ -978,9 +958,7 @@ impl EventCoordinator {
 
                         {
                             counts.hints_seen += 1;
-                            if let crate::daemon::event_model::EventPayload::State { from, to } =
-                                &state_hint.payload
-                            {
+                            if let EventPayload::State { from, to } = &state_hint.payload {
                                 last_transition = Some(crate::daemon::snapshot::Transition {
                                     from: *from,
                                     to: *to,

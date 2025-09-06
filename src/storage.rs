@@ -1,6 +1,6 @@
 use crate::daemon::compression::CompactEvent;
-use crate::daemon::event_model::EventEnvelope;
 use crate::daemon::events::RawEvent;
+use crate::daemon::events::model::EventEnvelope;
 use crate::daemon::records::ActivityRecord;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
