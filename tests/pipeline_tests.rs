@@ -44,7 +44,10 @@ fn mk_mouse(ts: DateTime<Utc>) -> RawEvent {
             position: kronical::daemon::events::MousePosition { x: 0, y: 0 },
             button: None,
             click_count: None,
-            wheel_delta: None,
+            event_type: None,
+            wheel_amount: None,
+            wheel_rotation: None,
+            wheel_axis: None,
         },
     }
 }

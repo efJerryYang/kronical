@@ -20,7 +20,30 @@ pub struct MouseEventData {
     pub position: MousePosition,
     pub button: Option<String>,
     pub click_count: Option<u16>,
-    pub wheel_delta: Option<i16>,
+    // Mouse movement/drag/click classification
+    pub event_type: Option<MouseEventKind>,
+    // Wheel-specific fields captured from uiohook Wheel events
+    // amount is the magnitude of the scroll (platform-specific units)
+    pub wheel_amount: Option<i32>,
+    // rotation is the signed step direction (+1 / -1)
+    pub wheel_rotation: Option<i32>,
+    // axis of wheel movement (Vertical or Horizontal)
+    pub wheel_axis: Option<WheelAxis>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum MouseEventKind {
+    Moved,
+    Pressed,
+    Released,
+    Clicked,
+    Dragged,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub enum WheelAxis {
+    Vertical,
+    Horizontal,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

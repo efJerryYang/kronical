@@ -1,4 +1,4 @@
-use crate::daemon::events::{MousePosition, RawEvent};
+use crate::daemon::events::{MousePosition, RawEvent, WheelAxis};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -86,7 +86,7 @@ impl ScrollCompressor {
     fn extract_scroll_events(
         &self,
         events: &[RawEvent],
-    ) -> Vec<(DateTime<Utc>, MousePosition, i16, i32, u8)> {
+    ) -> Vec<(DateTime<Utc>, MousePosition, i32, i32, WheelAxis)> {
         events
             .iter()
             .filter_map(|event| {
@@ -94,9 +94,21 @@ impl ScrollCompressor {
                     timestamp, data, ..
                 } = event
                 {
-                    data.wheel_delta.map(|delta| {
-                        (*timestamp, data.position.clone(), delta, 0, 0) // TODO: get rotation and direction from data
-                    })
+                    // Only accept events that came from uiohook WheelEvent with explicit fields
+                    if let (Some(amount), Some(rotation), Some(axis)) =
+                        (data.wheel_amount, data.wheel_rotation, data.wheel_axis)
+                    {
+                        let signed_amount = if rotation >= 0 { amount } else { -amount };
+                        Some((
+                            *timestamp,
+                            data.position.clone(),
+                            signed_amount,
+                            rotation,
+                            axis,
+                        ))
+                    } else {
+                        None
+                    }
                 } else {
                     None
                 }
@@ -104,29 +116,22 @@ impl ScrollCompressor {
             .collect()
     }
 
-    fn determine_direction(&self, delta: i16, direction: u8) -> ScrollDirection {
-        match direction {
-            0 => {
-                if delta > 0 {
+    fn determine_direction(&self, signed_amount: i32, axis: WheelAxis) -> ScrollDirection {
+        match axis {
+            WheelAxis::Vertical => {
+                if signed_amount > 0 {
                     ScrollDirection::VerticalUp
                 } else {
                     ScrollDirection::VerticalDown
                 }
-            } // Vertical
-            1 => {
-                if delta > 0 {
+            }
+            WheelAxis::Horizontal => {
+                if signed_amount > 0 {
                     ScrollDirection::HorizontalRight
                 } else {
                     ScrollDirection::HorizontalLeft
                 }
-            } // Horizontal
-            _ => {
-                if delta > 0 {
-                    ScrollDirection::VerticalUp
-                } else {
-                    ScrollDirection::VerticalDown
-                }
-            } // Default to vertical
+            }
         }
     }
 }
@@ -148,8 +153,8 @@ impl EventCompressor for ScrollCompressor {
         let mut sequences = Vec::new();
         let mut current_sequence: Option<CompactScrollSequence> = None;
 
-        for (timestamp, position, delta, rotation, direction) in scroll_events {
-            let scroll_direction = self.determine_direction(delta, direction);
+        for (timestamp, position, signed_amount, rotation, axis) in scroll_events {
+            let scroll_direction = self.determine_direction(signed_amount, axis);
 
             match &mut current_sequence {
                 Some(seq)
@@ -158,7 +163,7 @@ impl EventCompressor for ScrollCompressor {
                 {
                     // Extend current sequence
                     seq.end_time = timestamp;
-                    seq.total_amount += delta as i32;
+                    seq.total_amount += signed_amount as i32;
                     seq.total_rotation += rotation;
                     seq.scroll_count += 1;
                 }
@@ -171,7 +176,7 @@ impl EventCompressor for ScrollCompressor {
                         start_time: timestamp,
                         end_time: timestamp,
                         direction: scroll_direction,
-                        total_amount: delta as i32,
+                        total_amount: signed_amount as i32,
                         total_rotation: rotation,
                         scroll_count: 1,
                         position,
@@ -236,16 +241,19 @@ impl MouseTrajectoryCompressor {
                     timestamp, data, ..
                 } = event
                 {
-                    // Determine if it's a move or drag based on whether button is pressed
-                    let trajectory_type = if data.button.is_some() {
-                        MouseTrajectoryType::Drag
-                    } else {
-                        MouseTrajectoryType::Movement
-                    };
-
-                    // Only include actual movement events (not clicks)
-                    if data.click_count.is_none() {
-                        Some((*timestamp, data.position.clone(), trajectory_type))
+                    // Only include movement/dragged events; ignore clicks/press/release
+                    if let Some(kind) = data.event_type {
+                        match kind {
+                            crate::daemon::events::MouseEventKind::Moved => Some((
+                                *timestamp,
+                                data.position.clone(),
+                                MouseTrajectoryType::Movement,
+                            )),
+                            crate::daemon::events::MouseEventKind::Dragged => {
+                                Some((*timestamp, data.position.clone(), MouseTrajectoryType::Drag))
+                            }
+                            _ => None,
+                        }
                     } else {
                         None
                     }

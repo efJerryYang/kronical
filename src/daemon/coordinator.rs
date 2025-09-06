@@ -3,7 +3,9 @@ use crate::daemon::duckdb_system_tracker::DuckDbSystemTracker;
 use crate::daemon::events::adapter::EventAdapter;
 use crate::daemon::events::deriver::{LockDeriver, StateDeriver};
 use crate::daemon::events::model::{EventKind, EventPayload, SignalKind};
-use crate::daemon::events::{KeyboardEventData, MouseEventData, MousePosition, WindowFocusInfo};
+use crate::daemon::events::{
+    KeyboardEventData, MouseEventData, MouseEventKind, MousePosition, WindowFocusInfo,
+};
 use crate::daemon::focus_tracker::{FocusCacheCaps, FocusChangeCallback, FocusEventWrapper};
 use crate::daemon::records::{ActivityRecord, aggregate_activities_since};
 use crate::storage::StorageBackend;
@@ -44,8 +46,25 @@ fn pretty_format_duration(seconds: u64) -> String {
 #[derive(Debug, Clone)]
 pub enum KronicalEvent {
     KeyboardInput,
-    MouseInput,
-    WindowFocusChange { focus_info: WindowFocusInfo },
+    MouseInput {
+        x: i32,
+        y: i32,
+        button: Option<String>,
+        clicks: u16,
+        kind: MouseEventKind,
+    },
+    MouseWheel {
+        clicks: u16,
+        x: i32,
+        y: i32,
+        type_: u8,
+        amount: u16,
+        rotation: i16,
+        direction: u8,
+    },
+    WindowFocusChange {
+        focus_info: WindowFocusInfo,
+    },
     Shutdown,
 }
 
@@ -103,13 +122,40 @@ impl EventHandler for KronicalEventHandler {
                 trace!("Keyboard event detected");
                 KronicalEvent::KeyboardInput
             }
-            UiohookEvent::Mouse(_) => {
+            UiohookEvent::Mouse(m) => {
+                use uiohook_rs::hook::mouse::MouseEventType as VMouseEventType;
                 trace!("Mouse event detected");
-                KronicalEvent::MouseInput
+                let kind = match m.event_type {
+                    VMouseEventType::Moved => MouseEventKind::Moved,
+                    VMouseEventType::Pressed => MouseEventKind::Pressed,
+                    VMouseEventType::Released => MouseEventKind::Released,
+                    VMouseEventType::Clicked => MouseEventKind::Clicked,
+                    VMouseEventType::Dragged => MouseEventKind::Dragged,
+                };
+                // Map button; treat NoButton as None
+                let button_str = match format!("{:?}", m.button).as_str() {
+                    "NoButton" => None,
+                    other => Some(other.to_string()),
+                };
+                KronicalEvent::MouseInput {
+                    x: m.x as i32,
+                    y: m.y as i32,
+                    button: button_str,
+                    clicks: m.clicks,
+                    kind,
+                }
             }
-            UiohookEvent::Wheel(_) => {
+            UiohookEvent::Wheel(w) => {
                 trace!("Wheel event detected");
-                KronicalEvent::MouseInput
+                KronicalEvent::MouseWheel {
+                    clicks: w.clicks,
+                    x: w.x as i32,
+                    y: w.y as i32,
+                    type_: w.type_,
+                    amount: w.amount,
+                    rotation: w.rotation,
+                    direction: w.direction,
+                }
             }
             UiohookEvent::HookEnabled => {
                 debug!("UIohook enabled");
@@ -226,16 +272,59 @@ impl EventCoordinator {
                     modifiers: Vec::new(),
                 },
             }),
-            KronicalEvent::MouseInput => Ok(RawEvent::MouseInput {
+            KronicalEvent::MouseInput {
+                x,
+                y,
+                button,
+                clicks,
+                kind,
+            } => Ok(RawEvent::MouseInput {
                 timestamp: now,
                 event_id,
                 data: MouseEventData {
-                    position: MousePosition { x: 0, y: 0 },
-                    button: None,
-                    click_count: None,
-                    wheel_delta: None,
+                    position: MousePosition { x, y },
+                    button,
+                    click_count: if clicks > 0 { Some(clicks) } else { None },
+                    event_type: Some(kind),
+                    wheel_amount: None,
+                    wheel_rotation: None,
+                    wheel_axis: None,
                 },
             }),
+            KronicalEvent::MouseWheel {
+                clicks,
+                x,
+                y,
+                type_: _,
+                amount,
+                rotation,
+                direction,
+            } => {
+                use crate::daemon::events::WheelAxis;
+                use uiohook_rs::hook::wheel::{
+                    WHEEL_HORIZONTAL_DIRECTION, WHEEL_VERTICAL_DIRECTION,
+                };
+                let axis = if direction == WHEEL_VERTICAL_DIRECTION {
+                    Some(WheelAxis::Vertical)
+                } else if direction == WHEEL_HORIZONTAL_DIRECTION {
+                    Some(WheelAxis::Horizontal)
+                } else {
+                    None
+                };
+                Ok(RawEvent::MouseInput {
+                    timestamp: now,
+                    event_id,
+                    data: MouseEventData {
+                        position: MousePosition { x, y },
+                        button: None,
+                        click_count: Some(clicks as u16),
+                        event_type: None,
+                        wheel_amount: Some(amount as i32),
+                        wheel_rotation: Some(rotation as i32),
+                        wheel_axis: axis,
+                    },
+                })
+            }
             KronicalEvent::WindowFocusChange { focus_info } => Ok(RawEvent::WindowFocusChange {
                 timestamp: now,
                 event_id,
