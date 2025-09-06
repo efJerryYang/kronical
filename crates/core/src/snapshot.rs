@@ -1,5 +1,5 @@
-use crate::daemon::events::WindowFocusInfo;
-use crate::daemon::records::ActivityState;
+use crate::events::WindowFocusInfo;
+use crate::records::ActivityState;
 use once_cell::sync::{Lazy, OnceCell};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -143,10 +143,6 @@ pub struct ConfigSummary {
     pub ephemeral_app_max_duration_secs: u64,
     pub ephemeral_app_min_distinct_procs: usize,
 }
-
-// CountsSummary removed; use Counts directly where needed
-
-// Replay info removed
 
 pub fn get_current() -> Arc<Snapshot> {
     if let Ok(guard) = SNAPSHOT.read() {

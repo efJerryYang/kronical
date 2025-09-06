@@ -1,4 +1,0 @@
-// Signals drive state transitions only.
-// For now, re-export existing definitions from model to keep changes minimal.
-
-pub use crate::daemon::events::model::SignalKind;

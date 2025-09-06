@@ -1965,6 +1965,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "kronical-common",
+ "kronical-core",
  "kronical-rpc",
  "libc",
  "log",
@@ -1997,6 +1998,17 @@ dependencies = [
  "config",
  "dirs",
  "serde",
+]
+
+[[package]]
+name = "kronical-core"
+version = "0.1.0"
+dependencies = [
+ "chrono",
+ "kronical-common",
+ "once_cell",
+ "serde",
+ "tokio",
 ]
 
 [[package]]

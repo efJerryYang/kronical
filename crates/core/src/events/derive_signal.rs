@@ -1,6 +1,4 @@
-use crate::daemon::events::model::{
-    EventEnvelope, EventKind, EventPayload, EventSource, SignalKind,
-};
+use crate::events::model::{EventEnvelope, EventKind, EventPayload, EventSource, SignalKind};
 
 pub struct LockDeriver {
     locked: bool,
@@ -14,11 +12,9 @@ impl LockDeriver {
     pub fn derive(&mut self, input: &[EventEnvelope]) -> Vec<EventEnvelope> {
         let mut out = Vec::with_capacity(input.len());
         for e in input.iter() {
-            let mut _emitted_lock = false;
             if let EventKind::Signal(kind) = &e.kind {
                 match kind {
                     SignalKind::AppChanged | SignalKind::WindowChanged => {
-                        // Determine app name via Focus payload if present
                         let is_login = match &e.payload {
                             EventPayload::Focus(fi) => {
                                 fi.app_name.eq_ignore_ascii_case("loginwindow")
@@ -26,7 +22,6 @@ impl LockDeriver {
                             _ => false,
                         };
                         if is_login && !self.locked {
-                            // Emit LockStart before the original signal
                             out.push(EventEnvelope {
                                 id: e.id,
                                 timestamp: e.timestamp,
@@ -40,9 +35,7 @@ impl LockDeriver {
                                 sensitive: false,
                             });
                             self.locked = true;
-                            _emitted_lock = true;
                         } else if self.locked && !is_login {
-                            // Emit LockEnd before leaving loginwindow
                             out.push(EventEnvelope {
                                 id: e.id,
                                 timestamp: e.timestamp,
@@ -56,13 +49,11 @@ impl LockDeriver {
                                 sensitive: false,
                             });
                             self.locked = false;
-                            _emitted_lock = true;
                         }
                     }
                     _ => {}
                 }
             }
-            // push the original after any derived lock boundary
             out.push(e.clone());
         }
         out

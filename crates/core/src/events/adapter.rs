@@ -1,9 +1,9 @@
 use chrono::{DateTime, Utc};
 
-use crate::daemon::events::model::{
+use crate::events::model::{
     EventEnvelope, EventKind, EventPayload, EventSource, HintKind, SignalKind,
 };
-use crate::daemon::events::{RawEvent, WindowFocusInfo};
+use crate::events::{RawEvent, WindowFocusInfo};
 
 pub struct EventAdapter {
     last_focus: Option<WindowFocusInfo>,

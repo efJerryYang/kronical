@@ -1,8 +1,8 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::daemon::events::{KeyboardEventData, MouseEventData, WindowFocusInfo};
-use crate::daemon::records::ActivityState;
+use crate::events::{KeyboardEventData, MouseEventData, WindowFocusInfo};
+use crate::records::ActivityState;
 
 // Event provenance
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -158,7 +158,7 @@ impl DefaultStateEngine {
     }
     fn compute(&self, now: DateTime<Utc>) -> ActivityState {
         if self.locked {
-            ActivityState::Inactive // Locked handled via explicit Lock state transitions outside compute
+            ActivityState::Inactive
         } else {
             let dt = (now - self.last_signal_time).num_seconds();
             if dt <= self.active_grace_secs {
@@ -182,7 +182,7 @@ impl StateEngine for DefaultStateEngine {
             EventKind::Signal(SignalKind::LockStart) => {
                 self.locked = true;
                 let from = self.current;
-                self.current = ActivityState::Inactive; // we’ll map this to Locked in the record layer
+                self.current = ActivityState::Inactive;
                 return Some(StateTransition {
                     from,
                     to: self.current,
@@ -190,7 +190,6 @@ impl StateEngine for DefaultStateEngine {
             }
             EventKind::Signal(SignalKind::LockEnd) => {
                 self.locked = false;
-                // Don’t update last_signal_time here; next app change will
                 let from = self.current;
                 let to = self.compute(now);
                 self.current = to;
