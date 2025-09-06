@@ -32,3 +32,10 @@ pub fn set_system_tracker_query_tx(
 ) {
     crate::daemon::server::grpc::set_system_tracker_query_tx(tx)
 }
+
+/// Re-export helper to set the system tracker control channel for the gRPC API.
+pub fn set_system_tracker_control_tx(
+    tx: std::sync::mpsc::Sender<crate::daemon::tracker::ControlMsg>,
+) {
+    crate::daemon::server::grpc::set_system_tracker_control_tx(tx)
+}

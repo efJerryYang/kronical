@@ -2,8 +2,8 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tracing::info;
 
@@ -46,30 +46,34 @@ pub struct DuckDbSystemTracker {
     interval: Duration,
     batch_size: usize,
     db_path: PathBuf,
-    running: Arc<Mutex<bool>>,
-    flush_signal_path: PathBuf,
+    started: AtomicBool,
+    control_tx: Option<mpsc::Sender<ControlMsg>>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ControlMsg {
+    Stop,
+    /// Request an immediate flush of buffered samples. The tracker will
+    /// capture the current iteration's sample then persist all buffered rows
+    /// and acknowledge via the provided channel.
+    Flush(mpsc::Sender<()>),
 }
 
 impl DuckDbSystemTracker {
     pub fn new(pid: u32, interval_secs: f64, batch_size: usize, db_path: PathBuf) -> Self {
-        let flush_signal_path = db_path.with_file_name("tracker-flush-signal");
         Self {
             pid,
             interval: Duration::from_secs_f64(interval_secs),
             batch_size,
             db_path,
-            running: Arc::new(Mutex::new(false)),
-            flush_signal_path,
+            started: AtomicBool::new(false),
+            control_tx: None,
         }
     }
 
-    pub fn start(&self) -> Result<()> {
-        {
-            let mut running = self.running.lock().unwrap();
-            if *running {
-                return Err(anyhow::anyhow!("DuckDB system tracker is already running"));
-            }
-            *running = true;
+    pub fn start(&mut self) -> Result<()> {
+        if self.started.swap(true, Ordering::SeqCst) {
+            return Err(anyhow::anyhow!("DuckDB system tracker is already running"));
         }
 
         info!(
@@ -81,8 +85,10 @@ impl DuckDbSystemTracker {
         let interval = self.interval;
         let batch_size = self.batch_size;
         let db_path = self.db_path.clone();
-        let flush_signal_path = self.flush_signal_path.clone();
-        let running = Arc::clone(&self.running);
+        let (control_tx, control_rx) = mpsc::channel::<ControlMsg>();
+        self.control_tx = Some(control_tx.clone());
+        // Expose control channel to APIs (e.g., gRPC) so they can request a flush.
+        crate::daemon::api::set_system_tracker_control_tx(control_tx.clone());
 
         // Create the DuckDB store instance once within this thread.
         // Also set up a query channel so the gRPC server can ask this
@@ -116,10 +122,41 @@ impl DuckDbSystemTracker {
                     }
                 };
 
-            while *running.lock().unwrap() {
-                // Detect flush request and defer removing the signal until after we
-                // have also captured this iteration's sample, so the caller sees it.
-                let flush_requested = flush_signal_path.exists();
+            // Try to capture an initial sample so early flushes have data.
+            if let Ok((cpu_percent, memory_bytes, disk_io_delta, current_total_disk_io)) =
+                collect_system_metrics(pid, last_disk_io)
+            {
+                last_disk_io = current_total_disk_io;
+                metrics_buffer.push(SystemMetrics {
+                    timestamp: Utc::now(),
+                    cpu_percent,
+                    memory_bytes,
+                    disk_io_bytes: disk_io_delta,
+                });
+                batch_count += 1;
+            }
+
+            let mut running = true;
+            // When a Flush control message is received, we defer the actual flush
+            // until after capturing the current sample to mimic prior semantics.
+            let mut pending_flush_acks: Vec<mpsc::Sender<()>> = Vec::new();
+            while running {
+                // Drain any pending control messages (non-blocking)
+                loop {
+                    match control_rx.try_recv() {
+                        Ok(ControlMsg::Stop) => {
+                            running = false;
+                        }
+                        Ok(ControlMsg::Flush(ack_tx)) => {
+                            pending_flush_acks.push(ack_tx);
+                        }
+                        Err(mpsc::TryRecvError::Empty) => break,
+                        Err(mpsc::TryRecvError::Disconnected) => {
+                            running = false;
+                            break;
+                        }
+                    }
+                }
 
                 let start_time = std::time::Instant::now();
 
@@ -149,25 +186,29 @@ impl DuckDbSystemTracker {
                             }
                         }
 
-                        if flush_requested {
+                        if !pending_flush_acks.is_empty() {
                             tracing::info!(
-                                "Tracker flush requested (normal path); flushing {} buffered samples",
+                                "Tracker flush requested; flushing {} buffered samples",
                                 metrics_buffer.len()
                             );
                             flush_buffer(&mut metrics_buffer, &mut store);
-                            let _ = std::fs::remove_file(&flush_signal_path);
+                            for ack in pending_flush_acks.drain(..) {
+                                let _ = ack.send(());
+                            }
                         }
                     }
                     Err(e) => {
                         tracing::warn!("Failed to collect system metrics: {}", e);
                         // Even if collection failed, honor a pending flush to persist any buffered samples
-                        if flush_requested {
+                        if !pending_flush_acks.is_empty() {
                             tracing::info!(
                                 "Tracker flush requested (error path); flushing {} buffered samples",
                                 metrics_buffer.len()
                             );
                             flush_buffer(&mut metrics_buffer, &mut store);
-                            let _ = std::fs::remove_file(&flush_signal_path);
+                            for ack in pending_flush_acks.drain(..) {
+                                let _ = ack.send(());
+                            }
                         }
                     }
                 }
@@ -176,6 +217,8 @@ impl DuckDbSystemTracker {
                 loop {
                     match query_rx.try_recv() {
                         Ok(req) => {
+                            // Ensure freshest view by flushing any buffered samples
+                            flush_buffer(&mut metrics_buffer, &mut store);
                             let result = match req.query {
                                 MetricsQuery::ByLimit { pid, limit } => {
                                     let mut rows = match store.get_metrics_for_pid(pid, Some(limit))
@@ -203,6 +246,8 @@ impl DuckDbSystemTracker {
                     }
                 }
 
+                // Note: control messages are drained at the start of each loop
+
                 let elapsed = start_time.elapsed();
                 if elapsed < interval {
                     thread::sleep(interval - elapsed);
@@ -221,35 +266,34 @@ impl DuckDbSystemTracker {
         Ok(())
     }
 
-    pub fn stop(&self) -> Result<()> {
-        {
-            let mut running = self.running.lock().unwrap();
-            if !*running {
-                return Err(anyhow::anyhow!("DuckDB system tracker is not running"));
-            }
-            *running = false;
+    pub fn stop(&mut self) -> Result<()> {
+        if !self.started.swap(false, Ordering::SeqCst) {
+            return Err(anyhow::anyhow!("DuckDB system tracker is not running"));
         }
-
+        if let Some(tx) = &self.control_tx {
+            let _ = tx.send(ControlMsg::Stop);
+        }
         info!("DuckDB system tracker stop requested");
         Ok(())
     }
 
     pub fn is_running(&self) -> bool {
-        *self.running.lock().unwrap()
+        self.started.load(Ordering::SeqCst)
     }
 
     pub fn flush(&self) -> Result<()> {
-        std::fs::write(&self.flush_signal_path, "")
-            .map_err(|e| anyhow::anyhow!("Failed to create flush signal file: {}", e))?;
+        let tx = self
+            .control_tx
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("Tracker control channel not available"))?;
+        let (ack_tx, ack_rx) = mpsc::channel();
+        tx.send(ControlMsg::Flush(ack_tx))
+            .map_err(|_| anyhow::anyhow!("Failed to send flush control message"))?;
+        let _ = ack_rx
+            .recv_timeout(std::time::Duration::from_millis(2000))
+            .map_err(|_| anyhow::anyhow!("Timed out waiting for tracker flush ack"))?;
         Ok(())
     }
-}
-
-pub fn trigger_tracker_flush(workspace_dir: &PathBuf) -> Result<()> {
-    let flush_signal_path = workspace_dir.join("tracker-flush-signal");
-    std::fs::write(&flush_signal_path, "")
-        .map_err(|e| anyhow::anyhow!("Failed to create flush signal file: {}", e))?;
-    Ok(())
 }
 
 fn collect_system_metrics(pid: u32, last_disk_io: u64) -> Result<(f64, u64, u64, u64)> {
@@ -761,7 +805,7 @@ mod tests {
         let temp_dir = tempdir()?;
         let db_path = temp_dir.path().join("tracker_test.duckdb");
 
-        let tracker = DuckDbSystemTracker::new(1234, 1.0, 10, db_path.clone());
+        let mut tracker = DuckDbSystemTracker::new(1234, 1.0, 10, db_path.clone());
 
         assert!(!tracker.is_running());
 

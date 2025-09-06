@@ -217,7 +217,7 @@ fn main() {
     );
 
     info!("Kronical daemon will run on MAIN THREAD (required by macOS hooks)");
-    let result = coordinator.start_main_thread(data_store, pid_file.clone());
+    let result = coordinator.start_main_thread(data_store, config.workspace_dir.clone());
 
     cleanup_pid_file(&pid_file);
 

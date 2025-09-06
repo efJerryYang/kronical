@@ -1,10 +1,10 @@
 use crate::events::WindowFocusInfo;
 use crate::records::ActivityState;
-use once_cell::sync::{Lazy, OnceCell};
+use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::{
-    Arc, RwLock,
+    Arc,
     atomic::{AtomicU64, Ordering},
 };
 use tokio::sync::watch;
@@ -64,10 +64,22 @@ impl Snapshot {
 }
 
 pub static SNAPSHOT_SEQ: AtomicU64 = AtomicU64::new(0);
-pub static SNAPSHOT: Lazy<RwLock<Arc<Snapshot>>> =
-    Lazy::new(|| RwLock::new(Arc::new(Snapshot::empty())));
-static HEALTH_BUF: Lazy<RwLock<VecDeque<String>>> =
-    Lazy::new(|| RwLock::new(VecDeque::with_capacity(64)));
+// Channel-first health buffer: maintain the last 64 messages via a watch channel.
+// Avoids RwLock by cloning/modifying the current buffer and re-sending.
+static HEALTH_WATCH: OnceCell<(
+    watch::Sender<VecDeque<String>>,
+    watch::Receiver<VecDeque<String>>,
+)> = OnceCell::new();
+
+fn init_health_watch() -> &'static (
+    watch::Sender<VecDeque<String>>,
+    watch::Receiver<VecDeque<String>>,
+) {
+    HEALTH_WATCH.get_or_init(|| {
+        let initial: VecDeque<String> = VecDeque::with_capacity(64);
+        watch::channel(initial)
+    })
+}
 
 // Optional live snapshot watch channel
 static SNAP_WATCH: OnceCell<(watch::Sender<Arc<Snapshot>>, watch::Receiver<Arc<Snapshot>>)> =
@@ -76,8 +88,8 @@ static SNAP_WATCH: OnceCell<(watch::Sender<Arc<Snapshot>>, watch::Receiver<Arc<S
 fn init_snapshot_watch() -> &'static (watch::Sender<Arc<Snapshot>>, watch::Receiver<Arc<Snapshot>>)
 {
     SNAP_WATCH.get_or_init(|| {
-        // Initialize with current snapshot value
-        let initial = get_current();
+        // Initialize with an empty snapshot value and update over time
+        let initial = Arc::new(Snapshot::empty());
         watch::channel(initial)
     })
 }
@@ -120,9 +132,6 @@ pub fn publish_basic(
         aggregated_apps,
     };
     let arc = Arc::new(snap);
-    if let Ok(mut guard) = SNAPSHOT.write() {
-        *guard = arc.clone();
-    }
     let (tx, _rx) = init_snapshot_watch();
     let _ = tx.send(arc);
 }
@@ -145,11 +154,8 @@ pub struct ConfigSummary {
 }
 
 pub fn get_current() -> Arc<Snapshot> {
-    if let Ok(guard) = SNAPSHOT.read() {
-        guard.clone()
-    } else {
-        Arc::new(Snapshot::empty())
-    }
+    let (_tx, rx) = init_snapshot_watch();
+    rx.borrow().clone()
 }
 
 pub fn watch_snapshot() -> watch::Receiver<Arc<Snapshot>> {
@@ -159,20 +165,18 @@ pub fn watch_snapshot() -> watch::Receiver<Arc<Snapshot>> {
 
 pub fn push_health(msg: impl Into<String>) {
     let s = msg.into();
-    if let Ok(mut q) = HEALTH_BUF.write() {
-        if q.len() >= 64 {
-            q.pop_front();
-        }
-        q.push_back(s);
+    let (tx, rx) = init_health_watch();
+    let mut buf = rx.borrow().clone();
+    if buf.len() >= 64 {
+        let _ = buf.pop_front();
     }
+    buf.push_back(s);
+    let _ = tx.send(buf);
 }
 
 pub fn current_health() -> Vec<String> {
-    if let Ok(q) = HEALTH_BUF.read() {
-        q.iter().cloned().collect()
-    } else {
-        Vec::new()
-    }
+    let (_tx, rx) = init_health_watch();
+    rx.borrow().iter().cloned().collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

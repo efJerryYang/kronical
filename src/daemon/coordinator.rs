@@ -337,38 +337,26 @@ impl EventCoordinator {
         }
     }
 
-    // TODO: the pid file should not be passed here, we should have a constant rust file. and we can then get the workspace directory from there too
     pub fn start_main_thread(
         &self,
         data_store: Box<dyn StorageBackend>,
-        pid_file: std::path::PathBuf,
+        workspace_dir: std::path::PathBuf,
     ) -> Result<()> {
         info!("Step A: Starting Kronical on MAIN THREAD (required for hooks)");
 
         let (sender, receiver) = mpsc::channel();
 
         // Start API servers (gRPC + HTTP/SSE) via unified API facade.
-        let workspace_dir = match pid_file.parent() {
-            Some(dir) => dir,
-            None => {
-                error!(
-                    "PID file has no parent; cannot derive workspace dir. Skipping API startup."
-                );
-                return Err(anyhow::anyhow!(
-                    "invalid PID file path; missing parent directory"
-                ));
-            }
-        };
-        let uds_grpc = crate::util::paths::grpc_uds(workspace_dir);
-        let uds_http = crate::util::paths::http_uds(workspace_dir);
+        let uds_grpc = crate::util::paths::grpc_uds(&workspace_dir);
+        let uds_http = crate::util::paths::http_uds(&workspace_dir);
         if let Err(e) = crate::daemon::api::spawn_all(uds_grpc, uds_http) {
             error!("Failed to start API servers: {}", e);
         }
 
         if self.tracker_enabled {
             let current_pid = std::process::id();
-            let tracker_db_path = crate::util::paths::tracker_db(workspace_dir);
-            let tracker = DuckDbSystemTracker::new(
+            let tracker_db_path = crate::util::paths::tracker_db(&workspace_dir);
+            let mut tracker = DuckDbSystemTracker::new(
                 current_pid,
                 self.tracker_interval_secs,
                 self.tracker_batch_size,
@@ -1219,7 +1207,6 @@ impl EventCoordinator {
         };
 
         let shutdown_sender = sender.clone();
-        let pid_file_cleanup = pid_file.clone();
         ctrlc::set_handler(move || {
             info!("Step S: Ctrl+C received, sending shutdown signal");
             if let Err(e) = shutdown_sender.send(KronicalEvent::Shutdown) {
@@ -1230,9 +1217,6 @@ impl EventCoordinator {
             if let Err(e) = winshift::stop_hook() {
                 error!("Step S: Failed to stop winshift: {}", e);
             }
-
-            info!("Step S: Cleaning up PID file");
-            let _ = std::fs::remove_file(&pid_file_cleanup);
         })?;
 
         // poll_handle_arc already created earlier; reuse it for the handler
@@ -1281,27 +1265,23 @@ impl EventCoordinator {
         }
 
         info!("Step C: Cleaning up socket files");
-        if let Some(socket_dir) = pid_file.parent() {
-            let grpc_sock = socket_dir.join("kroni.sock");
-            let http_sock = socket_dir.join("kroni.http.sock");
+        let grpc_sock = crate::util::paths::grpc_uds(&workspace_dir);
+        let http_sock = crate::util::paths::http_uds(&workspace_dir);
 
-            if grpc_sock.exists() {
-                if let Err(e) = std::fs::remove_file(&grpc_sock) {
-                    error!("Failed to remove gRPC socket: {}", e);
-                } else {
-                    info!("Removed gRPC socket file");
-                }
+        if grpc_sock.exists() {
+            if let Err(e) = std::fs::remove_file(&grpc_sock) {
+                error!("Failed to remove gRPC socket: {}", e);
+            } else {
+                info!("Removed gRPC socket file");
             }
+        }
 
-            if http_sock.exists() {
-                if let Err(e) = std::fs::remove_file(&http_sock) {
-                    error!("Failed to remove HTTP socket: {}", e);
-                } else {
-                    info!("Removed HTTP socket file");
-                }
+        if http_sock.exists() {
+            if let Err(e) = std::fs::remove_file(&http_sock) {
+                error!("Failed to remove HTTP socket: {}", e);
+            } else {
+                info!("Removed HTTP socket file");
             }
-        } else {
-            error!("PID file has no parent; skipping socket cleanup");
         }
 
         info!("Step C: Kronical shutdown complete");
