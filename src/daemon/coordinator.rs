@@ -669,11 +669,11 @@ impl EventCoordinator {
                                     }
 
                                     counts.hints_seen += 1;
-                                    if let EventPayload::State { from, to } = &env.payload {
+                                    if let EventPayload::State { from, to } = env.payload.clone() {
                                         last_transition =
                                             Some(crate::daemon::snapshot::Transition {
-                                                from: *from,
-                                                to: *to,
+                                                from,
+                                                to,
                                                 at: env.timestamp,
                                             });
                                     }
@@ -691,11 +691,12 @@ impl EventCoordinator {
                                         }
 
                                         counts.hints_seen += 1;
-                                        if let EventPayload::State { from, to } = &h.payload {
+                                        if let EventPayload::State { from, to } = h.payload.clone()
+                                        {
                                             last_transition =
                                                 Some(crate::daemon::snapshot::Transition {
-                                                    from: *from,
-                                                    to: *to,
+                                                    from,
+                                                    to,
                                                     at: h.timestamp,
                                                 });
                                         }
