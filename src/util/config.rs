@@ -3,9 +3,17 @@ use config::{Config, Environment, File};
 use serde::Deserialize;
 use std::path::PathBuf;
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DatabaseBackendConfig {
+    Duckdb,
+    Sqlite3,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
     pub workspace_dir: PathBuf,
+    pub db_backend: DatabaseBackendConfig,
     pub retention_minutes: u64,
     pub active_grace_secs: u64,
     pub idle_threshold_secs: u64,
@@ -34,6 +42,7 @@ impl Default for AppConfig {
 
         Self {
             workspace_dir,
+            db_backend: DatabaseBackendConfig::Duckdb,
             retention_minutes: 72 * 60,
             active_grace_secs: 30,
             idle_threshold_secs: 300,
@@ -61,6 +70,7 @@ impl AppConfig {
 
         let mut builder = Config::builder()
             .set_default("workspace_dir", workspace_dir.to_str().unwrap())?
+            .set_default("db_backend", "duckdb")?
             .set_default("retention_minutes", 72 * 60)?
             .set_default("active_grace_secs", 30)?
             .set_default("idle_threshold_secs", 300)?

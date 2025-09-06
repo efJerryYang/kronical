@@ -745,7 +745,7 @@ impl EventCoordinator {
                                         chrono::Utc::now()
                                             + chrono::Duration::milliseconds(ms as i64),
                                     );
-                                    let sm = crate::storage::sqlite3::storage_metrics();
+                                    let sm = crate::storage::storage_metrics();
                                     crate::daemon::snapshot::publish_basic(
                                         record_builder.current_state(),
                                         record_builder.current_focus(),
@@ -979,7 +979,7 @@ impl EventCoordinator {
                                         chrono::Utc::now()
                                             + chrono::Duration::milliseconds(ms as i64),
                                     );
-                                    let sm = crate::storage::sqlite3::storage_metrics();
+                                    let sm = crate::storage::storage_metrics();
                                     crate::daemon::snapshot::publish_basic(
                                         record_builder.current_state(),
                                         record_builder.current_focus(),
@@ -1087,7 +1087,7 @@ impl EventCoordinator {
                             let next_timeout = Some(
                                 chrono::Utc::now() + chrono::Duration::milliseconds(ms as i64),
                             );
-                            let sm = crate::storage::sqlite3::storage_metrics();
+                            let sm = crate::storage::storage_metrics();
                             crate::daemon::snapshot::publish_basic(
                                 record_builder.current_state(),
                                 record_builder.current_focus(),
@@ -1157,7 +1157,7 @@ impl EventCoordinator {
                         };
                         let next_timeout =
                             Some(chrono::Utc::now() + chrono::Duration::milliseconds(ms as i64));
-                        let sm = crate::storage::sqlite3::storage_metrics();
+                        let sm = crate::storage::storage_metrics();
                         crate::daemon::snapshot::publish_basic(
                             record_builder.current_state(),
                             record_builder.current_focus(),
