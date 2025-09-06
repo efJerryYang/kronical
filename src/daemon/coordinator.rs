@@ -290,15 +290,11 @@ impl EventCoordinator {
                     current_pid
                 );
 
-                {
-                    crate::daemon::kroni_server::set_system_tracker_db_path(
-                        tracker_db_path.clone(),
-                    );
-                    info!(
-                        "System tracker DB path set for gRPC API: {:?}",
-                        tracker_db_path
-                    );
-                }
+                crate::daemon::kroni_server::set_system_tracker_db_path(tracker_db_path.clone());
+                info!(
+                    "System tracker DB path set for gRPC API: {:?}",
+                    tracker_db_path
+                );
             }
         }
 
@@ -581,20 +577,18 @@ impl EventCoordinator {
                                         recent_records.push_back(rec);
                                     }
 
+                                    counts.hints_seen += 1;
+                                    if let crate::daemon::event_model::EventPayload::State {
+                                        from,
+                                        to,
+                                    } = &env.payload
                                     {
-                                        counts.hints_seen += 1;
-                                        if let crate::daemon::event_model::EventPayload::State {
-                                            from,
-                                            to,
-                                        } = &env.payload
-                                        {
-                                            last_transition =
-                                                Some(crate::daemon::snapshot::Transition {
-                                                    from: *from,
-                                                    to: *to,
-                                                    at: env.timestamp,
-                                                });
-                                        }
+                                        last_transition =
+                                            Some(crate::daemon::snapshot::Transition {
+                                                from: *from,
+                                                to: *to,
+                                                at: env.timestamp,
+                                            });
                                     }
                                 }
                                 for env in envelopes_with_lock.iter().filter(|e| {
@@ -603,9 +597,7 @@ impl EventCoordinator {
                                         crate::daemon::event_model::EventKind::Signal(_)
                                     )
                                 }) {
-                                    {
-                                        counts.signals_seen += 1;
-                                    }
+                                    counts.signals_seen += 1;
                                     if let Some(h) = state_deriver.on_signal(env) {
                                         let _ = store.add_envelopes(vec![h.clone()]);
                                         if let Some(rec) = record_builder.on_hint(&h) {
@@ -613,11 +605,18 @@ impl EventCoordinator {
                                             recent_records.push_back(rec);
                                         }
 
+                                        counts.hints_seen += 1;
+                                        if let crate::daemon::event_model::EventPayload::State {
+                                            from,
+                                            to,
+                                        } = &h.payload
                                         {
-                                            counts.hints_seen += 1;
-                                            if let crate::daemon::event_model::EventPayload::State { from, to } = &h.payload {
-                                                last_transition = Some(crate::daemon::snapshot::Transition { from: *from, to: *to, at: h.timestamp });
-                                            }
+                                            last_transition =
+                                                Some(crate::daemon::snapshot::Transition {
+                                                    from: *from,
+                                                    to: *to,
+                                                    at: h.timestamp,
+                                                });
                                         }
                                     }
                                 }
@@ -735,20 +734,18 @@ impl EventCoordinator {
                                         new_records.push(rec);
                                     }
 
+                                    counts.hints_seen += 1;
+                                    if let crate::daemon::event_model::EventPayload::State {
+                                        from,
+                                        to,
+                                    } = &env.payload
                                     {
-                                        counts.hints_seen += 1;
-                                        if let crate::daemon::event_model::EventPayload::State {
-                                            from,
-                                            to,
-                                        } = &env.payload
-                                        {
-                                            last_transition =
-                                                Some(crate::daemon::snapshot::Transition {
-                                                    from: *from,
-                                                    to: *to,
-                                                    at: env.timestamp,
-                                                });
-                                        }
+                                        last_transition =
+                                            Some(crate::daemon::snapshot::Transition {
+                                                from: *from,
+                                                to: *to,
+                                                at: env.timestamp,
+                                            });
                                     }
                                 }
                                 // Then signals (which may derive state-change hints)
@@ -758,9 +755,7 @@ impl EventCoordinator {
                                         crate::daemon::event_model::EventKind::Signal(_)
                                     )
                                 }) {
-                                    {
-                                        counts.signals_seen += 1;
-                                    }
+                                    counts.signals_seen += 1;
                                     if let Some(h) = state_deriver.on_signal(env) {
                                         if let Err(e) = store.add_envelopes(vec![h.clone()]) {
                                             error!("Failed to store derived state hint: {}", e);
@@ -773,11 +768,18 @@ impl EventCoordinator {
                                             new_records.push(rec);
                                         }
 
+                                        counts.hints_seen += 1;
+                                        if let crate::daemon::event_model::EventPayload::State {
+                                            from,
+                                            to,
+                                        } = &h.payload
                                         {
-                                            counts.hints_seen += 1;
-                                            if let crate::daemon::event_model::EventPayload::State { from, to } = &h.payload {
-                                                last_transition = Some(crate::daemon::snapshot::Transition { from: *from, to: *to, at: h.timestamp });
-                                            }
+                                            last_transition =
+                                                Some(crate::daemon::snapshot::Transition {
+                                                    from: *from,
+                                                    to: *to,
+                                                    at: h.timestamp,
+                                                });
                                         }
                                     }
                                 }
@@ -808,9 +810,7 @@ impl EventCoordinator {
                                     for r in new_records.into_iter() {
                                         recent_records.push_back(r);
 
-                                        {
-                                            counts.records_emitted += 1;
-                                        }
+                                        counts.records_emitted += 1;
                                     }
                                 }
 
@@ -1138,11 +1138,9 @@ impl EventCoordinator {
                 error!("Step S: Failed to send shutdown: {}", e);
             }
 
-            {
-                info!("Step S: Stopping winshift hook");
-                if let Err(e) = winshift::stop_hook() {
-                    error!("Step S: Failed to stop winshift: {}", e);
-                }
+            info!("Step S: Stopping winshift hook");
+            if let Err(e) = winshift::stop_hook() {
+                error!("Step S: Failed to stop winshift: {}", e);
             }
 
             info!("Step S: Cleaning up PID file");

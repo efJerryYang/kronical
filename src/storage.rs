@@ -1,5 +1,4 @@
 use crate::daemon::compression::CompactEvent;
-// EventEnvelope already imported above
 use crate::daemon::event_model::EventEnvelope;
 use crate::daemon::events::RawEvent;
 use crate::daemon::records::ActivityRecord;
