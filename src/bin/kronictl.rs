@@ -459,104 +459,95 @@ fn run_monitor_loop<B: Backend>(terminal: &mut Terminal<B>, data_file: PathBuf) 
                                                     "  └── "
                                                 };
 
-                                                let left_main = format!(
-                                                    "<#{}> {}{}",
-                                                    win.window_id,
-                                                    win.window_title,
-                                                    if win.is_group { " [group]" } else { "" },
-                                                );
-                                                // Right info shown as: "{duration} • since {time}"
+                                                // Right info as rendered: "{duration} • since {time}"
                                                 let right_info = format!(
                                                     "{} • since {}",
                                                     dur_pretty, local_first
                                                 );
-
-                                                // Use display width (CJK wide = 2, latin = 1) for alignment
-                                                let visible_left = UnicodeWidthStr::width(prefix)
-                                                    + UnicodeWidthStr::width(left_main.as_str());
                                                 let visible_right =
                                                     UnicodeWidthStr::width(right_info.as_str());
 
-                                                // Truncate title if needed to fit
-                                                let mut left_trunc = left_main.clone();
-                                                if visible_left + visible_right > width {
-                                                    let budget = width.saturating_sub(
-                                                        UnicodeWidthStr::width(prefix)
-                                                            + visible_right
-                                                            + 2,
-                                                    ); // space after id before title
-                                                    let id_part = format!("<#{}> ", win.window_id);
-                                                    let remain = budget.saturating_sub(
-                                                        UnicodeWidthStr::width(id_part.as_str()),
-                                                    );
-                                                    let mut truncated_title = String::new();
-                                                    let mut acc = 0usize;
-                                                    for ch in win.window_title.chars() {
-                                                        let ch_w = UnicodeWidthChar::width(ch)
-                                                            .unwrap_or(0);
-                                                        if acc + ch_w > remain.max(0) as usize {
-                                                            truncated_title.push('…');
-                                                            break;
+                                                // Left fixed widths: prefix + id + one space before title
+                                                let id_text = format!("<#{}>", win.window_id);
+                                                let left_fixed = UnicodeWidthStr::width(prefix)
+                                                    + UnicodeWidthStr::width(id_text.as_str())
+                                                    + 1; // single space between id and title
+
+                                                // Base title (plus group tag if any)
+                                                let mut base_title = win.window_title.clone();
+                                                if win.is_group {
+                                                    base_title.push_str(" [group]");
+                                                }
+                                                let mut title_display = base_title.clone();
+                                                // Truncate if needed by display width, accounting for ellipsis width 1
+                                                let total_needed = left_fixed
+                                                    + UnicodeWidthStr::width(
+                                                        title_display.as_str(),
+                                                    )
+                                                    + visible_right;
+                                                if total_needed >= width {
+                                                    let remain = width
+                                                        .saturating_sub(left_fixed + visible_right);
+                                                    if remain == 0 {
+                                                        title_display = "…".to_string();
+                                                    } else {
+                                                        let mut acc = 0usize;
+                                                        let mut out = String::new();
+                                                        for ch in base_title.chars() {
+                                                            let w = UnicodeWidthChar::width(ch)
+                                                                .unwrap_or(0);
+                                                            // Reserve width 1 for ellipsis when truncating
+                                                            if acc + w > remain.saturating_sub(2) {
+                                                                out.push('…');
+                                                                break;
+                                                            }
+                                                            acc += w;
+                                                            out.push(ch);
                                                         }
-                                                        acc += ch_w;
-                                                        truncated_title.push(ch);
+                                                        title_display = out;
                                                     }
-                                                    left_trunc = format!(
-                                                        "{}{}{}",
-                                                        id_part.trim_end(),
-                                                        truncated_title,
-                                                        if win.is_group { " [group]" } else { "" },
-                                                    );
                                                 }
 
-                                                // Recompute padding after any truncation
-                                                let visible_left2 = UnicodeWidthStr::width(prefix)
-                                                    + UnicodeWidthStr::width(left_trunc.as_str());
+                                                // Compute padding spaces between left and right
+                                                let visible_left_final = left_fixed
+                                                    + UnicodeWidthStr::width(
+                                                        title_display.as_str(),
+                                                    );
                                                 let pad_spaces =
-                                                    if width > visible_left2 + visible_right {
-                                                        width - visible_left2 - visible_right
+                                                    if width > visible_left_final + visible_right {
+                                                        width - visible_left_final - visible_right
                                                     } else {
                                                         1
                                                     };
 
+                                                // Render parts
                                                 let mut parts: Vec<Span> = Vec::new();
                                                 parts.push(Span::styled(
                                                     prefix,
                                                     Style::default().fg(Color::DarkGray),
                                                 ));
-                                                // Render <#id> in green bold
-                                                let id_chunk = format!("<#{}>", win.window_id);
                                                 parts.push(Span::styled(
-                                                    id_chunk,
+                                                    id_text.clone(),
                                                     Style::default().fg(Color::Green),
                                                 ));
-                                                // Title chunk after id
-                                                let title_chunk = left_trunc
-                                                    .trim_start_matches(&format!(
-                                                        "<#{}>",
-                                                        win.window_id
-                                                    ))
-                                                    .trim_start()
-                                                    .to_string();
+                                                parts.push(Span::raw(" "));
                                                 parts.push(Span::styled(
-                                                    format!(" {}", title_chunk),
+                                                    title_display,
                                                     if win.is_group {
                                                         Style::default().fg(Color::Magenta)
                                                     } else {
                                                         Style::default().fg(Color::White)
                                                     },
                                                 ));
-                                                // Padding and right info
                                                 parts.push(Span::raw(" ".repeat(pad_spaces)));
-                                                // Right: show duration (cyan) • since time (gray)
+                                                // Right: duration (cyan) • since time (gray)
                                                 parts.push(Span::styled(
                                                     dur_pretty,
                                                     Style::default().fg(Color::Cyan),
                                                 ));
                                                 parts.push(Span::raw(" • "));
-                                                let right_time = format!("since {}", local_first);
                                                 parts.push(Span::styled(
-                                                    right_time,
+                                                    format!("since {}", local_first),
                                                     Style::default().fg(Color::Gray),
                                                 ));
                                                 app_lines.push(Line::from(parts));
