@@ -9,13 +9,15 @@ fn main() {
         tonic_prost_build::configure()
             .build_client(true)
             .build_server(true)
-            .type_attribute(".", "#[derive(serde::Serialize, serde::Deserialize)]")
+            .compile_well_known_types(true)
+            // Map well-known types to prost-types rather than generating a local google module
+            .extern_path(".google.protobuf", "::prost_types")
             .compile_protos(&["proto/kroni.proto"], &["proto"]) // files, includes
             .expect("Failed to compile kroni.proto");
     }
 
     // macOS libproc bindings generation
-    #[cfg(target_os = "macos")]
+
     {
         use std::env;
         use std::path::PathBuf;

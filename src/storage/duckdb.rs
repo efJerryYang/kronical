@@ -6,21 +6,19 @@ use crate::daemon::records::ActivityRecord;
 use crate::storage::{StorageBackend, StorageCommand, dec_backlog, inc_backlog, set_last_flush};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use rusqlite::{Connection, params};
+use duckdb::{Connection, params};
 use serde_json;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::thread;
 
-// Uses shared StorageCommand from crate::storage
-
-pub struct SqliteStorage {
+pub struct DuckDbStorage {
     db_path: PathBuf,
     sender: mpsc::Sender<StorageCommand>,
     writer_thread: Option<thread::JoinHandle<()>>,
 }
 
-impl SqliteStorage {
+impl DuckDbStorage {
     pub fn new<P: AsRef<Path>>(db_path: P) -> Result<Self> {
         let db_path = db_path.as_ref().to_path_buf();
 
@@ -47,68 +45,76 @@ impl SqliteStorage {
     }
 
     fn init_db(conn: &Connection) -> Result<()> {
-        conn.pragma_update(None, "journal_mode", "WAL")?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
-        conn.pragma_update(None, "cache_size", -4000)?;
-
         conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS raw_events (
-                id INTEGER PRIMARY KEY,
-                timestamp TEXT NOT NULL,
+            r"CREATE TABLE IF NOT EXISTS raw_events (
+                id BIGINT,
+                timestamp TIMESTAMPTZ NOT NULL,
                 event_type TEXT NOT NULL,
                 data TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_raw_events_timestamp ON raw_events(timestamp);
             CREATE TABLE IF NOT EXISTS raw_envelopes (
-                id INTEGER PRIMARY KEY,
-                event_id INTEGER,
-                timestamp TEXT NOT NULL,
+                id BIGINT,
+                event_id BIGINT,
+                timestamp TIMESTAMPTZ NOT NULL,
                 source TEXT NOT NULL,
                 kind TEXT NOT NULL,
                 payload TEXT,
-                derived INTEGER NOT NULL,
-                polling INTEGER NOT NULL,
-                sensitive INTEGER NOT NULL
+                derived BOOLEAN NOT NULL,
+                polling BOOLEAN NOT NULL,
+                sensitive BOOLEAN NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_raw_envelopes_timestamp ON raw_envelopes(timestamp);
             CREATE TABLE IF NOT EXISTS activity_records (
-                id INTEGER PRIMARY KEY,
-                start_time TEXT NOT NULL,
-                end_time TEXT,
+                id BIGINT,
+                start_time TIMESTAMPTZ NOT NULL,
+                end_time TIMESTAMPTZ,
                 state TEXT NOT NULL,
                 focus_info TEXT
             );
-            CREATE INDEX IF NOT EXISTS idx_activity_records_start_time ON activity_records(start_time);"
+            CREATE INDEX IF NOT EXISTS idx_activity_records_start_time ON activity_records(start_time);
+            ",
         )?;
         Ok(())
     }
 
     fn background_writer(db_path: PathBuf, receiver: mpsc::Receiver<StorageCommand>) {
-        let mut conn = Connection::open(&db_path).expect("Failed to open DB in writer thread");
-        let mut tx = conn.transaction().expect("Failed to start transaction");
-        let mut count = 0;
+        let conn = Connection::open(&db_path).expect("Failed to open DB in writer thread");
+        let mut count: usize = 0;
+        conn.execute_batch("BEGIN TRANSACTION;")
+            .expect("Failed to start transaction");
 
-        for command in receiver.iter() {
-            let result = match command {
-                StorageCommand::RawEvent(event) => {
+        loop {
+            let result = match receiver.recv() {
+                Ok(StorageCommand::RawEvent(event)) => {
                     let data = serde_json::to_string(&event).unwrap();
-                    tx.execute(
-                        "INSERT INTO raw_events (timestamp, event_type, data) VALUES (?, ?, ?)",
-                        params![
-                            event.timestamp().to_rfc3339(),
-                            event.event_type().to_string(),
-                            data
-                        ],
-                    )
+                    let mut stmt = conn
+                        .prepare(
+                            "INSERT INTO raw_events (timestamp, event_type, data) VALUES (?, ?, ?)",
+                        )
+                        .expect("prepare failed");
+                    stmt.execute(params![
+                        event.timestamp().clone(),
+                        event.event_type().to_string(),
+                        data
+                    ])
                 }
-                StorageCommand::Record(record) => {
+                Ok(StorageCommand::Record(record)) => {
                     let focus_info_json = record
                         .focus_info
                         .as_ref()
                         .map(|fi| serde_json::to_string(fi).unwrap());
-                    tx.execute("INSERT INTO activity_records (start_time, end_time, state, focus_info) VALUES (?, ?, ?, ?)", params![record.start_time.to_rfc3339(), record.end_time.map(|t| t.to_rfc3339()), format!("{:?}", record.state), focus_info_json])
+                    let mut stmt = conn
+                        .prepare("INSERT INTO activity_records (start_time, end_time, state, focus_info) VALUES (?, ?, ?, ?)")
+                        .expect("prepare failed");
+                    stmt.execute(params![
+                        record.start_time,
+                        record.end_time,
+                        format!("{:?}", record.state),
+                        focus_info_json
+                    ])
                 }
-                StorageCommand::Envelope(env) => {
+                Ok(StorageCommand::Envelope(env)) => {
                     let source = match env.source {
                         EventSource::Hook => "hook",
                         EventSource::Derived => "derived",
@@ -147,48 +153,52 @@ impl SqliteStorage {
                         }
                         EventPayload::None => None,
                     };
-                    tx.execute(
-                        "INSERT INTO raw_envelopes (event_id, timestamp, source, kind, payload, derived, polling, sensitive) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
-                        params![
-                            env.id as i64,
-                            env.timestamp.to_rfc3339(),
-                            source,
-                            kind,
-                            payload_json,
-                            if env.derived { 1 } else { 0 },
-                            if env.polling { 1 } else { 0 },
-                            if env.sensitive { 1 } else { 0 },
-                        ],
-                    )
+                    let mut stmt = conn
+                        .prepare("INSERT INTO raw_envelopes (event_id, timestamp, source, kind, payload, derived, polling, sensitive) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
+                        .expect("prepare failed");
+                    stmt.execute(params![
+                        env.id as i64,
+                        env.timestamp,
+                        source,
+                        kind,
+                        payload_json,
+                        env.derived,
+                        env.polling,
+                        env.sensitive,
+                    ])
                 }
-                StorageCommand::Shutdown => break,
+                Ok(StorageCommand::Shutdown) => break,
+                Err(_) => break,
             };
 
             if let Err(e) = result {
-                eprintln!("Failed to write to DB: {}", e);
-                crate::daemon::snapshot::push_health(format!("db write error: {}", e));
+                eprintln!("Failed to write to DuckDB: {}", e);
+                // If a statement fails inside a transaction, DuckDB aborts the transaction.
+                // Roll back and start a new transaction to clear the aborted state.
+                let _ = conn.execute_batch("ROLLBACK; BEGIN TRANSACTION;");
+                crate::daemon::snapshot::push_health(format!("duckdb write error: {}", e));
             }
 
             count += 1;
             if count % 100 == 0 {
-                if let Err(e) = tx.commit() {
-                    eprintln!("Failed to commit transaction: {}", e);
-                    crate::daemon::snapshot::push_health(format!("db commit error: {}", e));
+                if let Err(e) = conn.execute_batch("COMMIT; BEGIN TRANSACTION;") {
+                    eprintln!("Failed to commit DuckDB transaction: {}", e);
+                    crate::daemon::snapshot::push_health(format!("duckdb commit error: {}", e));
                 }
                 set_last_flush(Utc::now());
-                tx = conn.transaction().expect("Failed to start new transaction");
             }
             dec_backlog();
         }
-        if let Err(e) = tx.commit() {
-            eprintln!("Final commit error: {}", e);
-            crate::daemon::snapshot::push_health(format!("db final commit error: {}", e));
+
+        if let Err(e) = conn.execute_batch("COMMIT;") {
+            eprintln!("Final DuckDB commit error: {}", e);
+            crate::daemon::snapshot::push_health(format!("duckdb final commit error: {}", e));
         }
         set_last_flush(Utc::now());
     }
 }
 
-impl StorageBackend for SqliteStorage {
+impl StorageBackend for DuckDbStorage {
     fn add_events(&mut self, events: Vec<RawEvent>) -> Result<()> {
         for event in events {
             self.sender
@@ -228,45 +238,29 @@ impl StorageBackend for SqliteStorage {
 
     fn fetch_records_since(&mut self, since: DateTime<Utc>) -> Result<Vec<ActivityRecord>> {
         let conn = Connection::open(&self.db_path)?;
-        // Include records that have not ended or ended after 'since'.
         let mut stmt = conn.prepare(
             "SELECT id, start_time, end_time, state, focus_info
              FROM activity_records
-             WHERE (end_time IS NULL OR end_time >= ?1)
+             WHERE (end_time IS NULL OR end_time >= ?)
              ORDER BY start_time ASC",
         )?;
 
-        let mut rows = stmt.query([since.to_rfc3339()])?;
+        let mut rows = stmt.query([since])?;
         let mut out: Vec<ActivityRecord> = Vec::new();
 
         while let Some(row) = rows.next()? {
-            let id: i64 = row.get(0)?;
-            let start_s: String = row.get(1)?;
-            let end_s: Option<String> = row.get(2)?;
+            let id: Option<i64> = row.get(0)?;
+            let start_time: DateTime<Utc> = row.get(1)?;
+            let end_time: Option<DateTime<Utc>> = row.get(2)?;
             let state_s: String = row.get(3)?;
             let focus_json: Option<String> = row.get(4)?;
-
-            let start_time = DateTime::parse_from_rfc3339(&start_s)
-                .map(|dt| dt.with_timezone(&Utc))
-                .context("Invalid start_time in DB")?;
-            let end_time = match end_s {
-                Some(s) => Some(
-                    DateTime::parse_from_rfc3339(&s)
-                        .map(|dt| dt.with_timezone(&Utc))
-                        .context("Invalid end_time in DB")?,
-                ),
-                None => None,
-            };
 
             let state = match state_s.as_str() {
                 "Active" => crate::daemon::records::ActivityState::Active,
                 "Passive" => crate::daemon::records::ActivityState::Passive,
                 "Inactive" => crate::daemon::records::ActivityState::Inactive,
                 "Locked" => crate::daemon::records::ActivityState::Locked,
-                other => {
-                    eprintln!("Unknown state in DB: {}", other);
-                    crate::daemon::records::ActivityState::Inactive
-                }
+                _ => crate::daemon::records::ActivityState::Inactive,
             };
 
             let focus_info = match focus_json {
@@ -275,7 +269,7 @@ impl StorageBackend for SqliteStorage {
             };
 
             out.push(ActivityRecord {
-                record_id: id as u64,
+                record_id: id.unwrap_or_default() as u64,
                 start_time,
                 end_time,
                 state,
@@ -297,30 +291,26 @@ impl StorageBackend for SqliteStorage {
         let mut stmt = conn.prepare(
             "SELECT event_id, timestamp, source, kind, payload, derived, polling, sensitive
              FROM raw_envelopes
-             WHERE timestamp >= ?1 AND timestamp <= ?2
+             WHERE timestamp >= ? AND timestamp <= ?
              ORDER BY timestamp ASC",
         )?;
-        let mut rows = stmt.query([since.to_rfc3339(), until.to_rfc3339()])?;
+        let mut rows = stmt.query(params![since, until])?;
         let mut out: Vec<EventEnvelope> = Vec::new();
         while let Some(row) = rows.next()? {
             let event_id: Option<i64> = row.get(0)?;
-            let ts_s: String = row.get(1)?;
+            let timestamp: DateTime<Utc> = row.get(1)?;
             let source_s: String = row.get(2)?;
             let kind_s: String = row.get(3)?;
             let payload_s: Option<String> = row.get(4)?;
-            let derived_i: i64 = row.get(5)?;
-            let polling_i: i64 = row.get(6)?;
-            let sensitive_i: i64 = row.get(7)?;
+            let derived_b: bool = row.get(5)?;
+            let polling_b: bool = row.get(6)?;
+            let sensitive_b: bool = row.get(7)?;
 
-            let timestamp = DateTime::parse_from_rfc3339(&ts_s).map(|dt| dt.with_timezone(&Utc))?;
             let source = match source_s.as_str() {
                 "hook" => EventSource::Hook,
                 "derived" => EventSource::Derived,
                 "polling" => EventSource::Polling,
-                other => {
-                    eprintln!("Unknown envelope source: {}", other);
-                    EventSource::Hook
-                }
+                _ => EventSource::Hook,
             };
             let kind = if kind_s.starts_with("signal:") {
                 let k = &kind_s[7..];
@@ -359,11 +349,9 @@ impl StorageBackend for SqliteStorage {
                     .map(EventPayload::Mouse)
                     .unwrap_or(EventPayload::None),
                 (EventKind::Signal(_), Some(js)) | (EventKind::Hint(_), Some(js)) => {
-                    // Focus, Lock or Title tuples
                     if kind_s.contains("lock") {
                         EventPayload::Lock { reason: js }
                     } else if kind_s.contains("title") {
-                        // stored as tuple (window_id, title)
                         match serde_json::from_str::<(u32, String)>(&js) {
                             Ok((wid, title)) => EventPayload::Title {
                                 window_id: wid,
@@ -404,16 +392,16 @@ impl StorageBackend for SqliteStorage {
                 source,
                 kind,
                 payload,
-                derived: derived_i != 0,
-                polling: polling_i != 0,
-                sensitive: sensitive_i != 0,
+                derived: derived_b,
+                polling: polling_b,
+                sensitive: sensitive_b,
             });
         }
         Ok(out)
     }
 }
 
-impl Drop for SqliteStorage {
+impl Drop for DuckDbStorage {
     fn drop(&mut self) {
         let _ = self.sender.send(StorageCommand::Shutdown);
         if let Some(thread) = self.writer_thread.take() {

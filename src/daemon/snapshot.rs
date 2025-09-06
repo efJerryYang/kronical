@@ -21,7 +21,6 @@ pub struct Snapshot {
     pub next_timeout: Option<chrono::DateTime<chrono::Utc>>,
     pub storage: StorageInfo,
     pub config: ConfigSummary,
-    pub replay: ReplayInfo,
     pub health: Vec<String>,
     pub aggregated_apps: Vec<SnapshotApp>,
 }
@@ -57,10 +56,6 @@ impl Snapshot {
                 last_flush_at: None,
             },
             config: ConfigSummary::default(),
-            replay: ReplayInfo {
-                mode: "live".into(),
-                position: None,
-            },
             health: Vec::new(),
             aggregated_apps: Vec::new(),
         }
@@ -91,7 +86,6 @@ pub fn publish_basic(
     next_timeout: Option<chrono::DateTime<chrono::Utc>>,
     storage: StorageInfo,
     config: ConfigSummary,
-    replay: ReplayInfo,
     health: Vec<String>,
     aggregated_apps: Vec<SnapshotApp>,
 ) {
@@ -108,7 +102,6 @@ pub fn publish_basic(
         next_timeout,
         storage,
         config,
-        replay,
         health,
         aggregated_apps,
     };
@@ -141,11 +134,7 @@ pub struct CountsSummary {
     pub records_emitted: u64,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct ReplayInfo {
-    pub mode: String, // "live" | "replay"
-    pub position: Option<u64>,
-}
+// Replay info removed
 
 pub fn get_current() -> Arc<Snapshot> {
     if let Ok(guard) = SNAPSHOT.read() {

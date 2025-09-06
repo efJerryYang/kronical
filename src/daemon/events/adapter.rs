@@ -1,6 +1,6 @@
 use chrono::{DateTime, Utc};
 
-use crate::daemon::event_model::{
+use crate::daemon::events::model::{
     EventEnvelope, EventKind, EventPayload, EventSource, HintKind, SignalKind,
 };
 use crate::daemon::events::{RawEvent, WindowFocusInfo};

@@ -1,6 +1,6 @@
 use chrono::Utc;
-use kronical::daemon::event_adapter::EventAdapter;
-use kronical::daemon::event_model::{EventKind, HintKind};
+use kronical::daemon::events::adapter::EventAdapter;
+use kronical::daemon::events::model::{EventKind, HintKind};
 use kronical::daemon::events::{RawEvent, WindowFocusInfo};
 use std::sync::Arc;
 

@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
-use kronical::daemon::event_adapter::EventAdapter;
-use kronical::daemon::event_deriver::{LockDeriver, StateDeriver};
-use kronical::daemon::event_model::EventKind;
+use kronical::daemon::events::adapter::EventAdapter;
+use kronical::daemon::events::deriver::{LockDeriver, StateDeriver};
+use kronical::daemon::events::model::EventKind;
 use kronical::daemon::events::{RawEvent, WindowFocusInfo};
 use kronical::daemon::records::{ActivityState, RecordBuilder};
 use std::sync::Arc;
@@ -44,7 +44,10 @@ fn mk_mouse(ts: DateTime<Utc>) -> RawEvent {
             position: kronical::daemon::events::MousePosition { x: 0, y: 0 },
             button: None,
             click_count: None,
-            wheel_delta: None,
+            event_type: None,
+            wheel_amount: None,
+            wheel_rotation: None,
+            wheel_axis: None,
         },
     }
 }

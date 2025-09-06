@@ -3,9 +3,17 @@ use config::{Config, Environment, File};
 use serde::Deserialize;
 use std::path::PathBuf;
 
+#[derive(Debug, Clone, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum DatabaseBackendConfig {
+    Duckdb,
+    Sqlite3,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct AppConfig {
     pub workspace_dir: PathBuf,
+    pub db_backend: DatabaseBackendConfig,
     pub retention_minutes: u64,
     pub active_grace_secs: u64,
     pub idle_threshold_secs: u64,
@@ -26,14 +34,16 @@ pub struct AppConfig {
 
 impl Default for AppConfig {
     fn default() -> Self {
-        let workspace_dir = if let Some(home) = dirs::home_dir() {
-            home.join(".kronical")
-        } else {
-            panic!("Failed to determine home directory")
-        };
+        // Be resilient in environments without HOME by falling back to CWD.
+        let base_dir = dirs::home_dir()
+            .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_else(|| PathBuf::from("."));
+        let workspace_dir = base_dir.join(".kronical");
 
         Self {
             workspace_dir,
+            db_backend: DatabaseBackendConfig::Duckdb,
             retention_minutes: 72 * 60,
             active_grace_secs: 30,
             idle_threshold_secs: 300,
@@ -60,7 +70,9 @@ impl AppConfig {
         let config_path = workspace_dir.join("config.toml");
 
         let mut builder = Config::builder()
-            .set_default("workspace_dir", workspace_dir.to_str().unwrap())?
+            // Avoid panics on non-UTF8 paths by using lossy conversion.
+            .set_default("workspace_dir", workspace_dir.to_string_lossy().as_ref())?
+            .set_default("db_backend", "duckdb")?
             .set_default("retention_minutes", 72 * 60)?
             .set_default("active_grace_secs", 30)?
             .set_default("idle_threshold_secs", 300)?

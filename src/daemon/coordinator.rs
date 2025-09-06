@@ -1,11 +1,13 @@
-use crate::daemon::compression::CompressionEngine;
-use crate::daemon::event_adapter::EventAdapter;
-use crate::daemon::event_deriver::LockDeriver;
-use crate::daemon::events::{KeyboardEventData, MouseEventData, MousePosition, WindowFocusInfo};
-use crate::daemon::focus_tracker::{FocusCacheCaps, FocusChangeCallback, FocusEventWrapper};
+use crate::daemon::compressor::CompressionEngine;
+use crate::daemon::events::adapter::EventAdapter;
+use crate::daemon::events::deriver::{LockDeriver, StateDeriver};
+use crate::daemon::events::model::{EventKind, EventPayload, SignalKind};
+use crate::daemon::events::{
+    KeyboardEventData, MouseEventData, MouseEventKind, MousePosition, WindowFocusInfo,
+};
 use crate::daemon::records::{ActivityRecord, aggregate_activities_since};
-use crate::daemon::system_tracker::SystemTracker;
-// legacy socket server removed
+use crate::daemon::tracker::DuckDbSystemTracker;
+use crate::daemon::tracker::{FocusCacheCaps, FocusChangeCallback, FocusEventWrapper};
 use crate::storage::StorageBackend;
 use anyhow::Result;
 use log::{debug, error, info, trace};
@@ -13,11 +15,10 @@ use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
 use uiohook_rs::{EventHandler, Uiohook, UiohookEvent};
-#[cfg(target_os = "macos")]
+
 use winshift::ActiveWindowInfo;
 use winshift::{FocusChangeHandler, MonitoringMode, WindowFocusHook, WindowHookConfig};
 
-#[cfg(feature = "kroni-api")]
 fn pretty_format_duration(seconds: u64) -> String {
     if seconds == 0 {
         return "0s".to_string();
@@ -45,8 +46,25 @@ fn pretty_format_duration(seconds: u64) -> String {
 #[derive(Debug, Clone)]
 pub enum KronicalEvent {
     KeyboardInput,
-    MouseInput,
-    WindowFocusChange { focus_info: WindowFocusInfo },
+    MouseInput {
+        x: i32,
+        y: i32,
+        button: Option<String>,
+        clicks: u16,
+        kind: MouseEventKind,
+    },
+    MouseWheel {
+        clicks: u16,
+        x: i32,
+        y: i32,
+        type_: u8,
+        amount: u16,
+        rotation: i16,
+        direction: u8,
+    },
+    WindowFocusChange {
+        focus_info: WindowFocusInfo,
+    },
     Shutdown,
 }
 
@@ -104,13 +122,40 @@ impl EventHandler for KronicalEventHandler {
                 trace!("Keyboard event detected");
                 KronicalEvent::KeyboardInput
             }
-            UiohookEvent::Mouse(_) => {
+            UiohookEvent::Mouse(m) => {
+                use uiohook_rs::hook::mouse::MouseEventType as VMouseEventType;
                 trace!("Mouse event detected");
-                KronicalEvent::MouseInput
+                let kind = match m.event_type {
+                    VMouseEventType::Moved => MouseEventKind::Moved,
+                    VMouseEventType::Pressed => MouseEventKind::Pressed,
+                    VMouseEventType::Released => MouseEventKind::Released,
+                    VMouseEventType::Clicked => MouseEventKind::Clicked,
+                    VMouseEventType::Dragged => MouseEventKind::Dragged,
+                };
+                // Map button; treat NoButton as None
+                let button_str = match format!("{:?}", m.button).as_str() {
+                    "NoButton" => None,
+                    other => Some(other.to_string()),
+                };
+                KronicalEvent::MouseInput {
+                    x: m.x as i32,
+                    y: m.y as i32,
+                    button: button_str,
+                    clicks: m.clicks,
+                    kind,
+                }
             }
-            UiohookEvent::Wheel(_) => {
+            UiohookEvent::Wheel(w) => {
                 trace!("Wheel event detected");
-                KronicalEvent::MouseInput
+                KronicalEvent::MouseWheel {
+                    clicks: w.clicks,
+                    x: w.x as i32,
+                    y: w.y as i32,
+                    type_: w.type_,
+                    amount: w.amount,
+                    rotation: w.rotation,
+                    direction: w.direction,
+                }
             }
             UiohookEvent::HookEnabled => {
                 debug!("UIohook enabled");
@@ -141,7 +186,6 @@ impl FocusChangeHandler for KronicalEventHandler {
         self.focus_wrapper.handle_window_change(window_title);
     }
 
-    #[cfg(target_os = "macos")]
     fn on_app_change_info(&self, info: ActiveWindowInfo) {
         debug!(
             "App+Info: {} pid={} wid={}",
@@ -150,7 +194,6 @@ impl FocusChangeHandler for KronicalEventHandler {
         self.focus_wrapper.handle_app_change_info(info);
     }
 
-    #[cfg(target_os = "macos")]
     fn on_window_change_info(&self, info: ActiveWindowInfo) {
         debug!("Win+Info: '{}' wid={}", info.title, info.window_id);
         self.focus_wrapper.handle_window_change_info(info);
@@ -229,16 +272,59 @@ impl EventCoordinator {
                     modifiers: Vec::new(),
                 },
             }),
-            KronicalEvent::MouseInput => Ok(RawEvent::MouseInput {
+            KronicalEvent::MouseInput {
+                x,
+                y,
+                button,
+                clicks,
+                kind,
+            } => Ok(RawEvent::MouseInput {
                 timestamp: now,
                 event_id,
                 data: MouseEventData {
-                    position: MousePosition { x: 0, y: 0 },
-                    button: None,
-                    click_count: None,
-                    wheel_delta: None,
+                    position: MousePosition { x, y },
+                    button,
+                    click_count: if clicks > 0 { Some(clicks) } else { None },
+                    event_type: Some(kind),
+                    wheel_amount: None,
+                    wheel_rotation: None,
+                    wheel_axis: None,
                 },
             }),
+            KronicalEvent::MouseWheel {
+                clicks,
+                x,
+                y,
+                type_: _,
+                amount,
+                rotation,
+                direction,
+            } => {
+                use crate::daemon::events::WheelAxis;
+                use uiohook_rs::hook::wheel::{
+                    WHEEL_HORIZONTAL_DIRECTION, WHEEL_VERTICAL_DIRECTION,
+                };
+                let axis = if direction == WHEEL_VERTICAL_DIRECTION {
+                    Some(WheelAxis::Vertical)
+                } else if direction == WHEEL_HORIZONTAL_DIRECTION {
+                    Some(WheelAxis::Horizontal)
+                } else {
+                    None
+                };
+                Ok(RawEvent::MouseInput {
+                    timestamp: now,
+                    event_id,
+                    data: MouseEventData {
+                        position: MousePosition { x, y },
+                        button: None,
+                        click_count: Some(clicks as u16),
+                        event_type: None,
+                        wheel_amount: Some(amount as i32),
+                        wheel_rotation: Some(rotation as i32),
+                        wheel_axis: axis,
+                    },
+                })
+            }
             KronicalEvent::WindowFocusChange { focus_info } => Ok(RawEvent::WindowFocusChange {
                 timestamp: now,
                 event_id,
@@ -250,6 +336,7 @@ impl EventCoordinator {
         }
     }
 
+    // TODO: the pid file should not be passed here, we should have a constant rust file. and we can then get the workspace directory from there too
     pub fn start_main_thread(
         &self,
         data_store: Box<dyn StorageBackend>,
@@ -259,46 +346,45 @@ impl EventCoordinator {
 
         let (sender, receiver) = mpsc::channel();
 
-        // Legacy monitor socket (to be removed): now using kroni.* names
-        // legacy monitor socket removed
-        // legacy monitor socket removed
-
-        #[cfg(feature = "kroni-api")]
-        {
-            // Start Kroni gRPC API over UDS alongside the legacy socket.
-            let uds_path = pid_file.parent().unwrap().join("kroni.sock");
-            if let Err(e) = crate::daemon::kroni_server::spawn_server(uds_path) {
-                error!("Failed to start kroni API server: {}", e);
-            } else {
-                info!("Kroni API server started successfully");
+        // Start API servers (gRPC + HTTP/SSE) via unified API facade.
+        let workspace_dir = match pid_file.parent() {
+            Some(dir) => dir,
+            None => {
+                error!(
+                    "PID file has no parent; cannot derive workspace dir. Skipping API startup."
+                );
+                return Err(anyhow::anyhow!(
+                    "invalid PID file path; missing parent directory"
+                ));
             }
-        }
-
-        #[cfg(feature = "http-admin")]
-        {
-            let http_sock = pid_file.parent().unwrap().join("kroni.http.sock");
-            if let Err(e) = crate::daemon::http_admin::spawn_http_admin(http_sock) {
-                error!("Failed to start HTTP admin: {}", e);
-            } else {
-                info!("HTTP admin server started successfully");
-            }
+        };
+        let uds_grpc = crate::util::paths::grpc_uds(workspace_dir);
+        let uds_http = crate::util::paths::http_uds(workspace_dir);
+        if let Err(e) = crate::daemon::api::spawn_all(uds_grpc, uds_http) {
+            error!("Failed to start API servers: {}", e);
         }
 
         if self.tracker_enabled {
             let current_pid = std::process::id();
-            let tracker_zip_path = pid_file.parent().unwrap().join("system-tracker.zip");
-            let tracker = SystemTracker::new(
+            let tracker_db_path = crate::util::paths::tracker_db(workspace_dir);
+            let tracker = DuckDbSystemTracker::new(
                 current_pid,
                 self.tracker_interval_secs,
                 self.tracker_batch_size,
-                tracker_zip_path,
+                tracker_db_path.clone(),
             );
             if let Err(e) = tracker.start() {
-                error!("Failed to start system tracker: {}", e);
+                error!("Failed to start DuckDB system tracker: {}", e);
             } else {
                 info!(
-                    "System tracker started successfully for PID {}",
+                    "DuckDB system tracker started successfully for PID {}",
                     current_pid
+                );
+
+                crate::daemon::api::set_system_tracker_db_path(tracker_db_path.clone());
+                info!(
+                    "System tracker DB path set for gRPC API: {:?}",
+                    tracker_db_path
                 );
             }
         }
@@ -310,7 +396,6 @@ impl EventCoordinator {
             let mut adapter = EventAdapter::new();
             let mut lock_deriver = LockDeriver::new();
             let mut store = data_store;
-            // legacy socket server removed
             let mut pending_raw_events = Vec::new();
             let mut state_hist: std::collections::VecDeque<char> =
                 std::collections::VecDeque::new();
@@ -320,23 +405,23 @@ impl EventCoordinator {
             let eph_max = self.ephemeral_max_duration_secs;
             let eph_min = self.ephemeral_min_distinct_ids;
             let max_windows = self.max_windows_per_app;
-            #[cfg(feature = "kroni-api")]
+
             let app_eph_max = self.ephemeral_app_max_duration_secs;
-            #[cfg(feature = "kroni-api")]
+
             let app_eph_min = self.ephemeral_app_min_distinct_procs;
-            #[cfg(feature = "kroni-api")]
+
             let mut counts = crate::daemon::snapshot::Counts {
                 signals_seen: 0,
                 hints_seen: 0,
                 records_emitted: 0,
             };
-            #[cfg(feature = "kroni-api")]
+
             let mut last_transition: Option<crate::daemon::snapshot::Transition> = None;
 
             let poll_handle_arc2 = std::sync::Arc::clone(&poll_handle_arc);
             let ags = self.active_grace_secs;
             let its = self.idle_threshold_secs;
-            #[cfg(feature = "kroni-api")]
+
             let cfg_summary = crate::daemon::snapshot::ConfigSummary {
                 active_grace_secs: self.active_grace_secs,
                 idle_threshold_secs: self.idle_threshold_secs,
@@ -347,7 +432,6 @@ impl EventCoordinator {
                 ephemeral_app_min_distinct_procs: self.ephemeral_app_min_distinct_procs,
             };
 
-            #[cfg(feature = "kroni-api")]
             fn build_app_tree(
                 aggregated_activities: &[crate::daemon::records::AggregatedActivity],
                 app_short_max_duration_secs: u64,
@@ -556,8 +640,7 @@ impl EventCoordinator {
                 }
 
                 // Initialize new state + record components
-                let mut state_deriver =
-                    crate::daemon::event_deriver::StateDeriver::new(now0, ags as i64, its as i64);
+                let mut state_deriver = StateDeriver::new(now0, ags as i64, its as i64);
                 let mut record_builder = crate::daemon::records::RecordBuilder::new(
                     crate::daemon::records::ActivityState::Inactive,
                 );
@@ -576,52 +659,45 @@ impl EventCoordinator {
                                 // Persist all envelopes
                                 let _ = store.add_envelopes(envelopes_with_lock.clone());
                                 // Feed pipeline (hint-first ordering per timestamp)
-                                for env in envelopes_with_lock.iter().filter(|e| {
-                                    matches!(e.kind, crate::daemon::event_model::EventKind::Hint(_))
-                                }) {
+                                for env in envelopes_with_lock
+                                    .iter()
+                                    .filter(|e| matches!(e.kind, EventKind::Hint(_)))
+                                {
                                     if let Some(rec) = record_builder.on_hint(env) {
                                         let _ = store.add_records(vec![rec.clone()]);
                                         recent_records.push_back(rec);
                                     }
-                                    #[cfg(feature = "kroni-api")]
-                                    {
-                                        counts.hints_seen += 1;
-                                        if let crate::daemon::event_model::EventPayload::State {
-                                            from,
-                                            to,
-                                        } = &env.payload
-                                        {
-                                            last_transition =
-                                                Some(crate::daemon::snapshot::Transition {
-                                                    from: *from,
-                                                    to: *to,
-                                                    at: env.timestamp,
-                                                });
-                                        }
+
+                                    counts.hints_seen += 1;
+                                    if let EventPayload::State { from, to } = &env.payload {
+                                        last_transition =
+                                            Some(crate::daemon::snapshot::Transition {
+                                                from: *from,
+                                                to: *to,
+                                                at: env.timestamp,
+                                            });
                                     }
                                 }
-                                for env in envelopes_with_lock.iter().filter(|e| {
-                                    matches!(
-                                        e.kind,
-                                        crate::daemon::event_model::EventKind::Signal(_)
-                                    )
-                                }) {
-                                    #[cfg(feature = "kroni-api")]
-                                    {
-                                        counts.signals_seen += 1;
-                                    }
+                                for env in envelopes_with_lock
+                                    .iter()
+                                    .filter(|e| matches!(e.kind, EventKind::Signal(_)))
+                                {
+                                    counts.signals_seen += 1;
                                     if let Some(h) = state_deriver.on_signal(env) {
                                         let _ = store.add_envelopes(vec![h.clone()]);
                                         if let Some(rec) = record_builder.on_hint(&h) {
                                             let _ = store.add_records(vec![rec.clone()]);
                                             recent_records.push_back(rec);
                                         }
-                                        #[cfg(feature = "kroni-api")]
-                                        {
-                                            counts.hints_seen += 1;
-                                            if let crate::daemon::event_model::EventPayload::State { from, to } = &h.payload {
-                                                last_transition = Some(crate::daemon::snapshot::Transition { from: *from, to: *to, at: h.timestamp });
-                                            }
+
+                                        counts.hints_seen += 1;
+                                        if let EventPayload::State { from, to } = &h.payload {
+                                            last_transition =
+                                                Some(crate::daemon::snapshot::Transition {
+                                                    from: *from,
+                                                    to: *to,
+                                                    at: h.timestamp,
+                                                });
                                         }
                                     }
                                 }
@@ -635,7 +711,7 @@ impl EventCoordinator {
                                         break;
                                     }
                                 }
-                                #[cfg(feature = "kroni-api")]
+
                                 let agg = {
                                     aggregate_activities_since(
                                         recent_records.make_contiguous(),
@@ -654,7 +730,7 @@ impl EventCoordinator {
                                     crate::daemon::records::ActivityState::Locked => 30000,
                                 };
                                 poll_handle_arc2.store(ms, std::sync::atomic::Ordering::Relaxed);
-                                #[cfg(feature = "kroni-api")]
+
                                 {
                                     let aggregated_apps =
                                         build_app_tree(&agg, app_eph_max, app_eph_min);
@@ -670,7 +746,7 @@ impl EventCoordinator {
                                         chrono::Utc::now()
                                             + chrono::Duration::milliseconds(ms as i64),
                                     );
-                                    let sm = crate::storage::sqlite3::storage_metrics();
+                                    let sm = crate::storage::storage_metrics();
                                     crate::daemon::snapshot::publish_basic(
                                         record_builder.current_state(),
                                         record_builder.current_focus(),
@@ -684,10 +760,6 @@ impl EventCoordinator {
                                             last_flush_at: sm.last_flush_at,
                                         },
                                         cfg_summary.clone(),
-                                        crate::daemon::snapshot::ReplayInfo {
-                                            mode: "live".into(),
-                                            position: None,
-                                        },
                                         crate::daemon::snapshot::current_health(),
                                         aggregated_apps.clone(),
                                     );
@@ -732,40 +804,30 @@ impl EventCoordinator {
                                 // New pipeline: feed signals to StateDeriver, hints to RecordBuilder
                                 let mut new_records = Vec::new();
                                 // Hints first
-                                for env in envelopes_with_lock.iter().filter(|e| {
-                                    matches!(e.kind, crate::daemon::event_model::EventKind::Hint(_))
-                                }) {
+                                for env in envelopes_with_lock
+                                    .iter()
+                                    .filter(|e| matches!(e.kind, EventKind::Hint(_)))
+                                {
                                     if let Some(rec) = record_builder.on_hint(env) {
                                         new_records.push(rec);
                                     }
-                                    #[cfg(feature = "kroni-api")]
-                                    {
-                                        counts.hints_seen += 1;
-                                        if let crate::daemon::event_model::EventPayload::State {
-                                            from,
-                                            to,
-                                        } = &env.payload
-                                        {
-                                            last_transition =
-                                                Some(crate::daemon::snapshot::Transition {
-                                                    from: *from,
-                                                    to: *to,
-                                                    at: env.timestamp,
-                                                });
-                                        }
+
+                                    counts.hints_seen += 1;
+                                    if let EventPayload::State { from, to } = &env.payload {
+                                        last_transition =
+                                            Some(crate::daemon::snapshot::Transition {
+                                                from: *from,
+                                                to: *to,
+                                                at: env.timestamp,
+                                            });
                                     }
                                 }
                                 // Then signals (which may derive state-change hints)
-                                for env in envelopes_with_lock.iter().filter(|e| {
-                                    matches!(
-                                        e.kind,
-                                        crate::daemon::event_model::EventKind::Signal(_)
-                                    )
-                                }) {
-                                    #[cfg(feature = "kroni-api")]
-                                    {
-                                        counts.signals_seen += 1;
-                                    }
+                                for env in envelopes_with_lock
+                                    .iter()
+                                    .filter(|e| matches!(e.kind, EventKind::Signal(_)))
+                                {
+                                    counts.signals_seen += 1;
                                     if let Some(h) = state_deriver.on_signal(env) {
                                         if let Err(e) = store.add_envelopes(vec![h.clone()]) {
                                             error!("Failed to store derived state hint: {}", e);
@@ -777,12 +839,15 @@ impl EventCoordinator {
                                         if let Some(rec) = record_builder.on_hint(&h) {
                                             new_records.push(rec);
                                         }
-                                        #[cfg(feature = "kroni-api")]
-                                        {
-                                            counts.hints_seen += 1;
-                                            if let crate::daemon::event_model::EventPayload::State { from, to } = &h.payload {
-                                                last_transition = Some(crate::daemon::snapshot::Transition { from: *from, to: *to, at: h.timestamp });
-                                            }
+
+                                        counts.hints_seen += 1;
+                                        if let EventPayload::State { from, to } = &h.payload {
+                                            last_transition =
+                                                Some(crate::daemon::snapshot::Transition {
+                                                    from: *from,
+                                                    to: *to,
+                                                    at: h.timestamp,
+                                                });
                                         }
                                     }
                                 }
@@ -812,10 +877,8 @@ impl EventCoordinator {
                                     }
                                     for r in new_records.into_iter() {
                                         recent_records.push_back(r);
-                                        #[cfg(feature = "kroni-api")]
-                                        {
-                                            counts.records_emitted += 1;
-                                        }
+
+                                        counts.records_emitted += 1;
                                     }
                                 }
 
@@ -830,9 +893,7 @@ impl EventCoordinator {
 
                                         if !processed_events.is_empty() {
                                             // Suppress input events during Locked period using derived envelopes
-                                            use crate::daemon::event_model::{
-                                                EventKind, SignalKind,
-                                            };
+                                            use {EventKind, SignalKind};
                                             let mut suppress: std::collections::HashSet<u64> =
                                                 std::collections::HashSet::new();
                                             let mut locked = false;
@@ -884,7 +945,7 @@ impl EventCoordinator {
                                         break;
                                     }
                                 }
-                                #[cfg(feature = "kroni-api")]
+
                                 let agg = {
                                     aggregate_activities_since(
                                         recent_records.make_contiguous(),
@@ -903,7 +964,7 @@ impl EventCoordinator {
                                     crate::daemon::records::ActivityState::Locked => 30000,
                                 };
                                 poll_handle_arc2.store(ms, std::sync::atomic::Ordering::Relaxed);
-                                #[cfg(feature = "kroni-api")]
+
                                 {
                                     let aggregated_apps =
                                         build_app_tree(&agg, app_eph_max, app_eph_min);
@@ -919,7 +980,7 @@ impl EventCoordinator {
                                         chrono::Utc::now()
                                             + chrono::Duration::milliseconds(ms as i64),
                                     );
-                                    let sm = crate::storage::sqlite3::storage_metrics();
+                                    let sm = crate::storage::storage_metrics();
                                     crate::daemon::snapshot::publish_basic(
                                         record_builder.current_state(),
                                         record_builder.current_focus(),
@@ -933,10 +994,6 @@ impl EventCoordinator {
                                             last_flush_at: sm.last_flush_at,
                                         },
                                         cfg_summary.clone(),
-                                        crate::daemon::snapshot::ReplayInfo {
-                                            mode: "live".into(),
-                                            position: None,
-                                        },
                                         crate::daemon::snapshot::current_health(),
                                         aggregated_apps.clone(),
                                     );
@@ -980,12 +1037,10 @@ impl EventCoordinator {
                                 let _hist_str: String = state_hist.iter().collect();
                             }
                         }
-                        #[cfg(feature = "kroni-api")]
+
                         {
                             counts.hints_seen += 1;
-                            if let crate::daemon::event_model::EventPayload::State { from, to } =
-                                &state_hint.payload
-                            {
+                            if let EventPayload::State { from, to } = &state_hint.payload {
                                 last_transition = Some(crate::daemon::snapshot::Transition {
                                     from: *from,
                                     to: *to,
@@ -1003,7 +1058,7 @@ impl EventCoordinator {
                                 break;
                             }
                         }
-                        #[cfg(feature = "kroni-api")]
+
                         let agg = {
                             aggregate_activities_since(
                                 recent_records.make_contiguous(),
@@ -1021,7 +1076,7 @@ impl EventCoordinator {
                             crate::daemon::records::ActivityState::Locked => 30000,
                         };
                         poll_handle_arc2.store(ms, std::sync::atomic::Ordering::Relaxed);
-                        #[cfg(feature = "kroni-api")]
+
                         {
                             let aggregated_apps = build_app_tree(&agg, app_eph_max, app_eph_min);
                             let reason = match record_builder.current_state() {
@@ -1033,7 +1088,7 @@ impl EventCoordinator {
                             let next_timeout = Some(
                                 chrono::Utc::now() + chrono::Duration::milliseconds(ms as i64),
                             );
-                            let sm = crate::storage::sqlite3::storage_metrics();
+                            let sm = crate::storage::storage_metrics();
                             crate::daemon::snapshot::publish_basic(
                                 record_builder.current_state(),
                                 record_builder.current_focus(),
@@ -1047,10 +1102,6 @@ impl EventCoordinator {
                                     last_flush_at: sm.last_flush_at,
                                 },
                                 cfg_summary.clone(),
-                                crate::daemon::snapshot::ReplayInfo {
-                                    mode: "live".into(),
-                                    position: None,
-                                },
                                 crate::daemon::snapshot::current_health(),
                                 aggregated_apps.clone(),
                             );
@@ -1079,7 +1130,7 @@ impl EventCoordinator {
                             break;
                         }
                     }
-                    #[cfg(feature = "kroni-api")]
+
                     let agg = {
                         aggregate_activities_since(
                             recent_records.make_contiguous(),
@@ -1090,7 +1141,7 @@ impl EventCoordinator {
                             max_windows,
                         )
                     };
-                    #[cfg(feature = "kroni-api")]
+
                     {
                         let aggregated_apps = build_app_tree(&agg, app_eph_max, app_eph_min);
                         let ms = match record_builder.current_state() {
@@ -1107,7 +1158,7 @@ impl EventCoordinator {
                         };
                         let next_timeout =
                             Some(chrono::Utc::now() + chrono::Duration::milliseconds(ms as i64));
-                        let sm = crate::storage::sqlite3::storage_metrics();
+                        let sm = crate::storage::storage_metrics();
                         crate::daemon::snapshot::publish_basic(
                             record_builder.current_state(),
                             record_builder.current_focus(),
@@ -1121,10 +1172,6 @@ impl EventCoordinator {
                                 last_flush_at: sm.last_flush_at,
                             },
                             cfg_summary.clone(),
-                            crate::daemon::snapshot::ReplayInfo {
-                                mode: "live".into(),
-                                position: None,
-                            },
                             crate::daemon::snapshot::current_health(),
                             aggregated_apps,
                         );
@@ -1143,12 +1190,9 @@ impl EventCoordinator {
                 error!("Step S: Failed to send shutdown: {}", e);
             }
 
-            #[cfg(target_os = "macos")]
-            {
-                info!("Step S: Stopping winshift hook");
-                if let Err(e) = winshift::stop_hook() {
-                    error!("Step S: Failed to stop winshift: {}", e);
-                }
+            info!("Step S: Stopping winshift hook");
+            if let Err(e) = winshift::stop_hook() {
+                error!("Step S: Failed to stop winshift: {}", e);
             }
 
             info!("Step S: Cleaning up PID file");
@@ -1201,24 +1245,27 @@ impl EventCoordinator {
         }
 
         info!("Step C: Cleaning up socket files");
-        let socket_dir = pid_file.parent().unwrap();
-        let grpc_sock = socket_dir.join("kroni.sock");
-        let http_sock = socket_dir.join("kroni.http.sock");
+        if let Some(socket_dir) = pid_file.parent() {
+            let grpc_sock = socket_dir.join("kroni.sock");
+            let http_sock = socket_dir.join("kroni.http.sock");
 
-        if grpc_sock.exists() {
-            if let Err(e) = std::fs::remove_file(&grpc_sock) {
-                error!("Failed to remove gRPC socket: {}", e);
-            } else {
-                info!("Removed gRPC socket file");
+            if grpc_sock.exists() {
+                if let Err(e) = std::fs::remove_file(&grpc_sock) {
+                    error!("Failed to remove gRPC socket: {}", e);
+                } else {
+                    info!("Removed gRPC socket file");
+                }
             }
-        }
 
-        if http_sock.exists() {
-            if let Err(e) = std::fs::remove_file(&http_sock) {
-                error!("Failed to remove HTTP socket: {}", e);
-            } else {
-                info!("Removed HTTP socket file");
+            if http_sock.exists() {
+                if let Err(e) = std::fs::remove_file(&http_sock) {
+                    error!("Failed to remove HTTP socket: {}", e);
+                } else {
+                    info!("Removed HTTP socket file");
+                }
             }
+        } else {
+            error!("PID file has no parent; skipping socket cleanup");
         }
 
         info!("Step C: Kronical shutdown complete");

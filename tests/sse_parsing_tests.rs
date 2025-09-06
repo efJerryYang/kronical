@@ -18,7 +18,6 @@ fn parses_single_sse_event_into_snapshot() {
         next_timeout: None,
         storage: Default::default(),
         config: Default::default(),
-        replay: Default::default(),
         health: vec![],
         aggregated_apps: vec![],
     };

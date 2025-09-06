@@ -1,21 +1,19 @@
 use anyhow::{Context, Result};
+use chrono::Utc;
 use clap::{Parser, Subcommand};
 use crossterm::{
     event as crossterm_event, execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
-#[cfg(feature = "kroni-api")]
+
 use hyper_util::rt::TokioIo;
-use kronical as _; // ensure library is linked
-use kronical::daemon::system_tracker::trigger_tracker_flush;
-#[cfg(feature = "kroni-api")]
-use kronical::kroni_api::kroni::v1::kroni_client::KroniClient;
-#[cfg(feature = "kroni-api")]
-use kronical::kroni_api::kroni::v1::{SnapshotRequest, WatchRequest};
-use kronical::storage::StorageBackend;
-use kronical::storage::sqlite3::SqliteStorage;
+use kronical as _;
+
+use kronical::kroni_api::kroni::v1::{
+    SnapshotRequest, SystemMetricsRequest, WatchRequest, kroni_client::KroniClient,
+};
 use kronical::util::config::AppConfig;
-use log::{debug, error};
+use log::error;
 use ratatui::{
     Terminal,
     prelude::{Backend, Constraint, CrosstermBackend, Direction, Layout},
@@ -29,11 +27,11 @@ use std::process::{self, Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
-#[cfg(feature = "kroni-api")]
+
 use tokio::runtime;
-#[cfg(feature = "kroni-api")]
+
 use tonic::transport::Endpoint;
-#[cfg(feature = "kroni-api")]
+
 use tower::service_fn;
 
 #[derive(Parser)]
@@ -47,6 +45,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+// TODO: add journalctl like functionality.
 enum Commands {
     Start,
     Stop,
@@ -61,13 +60,6 @@ enum Commands {
         pretty: bool,
     },
     Monitor,
-    Replay {
-        #[arg(long, default_value_t = 60.0)]
-        speed: f64,
-        #[arg(long)]
-        minutes: Option<u64>,
-    },
-    ReplayMonitor,
     Tracker {
         #[command(subcommand)]
         action: TrackerAction,
@@ -77,6 +69,9 @@ enum Commands {
 #[derive(Subcommand)]
 enum TrackerAction {
     Show {
+        /// Show last N rows from current daemon run (default: 10)
+        #[arg(value_name = "count")]
+        count: Option<usize>,
         #[arg(long)]
         watch: bool,
     },
@@ -143,7 +138,7 @@ fn spawn_kronid() -> Result<()> {
 }
 
 fn stop_daemon(data_file: PathBuf) -> Result<()> {
-    let pid_file = data_file.parent().unwrap().join("kronid.pid");
+    let pid_file = kronical::util::paths::pid_file(data_file.parent().unwrap());
     if let Some(pid) = read_pid_file(&pid_file)? {
         if is_process_running(pid) {
             println!("Stopping Kronical daemon (PID: {})...", pid);
@@ -171,7 +166,7 @@ fn stop_daemon(data_file: PathBuf) -> Result<()> {
 }
 
 fn start_daemon(data_file: PathBuf, _app_config: AppConfig) -> Result<()> {
-    let pid_file = data_file.parent().unwrap().join("kronid.pid");
+    let pid_file = kronical::util::paths::pid_file(data_file.parent().unwrap());
     if let Some(existing_pid) = read_pid_file(&pid_file)? {
         if is_process_running(existing_pid) {
             return Err(anyhow::anyhow!(
@@ -201,7 +196,7 @@ fn get_status(data_file: PathBuf) -> Result<()> {
         local_now.format("%Y-%m-%d %H:%M:%S %Z")
     );
     println!("═════════════════════════════════════════════════════════════\n");
-    let uds_http = data_file.parent().unwrap().join("kroni.http.sock");
+    let uds_http = kronical::util::paths::http_uds(data_file.parent().unwrap());
     match http_get_snapshot(&uds_http) {
         Ok(snap) => {
             println!("Kronical Daemon:");
@@ -244,7 +239,7 @@ fn monitor_realtime(data_file: PathBuf) -> Result<()> {
         terminal.backend_mut(),
         crossterm::event::DisableMouseCapture
     )?;
-    let res = run_monitor_loop(&mut terminal, data_file, false);
+    let res = run_monitor_loop(&mut terminal, data_file);
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -258,38 +253,10 @@ fn monitor_realtime(data_file: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn monitor_replay(data_file: PathBuf) -> Result<()> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-    execute!(
-        terminal.backend_mut(),
-        crossterm::event::DisableMouseCapture
-    )?;
-    let res = run_monitor_loop(&mut terminal, data_file, true);
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        crossterm::event::DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
-    if let Err(err) = res {
-        println!("Error in monitor: {:?}", err);
-    }
-    Ok(())
-}
-
-fn run_monitor_loop<B: Backend>(
-    terminal: &mut Terminal<B>,
-    data_file: PathBuf,
-    _replay: bool,
-) -> io::Result<()> {
+fn run_monitor_loop<B: Backend>(terminal: &mut Terminal<B>, data_file: PathBuf) -> io::Result<()> {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream as StdUnixStream;
-    let uds_http = data_file.parent().unwrap().join("kroni.http.sock");
+    let uds_http = kronical::util::paths::http_uds(data_file.parent().unwrap());
     loop {
         match StdUnixStream::connect(&uds_http) {
             Ok(mut stream) => {
@@ -348,10 +315,9 @@ fn run_monitor_loop<B: Backend>(
                                     let top = Block::default()
                                         .title("Daemon Stats")
                                         .borders(Borders::ALL);
-                                    let pid_file = dirs::home_dir()
-                                        .unwrap_or_default()
-                                        .join(".kronical")
-                                        .join("kronid.pid");
+                                    let pid_file = kronical::util::paths::pid_file(
+                                        &dirs::home_dir().unwrap_or_default().join(".kronical"),
+                                    );
                                     let pid = std::fs::read_to_string(pid_file)
                                         .ok()
                                         .and_then(|s| s.trim().parse::<u32>().ok())
@@ -421,7 +387,7 @@ fn run_monitor_loop<B: Backend>(
                                     ];
                                     let p = Paragraph::new(lines).block(top);
                                     f.render_widget(p, layout[0]);
-                                    // Middle: Aggregated apps summary
+                                    // Middle: Details (moved above Apps)
                                     let mut app_lines: Vec<Line> = Vec::new();
                                     if !snap.aggregated_apps.is_empty() {
                                         app_lines.push(Line::from("Apps (latest first):"));
@@ -450,12 +416,7 @@ fn run_monitor_loop<B: Backend>(
                                     } else {
                                         app_lines.push(Line::from("Apps: (no recent activity)"));
                                     }
-                                    let p_apps = Paragraph::new(app_lines)
-                                        .block(Block::default().title("Apps").borders(Borders::ALL))
-                                        .wrap(Wrap { trim: true });
-                                    f.render_widget(p_apps, layout[1]);
-
-                                    // Bottom: Details
+                                    // Build Details content
                                     let mut details: Vec<Line> = Vec::new();
                                     details.push(Line::from(format!(
                                         "Counts: signals={} hints={} records={}",
@@ -483,12 +444,19 @@ fn run_monitor_loop<B: Backend>(
                                             details.push(Line::from(format!("- {}", h)));
                                         }
                                     }
+                                    // Render Details in the middle panel
                                     let p2 = Paragraph::new(details)
                                         .block(
                                             Block::default().title("Details").borders(Borders::ALL),
                                         )
                                         .wrap(Wrap { trim: true });
-                                    f.render_widget(p2, layout[2]);
+                                    f.render_widget(p2, layout[1]);
+
+                                    // Bottom: Aggregated apps summary (moved below Details)
+                                    let p_apps = Paragraph::new(app_lines)
+                                        .block(Block::default().title("Apps").borders(Borders::ALL))
+                                        .wrap(Wrap { trim: true });
+                                    f.render_widget(p_apps, layout[2]);
                                 })?;
                             }
                             data_buf.clear();
@@ -519,26 +487,6 @@ fn run_monitor_loop<B: Backend>(
     }
 }
 
-// legacy monitor socket removed
-
-fn start_replay_daemon(
-    data_file: PathBuf,
-    app_config: AppConfig,
-    speed: f64,
-    minutes: u64,
-) -> Result<()> {
-    let workspace_dir = data_file.parent().unwrap().to_path_buf();
-    let data_store: Box<dyn StorageBackend> =
-        Box::new(SqliteStorage::new(&data_file).context("Failed to initialize SQLite data store")?);
-    kronical::daemon::replay::run_replay(
-        data_store,
-        workspace_dir,
-        speed,
-        minutes,
-        (app_config.active_grace_secs, app_config.idle_threshold_secs),
-    )
-}
-
 fn main() {
     let cli = Cli::parse();
     setup_logging(cli.verbose);
@@ -559,22 +507,22 @@ fn main() {
         Commands::Stop => stop_daemon(data_file),
         Commands::Restart => restart_daemon(data_file, config.clone()),
         Commands::Status => get_status(data_file),
-        Commands::Snapshot { pretty } => {
-            snapshot_autoselect(&config.workspace_dir.join("kroni.http.sock"), pretty)
-        }
-        Commands::Watch { pretty } => {
-            watch_via_http(&config.workspace_dir.join("kroni.http.sock"), pretty)
-        }
+        Commands::Snapshot { pretty } => snapshot_autoselect(
+            &kronical::util::paths::http_uds(&config.workspace_dir),
+            pretty,
+        ),
+        Commands::Watch { pretty } => watch_via_http(
+            &kronical::util::paths::http_uds(&config.workspace_dir),
+            pretty,
+        ),
         Commands::Monitor => monitor_realtime(data_file),
-        Commands::Replay { speed, minutes } => {
-            let minutes = minutes.unwrap_or(config.retention_minutes);
-            start_replay_daemon(data_file, config.clone(), speed, minutes)
-        }
-        Commands::ReplayMonitor => monitor_replay(data_file),
         Commands::Tracker { action } => match action {
-            TrackerAction::Show { watch } => {
-                tracker_show(&config.workspace_dir, watch, config.tracker_refresh_secs)
-            }
+            TrackerAction::Show { count, watch } => tracker_show(
+                &config.workspace_dir,
+                count,
+                watch,
+                config.tracker_refresh_secs,
+            ),
             TrackerAction::Status => tracker_status(&config),
         },
     };
@@ -585,7 +533,6 @@ fn main() {
 }
 
 fn snapshot_autoselect(uds_http: &PathBuf, pretty: bool) -> Result<()> {
-    #[cfg(feature = "kroni-api")]
     {
         if let Ok(snap) = grpc_snapshot(uds_http) {
             if pretty {
@@ -701,10 +648,8 @@ fn sse_watch_via_http(uds_path: &PathBuf, pretty: bool) -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "kroni-api")]
 fn grpc_snapshot(uds_http: &PathBuf) -> Result<kronical::daemon::snapshot::Snapshot> {
-    use chrono::{DateTime, Utc};
-    let uds_grpc = uds_http.with_file_name("kroni.sock");
+    let uds_grpc = kronical::util::paths::grpc_uds(uds_http.parent().unwrap());
     let rt = runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -727,192 +672,178 @@ fn grpc_snapshot(uds_http: &PathBuf) -> Result<kronical::daemon::snapshot::Snaps
             }))
             .await?
             .into_inner();
-        // Map reply into our Snapshot for pretty printing/unified handling
-        let state = match reply.activity_state {
-            1 => kronical::daemon::records::ActivityState::Active,
-            2 => kronical::daemon::records::ActivityState::Passive,
-            3 => kronical::daemon::records::ActivityState::Inactive,
-            4 => kronical::daemon::records::ActivityState::Locked,
-            _ => kronical::daemon::records::ActivityState::Inactive,
-        };
-        let focus = reply
-            .focus
-            .map(|f| kronical::daemon::events::WindowFocusInfo {
-                pid: f.pid,
-                process_start_time: 0,
-                app_name: Arc::new(f.app),
-                window_title: Arc::new(f.title),
-                window_id: f.window_id.parse().unwrap_or(0),
-                window_instance_start: DateTime::parse_from_rfc3339(&f.since_rfc3339)
-                    .ok()
-                    .map(|dt| dt.with_timezone(&Utc))
-                    .unwrap_or_else(Utc::now),
-                window_position: None,
-                window_size: None,
-            });
-        let last_transition =
-            reply
-                .last_transition
-                .map(|t| kronical::daemon::snapshot::Transition {
-                    from: match t.from {
-                        1 => kronical::daemon::records::ActivityState::Active,
-                        2 => kronical::daemon::records::ActivityState::Passive,
-                        3 => kronical::daemon::records::ActivityState::Inactive,
-                        4 => kronical::daemon::records::ActivityState::Locked,
-                        _ => kronical::daemon::records::ActivityState::Inactive,
-                    },
-                    to: match t.to {
-                        1 => kronical::daemon::records::ActivityState::Active,
-                        2 => kronical::daemon::records::ActivityState::Passive,
-                        3 => kronical::daemon::records::ActivityState::Inactive,
-                        4 => kronical::daemon::records::ActivityState::Locked,
-                        _ => kronical::daemon::records::ActivityState::Inactive,
-                    },
-                    at: DateTime::parse_from_rfc3339(&t.at_rfc3339)
-                        .ok()
-                        .map(|dt| dt.with_timezone(&Utc))
-                        .unwrap_or_else(Utc::now),
-                });
-        let counts = reply
-            .counts
-            .map(|c| kronical::daemon::snapshot::Counts {
-                signals_seen: c.signals_seen,
-                hints_seen: c.hints_seen,
-                records_emitted: c.records_emitted,
-            })
-            .unwrap_or_default();
-        let cadence_ms = reply
-            .cadence
-            .as_ref()
-            .map(|c| c.current_ms)
-            .unwrap_or_default();
-        let cadence_reason = reply.cadence.map(|c| c.reason).unwrap_or_default();
-        let next_timeout = if reply.next_timeout_rfc3339.is_empty() {
-            None
-        } else {
-            DateTime::parse_from_rfc3339(&reply.next_timeout_rfc3339)
-                .ok()
-                .map(|dt| dt.with_timezone(&Utc))
-        };
-        let storage = reply
-            .storage
-            .map(|s| kronical::daemon::snapshot::StorageInfo {
-                backlog_count: s.backlog_count,
-                last_flush_at: if s.last_flush_rfc3339.is_empty() {
-                    None
-                } else {
-                    DateTime::parse_from_rfc3339(&s.last_flush_rfc3339)
-                        .ok()
-                        .map(|dt| dt.with_timezone(&Utc))
-                },
-            })
-            .unwrap_or_default();
-        let config = reply
-            .config
-            .map(|c| kronical::daemon::snapshot::ConfigSummary {
-                active_grace_secs: c.active_grace_secs,
-                idle_threshold_secs: c.idle_threshold_secs,
-                retention_minutes: c.retention_minutes,
-                ephemeral_max_duration_secs: c.ephemeral_max_duration_secs,
-                ephemeral_min_distinct_ids: c.ephemeral_min_distinct_ids as usize,
-                ephemeral_app_max_duration_secs: c.ephemeral_app_max_duration_secs,
-                ephemeral_app_min_distinct_procs: c.ephemeral_app_min_distinct_procs as usize,
-            })
-            .unwrap_or_default();
-        let replay = reply
-            .replay
-            .map(|r| kronical::daemon::snapshot::ReplayInfo {
-                mode: r.mode,
-                position: if r.position == 0 {
-                    None
-                } else {
-                    Some(r.position)
-                },
-            })
-            .unwrap_or_default();
-        let health = reply.health;
-        // Map aggregated apps if present
-        fn pretty_dur(seconds: u64) -> String {
-            if seconds == 0 {
-                return "0s".to_string();
-            }
-            let days = seconds / (24 * 3600);
-            let hours = (seconds % (24 * 3600)) / 3600;
-            let minutes = (seconds % 3600) / 60;
-            let secs = seconds % 60;
-            let mut result = String::new();
-            if days > 0 {
-                result.push_str(&format!("{}d", days));
-            }
-            if hours > 0 {
-                result.push_str(&format!("{}h", hours));
-            }
-            if minutes > 0 {
-                result.push_str(&format!("{}m", minutes));
-            }
-            if secs > 0 || result.is_empty() {
-                result.push_str(&format!("{}s", secs));
-            }
-            result
-        }
-        let aggregated_apps = reply
-            .aggregated_apps
-            .into_iter()
-            .map(|a| {
-                let windows = a
-                    .windows
-                    .into_iter()
-                    .map(|w| kronical::daemon::snapshot::SnapshotWindow {
-                        window_id: w.window_id,
-                        window_title: w.window_title,
-                        first_seen: DateTime::parse_from_rfc3339(&w.first_seen_rfc3339)
-                            .ok()
-                            .map(|dt| dt.with_timezone(&Utc))
-                            .unwrap_or_else(Utc::now),
-                        last_seen: DateTime::parse_from_rfc3339(&w.last_seen_rfc3339)
-                            .ok()
-                            .map(|dt| dt.with_timezone(&Utc))
-                            .unwrap_or_else(Utc::now),
-                        duration_seconds: w.duration_seconds,
-                        is_group: w.is_group,
-                    })
-                    .collect();
-                kronical::daemon::snapshot::SnapshotApp {
-                    app_name: a.app_name,
-                    pid: a.pid,
-                    process_start_time: a.process_start_time,
-                    windows,
-                    total_duration_secs: a.total_duration_secs,
-                    total_duration_pretty: if a.total_duration_pretty.is_empty() {
-                        pretty_dur(a.total_duration_secs)
-                    } else {
-                        a.total_duration_pretty
-                    },
-                }
-            })
-            .collect();
-        let snap = kronical::daemon::snapshot::Snapshot {
-            seq: reply.seq,
-            mono_ns: reply.mono_ns,
-            activity_state: state,
-            focus,
-            last_transition,
-            counts,
-            cadence_ms,
-            cadence_reason,
-            next_timeout,
-            storage,
-            config,
-            replay,
-            health,
-            aggregated_apps,
-        };
-        Ok::<_, anyhow::Error>(snap)
+        Ok::<_, anyhow::Error>(map_pb_snapshot(reply))
     })
 }
 
+fn map_pb_snapshot(
+    reply: kronical::kroni_api::kroni::v1::SnapshotReply,
+) -> kronical::daemon::snapshot::Snapshot {
+    // not using Utc here anymore; the server handles time bounds
+    let state = match reply.activity_state {
+        1 => kronical::daemon::records::ActivityState::Active,
+        2 => kronical::daemon::records::ActivityState::Passive,
+        3 => kronical::daemon::records::ActivityState::Inactive,
+        4 => kronical::daemon::records::ActivityState::Locked,
+        _ => kronical::daemon::records::ActivityState::Inactive,
+    };
+    let focus = reply
+        .focus
+        .map(|f| kronical::daemon::events::WindowFocusInfo {
+            pid: f.pid,
+            process_start_time: 0,
+            app_name: Arc::new(f.app),
+            window_title: Arc::new(f.title),
+            window_id: f.window_id.parse().unwrap_or(0),
+            window_instance_start: f
+                .since
+                .and_then(|ts| chrono::DateTime::<Utc>::from_timestamp(ts.seconds, ts.nanos as u32))
+                .unwrap_or_else(Utc::now),
+            window_position: None,
+            window_size: None,
+        });
+    let last_transition = reply
+        .last_transition
+        .map(|t| kronical::daemon::snapshot::Transition {
+            from: match t.from {
+                1 => kronical::daemon::records::ActivityState::Active,
+                2 => kronical::daemon::records::ActivityState::Passive,
+                3 => kronical::daemon::records::ActivityState::Inactive,
+                4 => kronical::daemon::records::ActivityState::Locked,
+                _ => kronical::daemon::records::ActivityState::Inactive,
+            },
+            to: match t.to {
+                1 => kronical::daemon::records::ActivityState::Active,
+                2 => kronical::daemon::records::ActivityState::Passive,
+                3 => kronical::daemon::records::ActivityState::Inactive,
+                4 => kronical::daemon::records::ActivityState::Locked,
+                _ => kronical::daemon::records::ActivityState::Inactive,
+            },
+            at: t
+                .at
+                .and_then(|ts| chrono::DateTime::<Utc>::from_timestamp(ts.seconds, ts.nanos as u32))
+                .unwrap_or_else(Utc::now),
+        });
+    let counts = reply
+        .counts
+        .map(|c| kronical::daemon::snapshot::Counts {
+            signals_seen: c.signals_seen,
+            hints_seen: c.hints_seen,
+            records_emitted: c.records_emitted,
+        })
+        .unwrap_or_default();
+    let cadence_ms = reply
+        .cadence
+        .as_ref()
+        .map(|c| c.current_ms)
+        .unwrap_or_default();
+    let cadence_reason = reply.cadence.map(|c| c.reason).unwrap_or_default();
+    let next_timeout = reply
+        .next_timeout
+        .and_then(|ts| chrono::DateTime::<Utc>::from_timestamp(ts.seconds, ts.nanos as u32));
+    let storage = reply
+        .storage
+        .map(|s| kronical::daemon::snapshot::StorageInfo {
+            backlog_count: s.backlog_count,
+            last_flush_at: s.last_flush.and_then(|ts| {
+                chrono::DateTime::<Utc>::from_timestamp(ts.seconds, ts.nanos as u32)
+            }),
+        })
+        .unwrap_or_default();
+    let config = reply
+        .config
+        .map(|c| kronical::daemon::snapshot::ConfigSummary {
+            active_grace_secs: c.active_grace_secs,
+            idle_threshold_secs: c.idle_threshold_secs,
+            retention_minutes: c.retention_minutes,
+            ephemeral_max_duration_secs: c.ephemeral_max_duration_secs,
+            ephemeral_min_distinct_ids: c.ephemeral_min_distinct_ids as usize,
+            ephemeral_app_max_duration_secs: c.ephemeral_app_max_duration_secs,
+            ephemeral_app_min_distinct_procs: c.ephemeral_app_min_distinct_procs as usize,
+        })
+        .unwrap_or_default();
+    let health = reply.health;
+    fn pretty_dur(seconds: u64) -> String {
+        if seconds == 0 {
+            return "0s".to_string();
+        }
+        let days = seconds / (24 * 3600);
+        let hours = (seconds % (24 * 3600)) / 3600;
+        let minutes = (seconds % 3600) / 60;
+        let secs = seconds % 60;
+        let mut result = String::new();
+        if days > 0 {
+            result.push_str(&format!("{}d", days));
+        }
+        if hours > 0 {
+            result.push_str(&format!("{}h", hours));
+        }
+        if minutes > 0 {
+            result.push_str(&format!("{}m", minutes));
+        }
+        if secs > 0 || result.is_empty() {
+            result.push_str(&format!("{}s", secs));
+        }
+        result
+    }
+    let aggregated_apps = reply
+        .aggregated_apps
+        .into_iter()
+        .map(|a| {
+            let windows = a
+                .windows
+                .into_iter()
+                .map(|w| kronical::daemon::snapshot::SnapshotWindow {
+                    window_id: w.window_id,
+                    window_title: w.window_title,
+                    first_seen: w
+                        .first_seen
+                        .and_then(|ts| {
+                            chrono::DateTime::<Utc>::from_timestamp(ts.seconds, ts.nanos as u32)
+                        })
+                        .unwrap_or_else(Utc::now),
+                    last_seen: w
+                        .last_seen
+                        .and_then(|ts| {
+                            chrono::DateTime::<Utc>::from_timestamp(ts.seconds, ts.nanos as u32)
+                        })
+                        .unwrap_or_else(Utc::now),
+                    duration_seconds: w.duration_seconds,
+                    is_group: w.is_group,
+                })
+                .collect();
+            kronical::daemon::snapshot::SnapshotApp {
+                app_name: a.app_name,
+                pid: a.pid,
+                process_start_time: a.process_start_time,
+                windows,
+                total_duration_secs: a.total_duration_secs,
+                total_duration_pretty: if a.total_duration_pretty.is_empty() {
+                    pretty_dur(a.total_duration_secs)
+                } else {
+                    a.total_duration_pretty
+                },
+            }
+        })
+        .collect();
+    kronical::daemon::snapshot::Snapshot {
+        seq: reply.seq,
+        mono_ns: reply.mono_ns,
+        activity_state: state,
+        focus,
+        last_transition,
+        counts,
+        cadence_ms,
+        cadence_reason,
+        next_timeout,
+        storage,
+        config,
+        health,
+        aggregated_apps,
+    }
+}
+
 fn sse_watch_via_grpc_then_http(uds_path: &PathBuf, pretty: bool) -> Result<()> {
-    #[cfg(feature = "kroni-api")]
     {
         if let Err(_e) = grpc_watch(uds_path, pretty) {
             // Fallback to HTTP SSE
@@ -925,10 +856,9 @@ fn sse_watch_via_grpc_then_http(uds_path: &PathBuf, pretty: bool) -> Result<()> 
     sse_watch_via_http(uds_path, pretty)
 }
 
-#[cfg(feature = "kroni-api")]
 fn grpc_watch(_uds_http_sock: &PathBuf, pretty: bool) -> Result<()> {
-    // The gRPC UDS is at kroni.sock next to http.sock
-    let uds_grpc = _uds_http_sock.with_file_name("kroni.sock");
+    // The gRPC UDS path is derived from the workspace dir
+    let uds_grpc = kronical::util::paths::grpc_uds(_uds_http_sock.parent().unwrap());
     let rt = runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -962,7 +892,8 @@ fn grpc_watch(_uds_http_sock: &PathBuf, pretty: bool) -> Result<()> {
                     item.cadence.as_ref().map(|c| c.current_ms).unwrap_or(0)
                 );
             } else {
-                println!("{}", serde_json::to_string(&item).unwrap_or_default());
+                let snap = map_pb_snapshot(item);
+                println!("{}", serde_json::to_string(&snap).unwrap_or_default());
             }
         }
         Ok::<(), anyhow::Error>(())
@@ -1006,7 +937,7 @@ fn print_snapshot_pretty(s: &kronical::daemon::snapshot::Snapshot) {
         s.config.ephemeral_max_duration_secs,
         s.config.ephemeral_min_distinct_ids
     );
-    println!("- mode: {}", s.replay.mode);
+    // Replay removed
     if !s.health.is_empty() {
         println!("- health: {}", s.health.join(", "));
     }
@@ -1034,19 +965,19 @@ fn tracker_status(config: &AppConfig) -> Result<()> {
         return Ok(());
     }
 
-    let daemon_pid_file = config.workspace_dir.join("kronid.pid");
+    let daemon_pid_file = kronical::util::paths::pid_file(&config.workspace_dir);
     if let Ok(Some(pid)) = read_pid_file(&daemon_pid_file) {
         if is_process_running(pid) {
             println!("Status: ENABLED and running with daemon (PID: {})", pid);
             println!("Interval: {} seconds", config.tracker_interval_secs);
             println!("Batch size: {}", config.tracker_batch_size);
 
-            let zip_path = config.workspace_dir.join("system-tracker.zip");
-            if zip_path.exists() {
-                let metadata = std::fs::metadata(&zip_path)?;
+            let db_path = kronical::util::paths::tracker_db(&config.workspace_dir);
+            if db_path.exists() {
+                let metadata = std::fs::metadata(&db_path)?;
                 println!(
                     "Data file: {} ({} bytes)",
-                    zip_path.display(),
+                    db_path.display(),
                     metadata.len()
                 );
                 let modified = metadata.modified()?;
@@ -1072,26 +1003,30 @@ fn cleanup_stale_tracker_pid(workspace_dir: &PathBuf) {
     }
 }
 
-fn tracker_show(workspace_dir: &PathBuf, watch: bool, refresh_interval_secs: f64) -> Result<()> {
-    let zip_path = workspace_dir.join("system-tracker.zip");
-
+fn tracker_show(
+    workspace_dir: &PathBuf,
+    count: Option<usize>,
+    watch: bool,
+    refresh_interval_secs: f64,
+) -> Result<()> {
     cleanup_stale_tracker_pid(workspace_dir);
 
-    let trigger_flush_and_show = || -> Result<()> {
-        if let Err(_) = trigger_tracker_flush(workspace_dir) {
-            debug!("Could not trigger tracker flush (daemon may not be running)");
-        }
-
-        std::thread::sleep(Duration::from_millis(100));
-
-        if !zip_path.exists() {
+    let show_data = || -> Result<()> {
+        let daemon_pid_file = kronical::util::paths::pid_file(workspace_dir);
+        let pid = if let Ok(Some(pid)) = read_pid_file(&daemon_pid_file) {
+            if !is_process_running(pid) {
+                return Err(anyhow::anyhow!(
+                    "Daemon not running. Start the daemon first with 'kronictl start'"
+                ));
+            }
+            pid
+        } else {
             return Err(anyhow::anyhow!(
-                "No tracker data found at {}. Make sure tracker_enabled = true in config and daemon is running.",
-                zip_path.display()
+                "Daemon not running. Start the daemon first with 'kronictl start'"
             ));
-        }
+        };
 
-        show_tracker_data(&zip_path)
+        show_tracker_data_grpc(workspace_dir, count, pid)
     };
 
     if watch {
@@ -1099,57 +1034,160 @@ fn tracker_show(workspace_dir: &PathBuf, watch: bool, refresh_interval_secs: f64
         let refresh_duration = Duration::from_secs_f64(refresh_interval_secs);
 
         loop {
-            trigger_flush_and_show()?;
+            show_data()?;
             std::thread::sleep(refresh_duration);
         }
     } else {
-        trigger_flush_and_show()?;
+        show_data()?;
     }
 
     Ok(())
 }
 
-fn show_tracker_data(zip_path: &PathBuf) -> Result<()> {
-    use std::fs::File;
-    use std::io::Read;
-    use zip::ZipArchive;
+fn show_tracker_data_grpc(
+    workspace_dir: &PathBuf,
+    count: Option<usize>,
+    daemon_pid: u32,
+) -> Result<()> {
+    use tonic::transport::Endpoint;
+    use tower::service_fn;
 
-    let file = File::open(zip_path)?;
-    let mut archive = ZipArchive::new(file)?;
+    // Server is responsible for flush-before-query to avoid client/server
+    // workspace drift and snapshot ordering issues.
 
-    let mut csv_file = archive.by_name("system-metrics.csv")?;
-    let mut contents = String::new();
-    csv_file.read_to_string(&mut contents)?;
+    let uds_grpc = kronical::util::paths::grpc_uds(workspace_dir);
+    let rt = runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
 
-    let mut reader = csv::Reader::from_reader(contents.as_bytes());
+    rt.block_on(async move {
+        let uds_grpc_dbg = uds_grpc.clone();
+        let ep = Endpoint::try_from("http://localhost")?;
+        let channel = ep
+            .connect_with_connector(service_fn(move |_| {
+                let p = uds_grpc.clone();
+                async move {
+                    let stream = tokio::net::UnixStream::connect(p).await?;
+                    Ok::<_, std::io::Error>(TokioIo::new(stream))
+                }
+            }))
+            .await?;
 
-    println!(
-        "{:<20} {:>8} {:>12} {:>12}",
-        "Timestamp", "CPU %", "Memory KB", "Disk IO KB"
-    );
-    println!("{}", "-".repeat(64));
+        let mut client = KroniClient::new(channel);
 
-    for result in reader.records() {
-        let record = result?;
-        if record.len() >= 4 {
-            let timestamp = &record[0];
-            let cpu = record[1].parse::<f64>().unwrap_or(0.0);
-            let memory_kb = record[2].parse::<u64>().unwrap_or(0) / 1024;
-            let disk_io_kb = record[3].parse::<u64>().unwrap_or(0) / 1024;
+        // Default to the last 10 rows from the current daemon run (by PID).
+        let limit_rows: usize = count.unwrap_or(10);
+        let pid_to_query = daemon_pid;
 
-            let time_part = timestamp
-                .split('T')
-                .nth(1)
-                .unwrap_or(timestamp)
-                .split('.')
-                .next()
-                .unwrap_or("");
+        // Ask the server for the latest N rows for this PID (no time range).
+        let request = SystemMetricsRequest {
+            pid: pid_to_query,
+            start_time: None,
+            end_time: None,
+            limit: limit_rows as u32,
+        };
+
+        println!(
+            "Debug: UDS={} PID={} limit={} (server flush-before-query)",
+            uds_grpc_dbg.display(),
+            pid_to_query,
+            limit_rows
+        );
+
+        let response = client
+            .get_system_metrics(tonic::Request::new(request))
+            .await?
+            .into_inner();
+
+        if response.metrics.is_empty() {
+            println!("No tracker data found for current daemon run");
+            return Ok(());
+        }
+
+        println!(
+            "{:<32} {:>8} {:>12} {:>12}",
+            "Timestamp (RFC3339)", "CPU %", "Memory KB", "Disk IO KB"
+        );
+        println!("{}", "-".repeat(68));
+
+        for metric in &response.metrics {
+            let time_part = match &metric.timestamp {
+                Some(ts) => {
+                    let secs = ts.seconds;
+                    let nanos = ts.nanos;
+                    let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, nanos as u32)
+                        .ok_or_else(|| anyhow::anyhow!("Invalid timestamp range"))?;
+                    use chrono::SecondsFormat;
+                    // Fixed-width RFC3339 with micros to keep columns aligned (32 chars in UTC)
+                    dt.to_rfc3339_opts(SecondsFormat::Micros, true)
+                }
+                None => "unknown".to_string(),
+            };
+            let memory_kb = metric.memory_bytes / 1024;
+            let disk_io_kb = metric.disk_io_bytes / 1024;
+
             println!(
-                "{:<20} {:>8.1} {:>12.1} {:>12.1}",
-                time_part, cpu, memory_kb as f64, disk_io_kb as f64
+                "{:<32} {:>8.1} {:>12} {:>12}",
+                time_part, metric.cpu_percent, memory_kb, disk_io_kb
             );
         }
-    }
+
+        if let (Some(first), Some(last)) = (response.metrics.first(), response.metrics.last()) {
+            let first_time = first
+                .timestamp
+                .as_ref()
+                .and_then(|ts| {
+                    use chrono::SecondsFormat;
+                    chrono::DateTime::<chrono::Utc>::from_timestamp(ts.seconds, ts.nanos as u32)
+                        .map(|dt| dt.to_rfc3339_opts(SecondsFormat::Micros, true))
+                })
+                .unwrap_or_else(|| "unknown".to_string());
+            let last_time = last
+                .timestamp
+                .as_ref()
+                .and_then(|ts| {
+                    use chrono::SecondsFormat;
+                    chrono::DateTime::<chrono::Utc>::from_timestamp(ts.seconds, ts.nanos as u32)
+                        .map(|dt| dt.to_rfc3339_opts(SecondsFormat::Micros, true))
+                })
+                .unwrap_or_else(|| "unknown".to_string());
+
+            println!();
+            println!(
+                "Showing {} entries from {} to {}",
+                response.metrics.len(),
+                first_time,
+                last_time
+            );
+            // Help users diagnose mismatches: show the PID and the expected DB path
+            let db_path = kronical::util::paths::tracker_db(workspace_dir);
+            println!("Source: PID={} DB={}", pid_to_query, db_path.display());
+
+            // Diagnostic: show recency delta
+            if let Some(ts) = last.timestamp.as_ref() {
+                if let Some(last_dt) =
+                    chrono::DateTime::<chrono::Utc>::from_timestamp(ts.seconds, ts.nanos as u32)
+                {
+                    let now = chrono::Utc::now();
+                    let delta = now.signed_duration_since(last_dt).num_seconds();
+                    println!("Debug: last_ts_age={}s (now={})", delta, now.to_rfc3339());
+                }
+            }
+        }
+
+        Ok::<(), anyhow::Error>(())
+    })?;
 
     Ok(())
+}
+
+#[cfg(not(feature = "kroni-api"))]
+fn show_tracker_data_grpc(
+    _workspace_dir: &PathBuf,
+    _count: Option<usize>,
+    _daemon_pid: u32,
+) -> Result<()> {
+    Err(anyhow::anyhow!(
+        "gRPC API not available. Compile with --features kroni-api to enable system tracker access."
+    ))
 }

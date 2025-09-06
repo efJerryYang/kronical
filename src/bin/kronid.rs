@@ -1,8 +1,10 @@
 use anyhow::{Context, Result};
 use kronical::daemon::coordinator::EventCoordinator;
 use kronical::storage::StorageBackend;
+use kronical::storage::duckdb::DuckDbStorage;
 use kronical::storage::sqlite3::SqliteStorage;
 use kronical::util::config::AppConfig;
+use kronical::util::config::DatabaseBackendConfig;
 use log::{error, info};
 use std::path::PathBuf;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
@@ -15,10 +17,9 @@ fn ensure_workspace_dir(workspace_dir: &PathBuf) -> Result<()> {
     Ok(())
 }
 
+// TODO: bad code, we should use certain library to check
 fn is_process_running(pid: u32) -> bool {
-    use std::process::Command;
-
-    Command::new("ps")
+    std::process::Command::new("ps")
         .args(["-p", &pid.to_string()])
         .output()
         .map(|output| output.status.success())
@@ -163,8 +164,11 @@ fn main() {
         std::process::exit(1);
     }
 
-    let data_file = config.workspace_dir.join("data.db");
-    let pid_file = config.workspace_dir.join("kronid.pid");
+    let data_file = match config.db_backend {
+        DatabaseBackendConfig::Duckdb => config.workspace_dir.join("data.duckdb"),
+        DatabaseBackendConfig::Sqlite3 => config.workspace_dir.join("data.sqlite3"),
+    };
+    let pid_file = kronical::util::paths::pid_file(&config.workspace_dir);
     if let Err(e) = write_pid_file(&pid_file) {
         error!("Failed to write PID: {}", e);
         std::process::exit(1);
@@ -177,12 +181,21 @@ fn main() {
 
     info!("Starting Kronical daemon (kronid)");
 
-    let data_store: Box<dyn StorageBackend> = match SqliteStorage::new(&data_file) {
-        Ok(s) => Box::new(s),
-        Err(e) => {
-            error!("Failed to initialize SQLite store: {}", e);
-            std::process::exit(1);
-        }
+    let data_store: Box<dyn StorageBackend> = match config.db_backend {
+        DatabaseBackendConfig::Duckdb => match DuckDbStorage::new(&data_file) {
+            Ok(s) => Box::new(s),
+            Err(e) => {
+                error!("Failed to initialize DuckDB store: {}", e);
+                std::process::exit(1);
+            }
+        },
+        DatabaseBackendConfig::Sqlite3 => match SqliteStorage::new(&data_file) {
+            Ok(s) => Box::new(s),
+            Err(e) => {
+                error!("Failed to initialize SQLite store: {}", e);
+                std::process::exit(1);
+            }
+        },
     };
 
     let coordinator = EventCoordinator::new(
