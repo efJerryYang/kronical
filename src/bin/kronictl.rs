@@ -12,8 +12,6 @@ use kronical as _;
 use kronical::kroni_api::kroni::v1::{
     SnapshotRequest, SystemMetricsRequest, WatchRequest, kroni_client::KroniClient,
 };
-use kronical::storage::StorageBackend;
-use kronical::storage::sqlite3::SqliteStorage;
 use kronical::util::config::AppConfig;
 use log::error;
 use ratatui::{
@@ -62,13 +60,6 @@ enum Commands {
         pretty: bool,
     },
     Monitor,
-    Replay {
-        #[arg(long, default_value_t = 60.0)]
-        speed: f64,
-        #[arg(long)]
-        minutes: Option<u64>,
-    },
-    ReplayMonitor,
     Tracker {
         #[command(subcommand)]
         action: TrackerAction,
@@ -248,7 +239,7 @@ fn monitor_realtime(data_file: PathBuf) -> Result<()> {
         terminal.backend_mut(),
         crossterm::event::DisableMouseCapture
     )?;
-    let res = run_monitor_loop(&mut terminal, data_file, false);
+    let res = run_monitor_loop(&mut terminal, data_file);
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -262,35 +253,7 @@ fn monitor_realtime(data_file: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn monitor_replay(data_file: PathBuf) -> Result<()> {
-    enable_raw_mode()?;
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen)?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend)?;
-    execute!(
-        terminal.backend_mut(),
-        crossterm::event::DisableMouseCapture
-    )?;
-    let res = run_monitor_loop(&mut terminal, data_file, true);
-    disable_raw_mode()?;
-    execute!(
-        terminal.backend_mut(),
-        LeaveAlternateScreen,
-        crossterm::event::DisableMouseCapture
-    )?;
-    terminal.show_cursor()?;
-    if let Err(err) = res {
-        println!("Error in monitor: {:?}", err);
-    }
-    Ok(())
-}
-
-fn run_monitor_loop<B: Backend>(
-    terminal: &mut Terminal<B>,
-    data_file: PathBuf,
-    _replay: bool,
-) -> io::Result<()> {
+fn run_monitor_loop<B: Backend>(terminal: &mut Terminal<B>, data_file: PathBuf) -> io::Result<()> {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream as StdUnixStream;
     let uds_http = data_file.parent().unwrap().join("kroni.http.sock");
@@ -523,26 +486,6 @@ fn run_monitor_loop<B: Backend>(
     }
 }
 
-// legacy monitor socket removed
-
-fn start_replay_daemon(
-    data_file: PathBuf,
-    app_config: AppConfig,
-    speed: f64,
-    minutes: u64,
-) -> Result<()> {
-    let workspace_dir = data_file.parent().unwrap().to_path_buf();
-    let data_store: Box<dyn StorageBackend> =
-        Box::new(SqliteStorage::new(&data_file).context("Failed to initialize SQLite data store")?);
-    kronical::daemon::replay::run_replay(
-        data_store,
-        workspace_dir,
-        speed,
-        minutes,
-        (app_config.active_grace_secs, app_config.idle_threshold_secs),
-    )
-}
-
 fn main() {
     let cli = Cli::parse();
     setup_logging(cli.verbose);
@@ -570,11 +513,6 @@ fn main() {
             watch_via_http(&config.workspace_dir.join("kroni.http.sock"), pretty)
         }
         Commands::Monitor => monitor_realtime(data_file),
-        Commands::Replay { speed, minutes } => {
-            let minutes = minutes.unwrap_or(config.retention_minutes);
-            start_replay_daemon(data_file, config.clone(), speed, minutes)
-        }
-        Commands::ReplayMonitor => monitor_replay(data_file),
         Commands::Tracker { action } => match action {
             TrackerAction::Show { count, watch } => tracker_show(
                 &config.workspace_dir,
@@ -821,17 +759,6 @@ fn map_pb_snapshot(
             ephemeral_app_min_distinct_procs: c.ephemeral_app_min_distinct_procs as usize,
         })
         .unwrap_or_default();
-    let replay = reply
-        .replay
-        .map(|r| kronical::daemon::snapshot::ReplayInfo {
-            mode: r.mode,
-            position: if r.position == 0 {
-                None
-            } else {
-                Some(r.position)
-            },
-        })
-        .unwrap_or_default();
     let health = reply.health;
     fn pretty_dur(seconds: u64) -> String {
         if seconds == 0 {
@@ -908,7 +835,6 @@ fn map_pb_snapshot(
         next_timeout,
         storage,
         config,
-        replay,
         health,
         aggregated_apps,
     }
@@ -1008,7 +934,7 @@ fn print_snapshot_pretty(s: &kronical::daemon::snapshot::Snapshot) {
         s.config.ephemeral_max_duration_secs,
         s.config.ephemeral_min_distinct_ids
     );
-    println!("- mode: {}", s.replay.mode);
+    // Replay removed
     if !s.health.is_empty() {
         println!("- health: {}", s.health.join(", "));
     }

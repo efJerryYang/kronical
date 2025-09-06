@@ -26,11 +26,6 @@ kronictl watch                    # Watch for changes
 kronictl watch --pretty           # Watch with pretty output
 kronictl monitor                  # Live TUI (press 'q' to quit)
 
-# Replay functionality
-kronictl replay                   # Replay with default speed
-kronictl replay --speed 2.0       # Replay at 2x speed
-kronictl replay-monitor           # Monitor replay mode
-
 # System tracking (when enabled in config)
 kronictl tracker status           # Show tracker status
 kronictl tracker show             # Show tracker data

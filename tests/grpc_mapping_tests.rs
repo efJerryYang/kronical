@@ -1,7 +1,6 @@
 use kronical::daemon::records::ActivityState;
 use kronical::daemon::snapshot::{
-    ConfigSummary, Counts, ReplayInfo, Snapshot, SnapshotApp, SnapshotWindow, StorageInfo,
-    Transition,
+    ConfigSummary, Counts, Snapshot, SnapshotApp, SnapshotWindow, StorageInfo, Transition,
 };
 
 #[test]
@@ -38,10 +37,7 @@ fn maps_aggregated_apps_in_grpc_snapshot_reply() {
             ephemeral_app_max_duration_secs: 45,
             ephemeral_app_min_distinct_procs: 2,
         },
-        replay: ReplayInfo {
-            mode: "live".into(),
-            position: None,
-        },
+
         health: vec!["ok".into()],
         aggregated_apps: vec![SnapshotApp {
             app_name: "vim".into(),

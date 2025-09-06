@@ -3,7 +3,7 @@ use crate::kroni_api::kroni::v1::kroni_server::{Kroni, KroniServer};
 use crate::kroni_api::kroni::v1::{
     SnapshotReply, SnapshotRequest, SystemMetric, SystemMetricsReply, SystemMetricsRequest,
     WatchRequest, snapshot_reply::ActivityState as PbState, snapshot_reply::Cadence,
-    snapshot_reply::Config, snapshot_reply::Counts, snapshot_reply::Focus, snapshot_reply::Replay,
+    snapshot_reply::Config, snapshot_reply::Counts, snapshot_reply::Focus,
     snapshot_reply::SnapshotApp as PbApp, snapshot_reply::SnapshotWindow as PbWin,
     snapshot_reply::Storage, snapshot_reply::Transition,
 };
@@ -230,10 +230,6 @@ pub fn to_pb(s: &snapshot::Snapshot) -> SnapshotReply {
         ephemeral_app_max_duration_secs: s.config.ephemeral_app_max_duration_secs,
         ephemeral_app_min_distinct_procs: s.config.ephemeral_app_min_distinct_procs as u32,
     });
-    let replay = Some(Replay {
-        mode: s.replay.mode.clone(),
-        position: s.replay.position.unwrap_or(0),
-    });
     let aggregated_apps = s
         .aggregated_apps
         .iter()
@@ -268,7 +264,6 @@ pub fn to_pb(s: &snapshot::Snapshot) -> SnapshotReply {
         next_timeout: s.next_timeout.as_ref().map(|t| utc_to_ts(*t)),
         storage,
         config,
-        replay,
         health: s.health.clone(),
         aggregated_apps,
     }

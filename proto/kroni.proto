@@ -61,11 +61,6 @@ message SnapshotReply {
     uint32 ephemeral_app_min_distinct_procs = 7;
   }
   Config config = 10;
-  message Replay {
-    string mode = 1; // "live" | "replay"
-    uint64 position = 2; // 0 if not applicable
-  }
-  Replay replay = 11;
   repeated string health = 12;
   message SnapshotWindow {
     string window_id = 1;

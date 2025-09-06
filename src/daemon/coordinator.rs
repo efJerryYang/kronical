@@ -670,10 +670,6 @@ impl EventCoordinator {
                                             last_flush_at: sm.last_flush_at,
                                         },
                                         cfg_summary.clone(),
-                                        crate::daemon::snapshot::ReplayInfo {
-                                            mode: "live".into(),
-                                            position: None,
-                                        },
                                         crate::daemon::snapshot::current_health(),
                                         aggregated_apps.clone(),
                                     );
@@ -908,10 +904,6 @@ impl EventCoordinator {
                                             last_flush_at: sm.last_flush_at,
                                         },
                                         cfg_summary.clone(),
-                                        crate::daemon::snapshot::ReplayInfo {
-                                            mode: "live".into(),
-                                            position: None,
-                                        },
                                         crate::daemon::snapshot::current_health(),
                                         aggregated_apps.clone(),
                                     );
@@ -1020,10 +1012,6 @@ impl EventCoordinator {
                                     last_flush_at: sm.last_flush_at,
                                 },
                                 cfg_summary.clone(),
-                                crate::daemon::snapshot::ReplayInfo {
-                                    mode: "live".into(),
-                                    position: None,
-                                },
                                 crate::daemon::snapshot::current_health(),
                                 aggregated_apps.clone(),
                             );
@@ -1094,10 +1082,6 @@ impl EventCoordinator {
                                 last_flush_at: sm.last_flush_at,
                             },
                             cfg_summary.clone(),
-                            crate::daemon::snapshot::ReplayInfo {
-                                mode: "live".into(),
-                                position: None,
-                            },
                             crate::daemon::snapshot::current_health(),
                             aggregated_apps,
                         );
