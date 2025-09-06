@@ -346,26 +346,17 @@ impl EventCoordinator {
 
         let (sender, receiver) = mpsc::channel();
 
-        // TODO: what does it mean by the "legacy socket"?
-        // Start Kroni gRPC API over UDS alongside the legacy socket.
-        let uds_path = pid_file.parent().unwrap().join("kroni.sock");
-        if let Err(e) = crate::daemon::kroni_server::spawn_server(uds_path) {
-            error!("Failed to start kroni API server: {}", e);
-        } else {
-            info!("Kroni API server started successfully");
-        }
-
-        // TODO: what does http-admin stands for?
-        let http_sock = pid_file.parent().unwrap().join("kroni.http.sock");
-        if let Err(e) = crate::daemon::http_server::spawn_http_server(http_sock) {
-            error!("Failed to start HTTP admin: {}", e);
-        } else {
-            info!("HTTP admin server started successfully");
+        // Start API servers (gRPC + HTTP/SSE) via unified API facade.
+        let workspace_dir = pid_file.parent().unwrap();
+        let uds_grpc = crate::util::paths::grpc_uds(workspace_dir);
+        let uds_http = crate::util::paths::http_uds(workspace_dir);
+        if let Err(e) = crate::daemon::api::spawn_all(uds_grpc, uds_http) {
+            error!("Failed to start API servers: {}", e);
         }
 
         if self.tracker_enabled {
             let current_pid = std::process::id();
-            let tracker_db_path = pid_file.parent().unwrap().join("system-tracker.duckdb");
+            let tracker_db_path = crate::util::paths::tracker_db(workspace_dir);
             let tracker = DuckDbSystemTracker::new(
                 current_pid,
                 self.tracker_interval_secs,
@@ -380,7 +371,7 @@ impl EventCoordinator {
                     current_pid
                 );
 
-                crate::daemon::kroni_server::set_system_tracker_db_path(tracker_db_path.clone());
+                crate::daemon::api::set_system_tracker_db_path(tracker_db_path.clone());
                 info!(
                     "System tracker DB path set for gRPC API: {:?}",
                     tracker_db_path

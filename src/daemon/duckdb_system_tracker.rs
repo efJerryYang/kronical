@@ -89,7 +89,7 @@ impl DuckDbSystemTracker {
         // thread to execute reads on the same in-process instance.
         let (query_tx, query_rx) = mpsc::channel::<MetricsQueryReq>();
 
-        crate::daemon::kroni_server::set_system_tracker_query_tx(query_tx.clone());
+        crate::daemon::api::set_system_tracker_query_tx(query_tx.clone());
 
         thread::spawn(move || {
             let mut store = match DuckDbSystemMetricsStore::new_file(&db_path) {

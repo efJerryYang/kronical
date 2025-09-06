@@ -9,3 +9,6 @@ pub mod snapshot;
 pub mod kroni_server;
 
 pub mod http_server;
+
+// Unified API facade around available transports (gRPC, HTTP/SSE)
+pub mod api;

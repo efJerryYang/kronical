@@ -138,7 +138,7 @@ fn spawn_kronid() -> Result<()> {
 }
 
 fn stop_daemon(data_file: PathBuf) -> Result<()> {
-    let pid_file = data_file.parent().unwrap().join("kronid.pid");
+    let pid_file = kronical::util::paths::pid_file(data_file.parent().unwrap());
     if let Some(pid) = read_pid_file(&pid_file)? {
         if is_process_running(pid) {
             println!("Stopping Kronical daemon (PID: {})...", pid);
@@ -166,7 +166,7 @@ fn stop_daemon(data_file: PathBuf) -> Result<()> {
 }
 
 fn start_daemon(data_file: PathBuf, _app_config: AppConfig) -> Result<()> {
-    let pid_file = data_file.parent().unwrap().join("kronid.pid");
+    let pid_file = kronical::util::paths::pid_file(data_file.parent().unwrap());
     if let Some(existing_pid) = read_pid_file(&pid_file)? {
         if is_process_running(existing_pid) {
             return Err(anyhow::anyhow!(
@@ -196,7 +196,7 @@ fn get_status(data_file: PathBuf) -> Result<()> {
         local_now.format("%Y-%m-%d %H:%M:%S %Z")
     );
     println!("═════════════════════════════════════════════════════════════\n");
-    let uds_http = data_file.parent().unwrap().join("kroni.http.sock");
+    let uds_http = kronical::util::paths::http_uds(data_file.parent().unwrap());
     match http_get_snapshot(&uds_http) {
         Ok(snap) => {
             println!("Kronical Daemon:");
@@ -256,7 +256,7 @@ fn monitor_realtime(data_file: PathBuf) -> Result<()> {
 fn run_monitor_loop<B: Backend>(terminal: &mut Terminal<B>, data_file: PathBuf) -> io::Result<()> {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream as StdUnixStream;
-    let uds_http = data_file.parent().unwrap().join("kroni.http.sock");
+    let uds_http = kronical::util::paths::http_uds(data_file.parent().unwrap());
     loop {
         match StdUnixStream::connect(&uds_http) {
             Ok(mut stream) => {
@@ -315,10 +315,9 @@ fn run_monitor_loop<B: Backend>(terminal: &mut Terminal<B>, data_file: PathBuf) 
                                     let top = Block::default()
                                         .title("Daemon Stats")
                                         .borders(Borders::ALL);
-                                    let pid_file = dirs::home_dir()
-                                        .unwrap_or_default()
-                                        .join(".kronical")
-                                        .join("kronid.pid");
+                                    let pid_file = kronical::util::paths::pid_file(
+                                        &dirs::home_dir().unwrap_or_default().join(".kronical"),
+                                    );
                                     let pid = std::fs::read_to_string(pid_file)
                                         .ok()
                                         .and_then(|s| s.trim().parse::<u32>().ok())
@@ -508,12 +507,14 @@ fn main() {
         Commands::Stop => stop_daemon(data_file),
         Commands::Restart => restart_daemon(data_file, config.clone()),
         Commands::Status => get_status(data_file),
-        Commands::Snapshot { pretty } => {
-            snapshot_autoselect(&config.workspace_dir.join("kroni.http.sock"), pretty)
-        }
-        Commands::Watch { pretty } => {
-            watch_via_http(&config.workspace_dir.join("kroni.http.sock"), pretty)
-        }
+        Commands::Snapshot { pretty } => snapshot_autoselect(
+            &kronical::util::paths::http_uds(&config.workspace_dir),
+            pretty,
+        ),
+        Commands::Watch { pretty } => watch_via_http(
+            &kronical::util::paths::http_uds(&config.workspace_dir),
+            pretty,
+        ),
         Commands::Monitor => monitor_realtime(data_file),
         Commands::Tracker { action } => match action {
             TrackerAction::Show { count, watch } => tracker_show(
@@ -648,7 +649,7 @@ fn sse_watch_via_http(uds_path: &PathBuf, pretty: bool) -> Result<()> {
 }
 
 fn grpc_snapshot(uds_http: &PathBuf) -> Result<kronical::daemon::snapshot::Snapshot> {
-    let uds_grpc = uds_http.with_file_name("kroni.sock");
+    let uds_grpc = kronical::util::paths::grpc_uds(uds_http.parent().unwrap());
     let rt = runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -856,8 +857,8 @@ fn sse_watch_via_grpc_then_http(uds_path: &PathBuf, pretty: bool) -> Result<()> 
 }
 
 fn grpc_watch(_uds_http_sock: &PathBuf, pretty: bool) -> Result<()> {
-    // The gRPC UDS is at kroni.sock next to http.sock
-    let uds_grpc = _uds_http_sock.with_file_name("kroni.sock");
+    // The gRPC UDS path is derived from the workspace dir
+    let uds_grpc = kronical::util::paths::grpc_uds(_uds_http_sock.parent().unwrap());
     let rt = runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -964,14 +965,14 @@ fn tracker_status(config: &AppConfig) -> Result<()> {
         return Ok(());
     }
 
-    let daemon_pid_file = config.workspace_dir.join("kronid.pid");
+    let daemon_pid_file = kronical::util::paths::pid_file(&config.workspace_dir);
     if let Ok(Some(pid)) = read_pid_file(&daemon_pid_file) {
         if is_process_running(pid) {
             println!("Status: ENABLED and running with daemon (PID: {})", pid);
             println!("Interval: {} seconds", config.tracker_interval_secs);
             println!("Batch size: {}", config.tracker_batch_size);
 
-            let db_path = config.workspace_dir.join("system-tracker.duckdb");
+            let db_path = kronical::util::paths::tracker_db(&config.workspace_dir);
             if db_path.exists() {
                 let metadata = std::fs::metadata(&db_path)?;
                 println!(
@@ -1011,7 +1012,7 @@ fn tracker_show(
     cleanup_stale_tracker_pid(workspace_dir);
 
     let show_data = || -> Result<()> {
-        let daemon_pid_file = workspace_dir.join("kronid.pid");
+        let daemon_pid_file = kronical::util::paths::pid_file(workspace_dir);
         let pid = if let Ok(Some(pid)) = read_pid_file(&daemon_pid_file) {
             if !is_process_running(pid) {
                 return Err(anyhow::anyhow!(
@@ -1054,7 +1055,7 @@ fn show_tracker_data_grpc(
     // Server is responsible for flush-before-query to avoid client/server
     // workspace drift and snapshot ordering issues.
 
-    let uds_grpc = workspace_dir.join("kroni.sock");
+    let uds_grpc = kronical::util::paths::grpc_uds(workspace_dir);
     let rt = runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
@@ -1159,7 +1160,7 @@ fn show_tracker_data_grpc(
                 last_time
             );
             // Help users diagnose mismatches: show the PID and the expected DB path
-            let db_path = workspace_dir.join("system-tracker.duckdb");
+            let db_path = kronical::util::paths::tracker_db(workspace_dir);
             println!("Source: PID={} DB={}", pid_to_query, db_path.display());
 
             // Diagnostic: show recency delta

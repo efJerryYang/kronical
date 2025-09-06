@@ -168,7 +168,7 @@ fn main() {
         DatabaseBackendConfig::Duckdb => config.workspace_dir.join("data.duckdb"),
         DatabaseBackendConfig::Sqlite3 => config.workspace_dir.join("data.sqlite3"),
     };
-    let pid_file = config.workspace_dir.join("kronid.pid");
+    let pid_file = kronical::util::paths::pid_file(&config.workspace_dir);
     if let Err(e) = write_pid_file(&pid_file) {
         error!("Failed to write PID: {}", e);
         std::process::exit(1);
