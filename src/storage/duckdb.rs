@@ -16,6 +16,7 @@ pub struct DuckDbStorage {
     db_path: PathBuf,
     sender: mpsc::Sender<StorageCommand>,
     writer_thread: Option<thread::JoinHandle<()>>,
+    memory_limit_mb: Option<u64>,
 }
 
 impl DuckDbStorage {
@@ -41,6 +42,46 @@ impl DuckDbStorage {
             db_path,
             sender,
             writer_thread: Some(writer_thread),
+            memory_limit_mb: None,
+        })
+    }
+
+    pub fn new_with_limit<P: AsRef<Path>>(db_path: P, limit_mb: u64) -> Result<Self> {
+        let db_path = db_path.as_ref().to_path_buf();
+
+        if let Some(parent) = db_path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("Failed to create directory: {:?}", parent))?;
+        }
+
+        let conn = Connection::open(&db_path)?;
+        // Apply memory limit for this connection.
+        let _ = conn.execute_batch(&format!(
+            "PRAGMA memory_limit='{}MB'; PRAGMA threads=2;",
+            limit_mb
+        ));
+        Self::init_db(&conn)?;
+
+        let (sender, receiver) = mpsc::channel();
+
+        let db_path_clone = db_path.clone();
+        let writer_thread = thread::spawn(move || {
+            let conn =
+                Connection::open(&db_path_clone).expect("Failed to open DB in writer thread");
+            // Apply memory limit for the writer connection as well.
+            let _ = conn.execute_batch(&format!(
+                "PRAGMA memory_limit='{}MB'; PRAGMA threads=2;",
+                limit_mb
+            ));
+            // Hand off to a helper that assumes an initialized connection
+            Self::background_writer_with_conn(conn, receiver);
+        });
+
+        Ok(Self {
+            db_path,
+            sender,
+            writer_thread: Some(writer_thread),
+            memory_limit_mb: Some(limit_mb),
         })
     }
 
@@ -80,6 +121,10 @@ impl DuckDbStorage {
 
     fn background_writer(db_path: PathBuf, receiver: mpsc::Receiver<StorageCommand>) {
         let conn = Connection::open(&db_path).expect("Failed to open DB in writer thread");
+        Self::background_writer_with_conn(conn, receiver)
+    }
+
+    fn background_writer_with_conn(conn: Connection, receiver: mpsc::Receiver<StorageCommand>) {
         let mut count: usize = 0;
         conn.execute_batch("BEGIN TRANSACTION;")
             .expect("Failed to start transaction");
@@ -238,6 +283,12 @@ impl StorageBackend for DuckDbStorage {
 
     fn fetch_records_since(&mut self, since: DateTime<Utc>) -> Result<Vec<ActivityRecord>> {
         let conn = Connection::open(&self.db_path)?;
+        if let Some(mb) = self.memory_limit_mb {
+            let _ = conn.execute_batch(&format!(
+                "PRAGMA memory_limit='{}MB'; PRAGMA threads=2;",
+                mb
+            ));
+        }
         let mut stmt = conn.prepare(
             "SELECT id, start_time, end_time, state, focus_info
              FROM activity_records
@@ -288,6 +339,12 @@ impl StorageBackend for DuckDbStorage {
         until: DateTime<Utc>,
     ) -> Result<Vec<EventEnvelope>> {
         let conn = Connection::open(&self.db_path)?;
+        if let Some(mb) = self.memory_limit_mb {
+            let _ = conn.execute_batch(&format!(
+                "PRAGMA memory_limit='{}MB'; PRAGMA threads=2;",
+                mb
+            ));
+        }
         let mut stmt = conn.prepare(
             "SELECT event_id, timestamp, source, kind, payload, derived, polling, sensitive
              FROM raw_envelopes

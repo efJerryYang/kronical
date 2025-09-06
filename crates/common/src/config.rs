@@ -14,6 +14,8 @@ pub enum DatabaseBackendConfig {
 pub struct AppConfig {
     pub workspace_dir: PathBuf,
     pub db_backend: DatabaseBackendConfig,
+    // Tracker storage backend (separate from main DB)
+    pub tracker_db_backend: DatabaseBackendConfig,
     pub retention_minutes: u64,
     pub active_grace_secs: u64,
     pub idle_threshold_secs: u64,
@@ -30,11 +32,13 @@ pub struct AppConfig {
     pub tracker_interval_secs: f64,
     pub tracker_batch_size: usize,
     pub tracker_refresh_secs: f64,
+    // DuckDB memory caps (MB). Applied when DuckDB is used.
+    pub duckdb_memory_limit_mb_main: u64,
+    pub duckdb_memory_limit_mb_tracker: u64,
 }
 
 impl Default for AppConfig {
     fn default() -> Self {
-        // Be resilient in environments without HOME by falling back to CWD.
         let base_dir = dirs::home_dir()
             .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
             .or_else(|| std::env::current_dir().ok())
@@ -44,6 +48,7 @@ impl Default for AppConfig {
         Self {
             workspace_dir,
             db_backend: DatabaseBackendConfig::Duckdb,
+            tracker_db_backend: DatabaseBackendConfig::Duckdb,
             retention_minutes: 72 * 60,
             active_grace_secs: 30,
             idle_threshold_secs: 300,
@@ -60,6 +65,8 @@ impl Default for AppConfig {
             tracker_interval_secs: 1.0,
             tracker_batch_size: 60,
             tracker_refresh_secs: 1.0,
+            duckdb_memory_limit_mb_main: 10,
+            duckdb_memory_limit_mb_tracker: 10,
         }
     }
 }
@@ -70,9 +77,9 @@ impl AppConfig {
         let config_path = workspace_dir.join("config.toml");
 
         let mut builder = Config::builder()
-            // Avoid panics on non-UTF8 paths by using lossy conversion.
             .set_default("workspace_dir", workspace_dir.to_string_lossy().as_ref())?
             .set_default("db_backend", "duckdb")?
+            .set_default("tracker_db_backend", "duckdb")?
             .set_default("retention_minutes", 72 * 60)?
             .set_default("active_grace_secs", 30)?
             .set_default("idle_threshold_secs", 300)?
@@ -88,19 +95,18 @@ impl AppConfig {
             .set_default("tracker_enabled", false)?
             .set_default("tracker_interval_secs", 1.0)?
             .set_default("tracker_batch_size", 60)?
-            .set_default("tracker_refresh_secs", 1.0)?;
+            .set_default("tracker_refresh_secs", 1.0)?
+            .set_default("duckdb_memory_limit_mb_main", 10)?
+            .set_default("duckdb_memory_limit_mb_tracker", 10)?;
 
-        // Load config file if it exists
         if config_path.exists() {
             builder = builder.add_source(File::from(config_path));
         }
 
-        // Allow environment variables to override config
         builder = builder.add_source(Environment::with_prefix("KRONICAL"));
 
         let config = builder.build()?;
         let app_config: AppConfig = config.try_deserialize()?;
-
         Ok(app_config)
     }
 }

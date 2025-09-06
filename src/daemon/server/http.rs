@@ -6,10 +6,9 @@ use futures_util::stream::Stream;
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
-use log::{info, warn};
+use log::{debug, info, warn};
 use std::convert::Infallible;
 use std::path::PathBuf;
-use std::time::Duration;
 use tokio::net::UnixListener;
 use tower::Service;
 
@@ -20,9 +19,9 @@ async fn snapshot_handler() -> Json<snapshot::Snapshot> {
 
 async fn stream_handler() -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     use tokio_stream::StreamExt;
-    use tokio_stream::wrappers::IntervalStream;
-    let stream = IntervalStream::new(tokio::time::interval(Duration::from_millis(500))).map(|_| {
-        let snap = snapshot::get_current();
+    use tokio_stream::wrappers::WatchStream;
+    let rx = snapshot::watch_snapshot();
+    let stream = WatchStream::new(rx).map(|snap| {
         let data = serde_json::to_string(&*snap).unwrap_or_else(|_| "{}".into());
         Ok(Event::default().data(data))
     });
@@ -63,7 +62,13 @@ pub fn spawn_http_server(uds_path: PathBuf) -> Result<std::thread::JoinHandle<()
                         .serve_connection(io, hyper_service)
                         .await
                     {
-                        eprintln!("Error serving connection: {:?}", err);
+                        // Treat client-initiated disconnects (e.g., quitting the monitor)
+                        // as a normal shutdown; hyper reports these as IncompleteMessage.
+                        if err.is_incomplete_message() {
+                            debug!("Client disconnected while streaming (incomplete message) — normal exit");
+                        } else {
+                            eprintln!("Error serving connection: {:?}", err);
+                        }
                     }
                 });
             }

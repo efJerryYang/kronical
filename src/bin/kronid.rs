@@ -182,13 +182,15 @@ fn main() {
     info!("Starting Kronical daemon (kronid)");
 
     let data_store: Box<dyn StorageBackend> = match config.db_backend {
-        DatabaseBackendConfig::Duckdb => match DuckDbStorage::new(&data_file) {
-            Ok(s) => Box::new(s),
-            Err(e) => {
-                error!("Failed to initialize DuckDB store: {}", e);
-                std::process::exit(1);
+        DatabaseBackendConfig::Duckdb => {
+            match DuckDbStorage::new_with_limit(&data_file, config.duckdb_memory_limit_mb_main) {
+                Ok(s) => Box::new(s),
+                Err(e) => {
+                    error!("Failed to initialize DuckDB store: {}", e);
+                    std::process::exit(1);
+                }
             }
-        },
+        }
         DatabaseBackendConfig::Sqlite3 => match SqliteStorage::new(&data_file) {
             Ok(s) => Box::new(s),
             Err(e) => {
@@ -214,10 +216,12 @@ fn main() {
         config.tracker_enabled,
         config.tracker_interval_secs,
         config.tracker_batch_size,
+        config.tracker_db_backend.clone(),
+        config.duckdb_memory_limit_mb_tracker,
     );
 
     info!("Kronical daemon will run on MAIN THREAD (required by macOS hooks)");
-    let result = coordinator.start_main_thread(data_store, pid_file.clone());
+    let result = coordinator.start_main_thread(data_store, config.workspace_dir.clone());
 
     cleanup_pid_file(&pid_file);
 

@@ -1,6 +1,7 @@
 use crate::daemon::compressor::CompressionEngine;
 use crate::daemon::events::adapter::EventAdapter;
-use crate::daemon::events::deriver::{LockDeriver, StateDeriver};
+use crate::daemon::events::derive_hint::StateDeriver;
+use crate::daemon::events::derive_signal::LockDeriver;
 use crate::daemon::events::model::{EventKind, EventPayload, SignalKind};
 use crate::daemon::events::{
     KeyboardEventData, MouseEventData, MouseEventKind, MousePosition, WindowFocusInfo,
@@ -8,7 +9,7 @@ use crate::daemon::events::{
 use crate::daemon::records::{ActivityRecord, aggregate_activities_since};
 use crate::daemon::tracker::DuckDbSystemTracker;
 use crate::daemon::tracker::{FocusCacheCaps, FocusChangeCallback, FocusEventWrapper};
-use crate::storage::StorageBackend;
+use crate::storage::{StorageBackend, StorageCommand};
 use anyhow::Result;
 use log::{debug, error, info, trace};
 use std::sync::{Arc, mpsc};
@@ -216,6 +217,8 @@ pub struct EventCoordinator {
     tracker_enabled: bool,
     tracker_interval_secs: f64,
     tracker_batch_size: usize,
+    tracker_db_backend: crate::util::config::DatabaseBackendConfig,
+    duckdb_memory_limit_mb_tracker: u64,
 }
 
 impl EventCoordinator {
@@ -235,6 +238,8 @@ impl EventCoordinator {
         tracker_enabled: bool,
         tracker_interval_secs: f64,
         tracker_batch_size: usize,
+        tracker_db_backend: crate::util::config::DatabaseBackendConfig,
+        duckdb_memory_limit_mb_tracker: u64,
     ) -> Self {
         Self {
             retention_minutes,
@@ -252,6 +257,8 @@ impl EventCoordinator {
             tracker_enabled,
             tracker_interval_secs,
             tracker_batch_size,
+            tracker_db_backend,
+            duckdb_memory_limit_mb_tracker,
         }
     }
 
@@ -336,42 +343,35 @@ impl EventCoordinator {
         }
     }
 
-    // TODO: the pid file should not be passed here, we should have a constant rust file. and we can then get the workspace directory from there too
     pub fn start_main_thread(
         &self,
         data_store: Box<dyn StorageBackend>,
-        pid_file: std::path::PathBuf,
+        workspace_dir: std::path::PathBuf,
     ) -> Result<()> {
         info!("Step A: Starting Kronical on MAIN THREAD (required for hooks)");
 
         let (sender, receiver) = mpsc::channel();
 
         // Start API servers (gRPC + HTTP/SSE) via unified API facade.
-        let workspace_dir = match pid_file.parent() {
-            Some(dir) => dir,
-            None => {
-                error!(
-                    "PID file has no parent; cannot derive workspace dir. Skipping API startup."
-                );
-                return Err(anyhow::anyhow!(
-                    "invalid PID file path; missing parent directory"
-                ));
-            }
-        };
-        let uds_grpc = crate::util::paths::grpc_uds(workspace_dir);
-        let uds_http = crate::util::paths::http_uds(workspace_dir);
+        let uds_grpc = crate::util::paths::grpc_uds(&workspace_dir);
+        let uds_http = crate::util::paths::http_uds(&workspace_dir);
         if let Err(e) = crate::daemon::api::spawn_all(uds_grpc, uds_http) {
             error!("Failed to start API servers: {}", e);
         }
 
         if self.tracker_enabled {
             let current_pid = std::process::id();
-            let tracker_db_path = crate::util::paths::tracker_db(workspace_dir);
-            let tracker = DuckDbSystemTracker::new(
+            let tracker_db_path = crate::util::paths::tracker_db_with_backend(
+                &workspace_dir,
+                &self.tracker_db_backend,
+            );
+            let mut tracker = DuckDbSystemTracker::new(
                 current_pid,
                 self.tracker_interval_secs,
                 self.tracker_batch_size,
                 tracker_db_path.clone(),
+                self.tracker_db_backend.clone(),
+                self.duckdb_memory_limit_mb_tracker,
             );
             if let Err(e) = tracker.start() {
                 error!("Failed to start DuckDB system tracker: {}", e);
@@ -401,6 +401,7 @@ impl EventCoordinator {
                 std::collections::VecDeque::new();
             let mut recent_records: std::collections::VecDeque<ActivityRecord> =
                 std::collections::VecDeque::new();
+            let mut current_focus: Option<WindowFocusInfo> = None;
             let retention = chrono::Duration::minutes(self.retention_minutes as i64);
             let eph_max = self.ephemeral_max_duration_secs;
             let eph_min = self.ephemeral_min_distinct_ids;
@@ -417,6 +418,8 @@ impl EventCoordinator {
             };
 
             let mut last_transition: Option<crate::daemon::snapshot::Transition> = None;
+            // Subscribe to live storage metrics updates
+            let sm_rx = crate::storage::storage_metrics_watch();
 
             let poll_handle_arc2 = std::sync::Arc::clone(&poll_handle_arc);
             let ags = self.active_grace_secs;
@@ -639,11 +642,77 @@ impl EventCoordinator {
                     Err(e) => error!("Failed to hydrate records from DB: {}", e),
                 }
 
-                // Initialize new state + record components
+                // Channel-based pipeline setup
+                let (hints_tx, hints_rx) =
+                    mpsc::channel::<crate::daemon::events::model::EventEnvelope>();
+                let (rec_fb_tx, rec_fb_rx) =
+                    mpsc::channel::<crate::daemon::records::ActivityRecord>();
+                let (storage_tx, storage_rx) = mpsc::channel::<StorageCommand>();
+
+                // Move storage into dedicated writer thread
+                let mut store_writer = store;
+                let storage_thread = thread::spawn(move || {
+                    info!("Storage writer thread started");
+                    while let Ok(cmd) = storage_rx.recv() {
+                        match cmd {
+                            StorageCommand::RawEvent(e) => {
+                                if let Err(e2) = store_writer.add_events(vec![e]) {
+                                    error!("store add_events error: {}", e2);
+                                }
+                            }
+                            StorageCommand::Record(r) => {
+                                if let Err(e2) = store_writer.add_records(vec![r]) {
+                                    error!("store add_records error: {}", e2);
+                                }
+                            }
+                            StorageCommand::Envelope(env) => {
+                                if let Err(e2) = store_writer.add_envelopes(vec![env]) {
+                                    error!("store add_envelopes error: {}", e2);
+                                }
+                            }
+                            StorageCommand::Shutdown => {
+                                info!("Storage writer shutdown received");
+                                break;
+                            }
+                        }
+                    }
+                    info!("Storage writer thread exiting");
+                });
+
+                // Hints worker thread: builds records from hints
+                let hints_storage_tx = storage_tx.clone();
+                let hints_fb_tx = rec_fb_tx.clone();
+                let hints_thread = thread::spawn(move || {
+                    info!("Hints worker thread started");
+                    let mut record_builder = crate::daemon::records::RecordBuilder::new(
+                        crate::daemon::records::ActivityState::Inactive,
+                    );
+                    while let Ok(env) = hints_rx.recv() {
+                        // Persist hint envelope
+                        if let Err(e) = hints_storage_tx.send(StorageCommand::Envelope(env.clone()))
+                        {
+                            error!("Failed to enqueue hint envelope to storage: {}", e);
+                        }
+                        if let Some(rec) = record_builder.on_hint(&env) {
+                            if let Err(e) =
+                                hints_storage_tx.send(StorageCommand::Record(rec.clone()))
+                            {
+                                error!("Failed to enqueue record to storage: {}", e);
+                            }
+                            let _ = hints_fb_tx.send(rec);
+                        }
+                    }
+                    // Finalize when channel closes
+                    if let Some(final_rec) = record_builder.finalize_all() {
+                        let _ = hints_storage_tx.send(StorageCommand::Record(final_rec.clone()));
+                        let _ = hints_fb_tx.send(final_rec);
+                    }
+                    info!("Hints worker thread exiting");
+                });
+
+                // Initialize derivation engine and state tracker
                 let mut state_deriver = StateDeriver::new(now0, ags as i64, its as i64);
-                let mut record_builder = crate::daemon::records::RecordBuilder::new(
-                    crate::daemon::records::ActivityState::Inactive,
-                );
+                let mut current_state = crate::daemon::records::ActivityState::Inactive;
 
                 loop {
                     match receiver.recv_timeout(Duration::from_millis(50)) {
@@ -656,50 +725,67 @@ impl EventCoordinator {
                                 // Adapt to EventEnvelope + derive lock boundaries
                                 let envelopes = adapter.adapt_batch(&raw_events_to_process);
                                 let envelopes_with_lock = lock_deriver.derive(&envelopes);
-                                // Persist all envelopes
-                                let _ = store.add_envelopes(envelopes_with_lock.clone());
-                                // Feed pipeline (hint-first ordering per timestamp)
-                                for env in envelopes_with_lock
-                                    .iter()
-                                    .filter(|e| matches!(e.kind, EventKind::Hint(_)))
-                                {
-                                    if let Some(rec) = record_builder.on_hint(env) {
-                                        let _ = store.add_records(vec![rec.clone()]);
-                                        recent_records.push_back(rec);
-                                    }
-
-                                    counts.hints_seen += 1;
-                                    if let EventPayload::State { from, to } = &env.payload {
-                                        last_transition =
-                                            Some(crate::daemon::snapshot::Transition {
-                                                from: *from,
-                                                to: *to,
-                                                at: env.timestamp,
-                                            });
+                                // Dispatch envelopes via explicit channels
+                                for env in envelopes_with_lock.iter() {
+                                    match &env.kind {
+                                        EventKind::Hint(_) => {
+                                            counts.hints_seen += 1;
+                                            if let EventPayload::Focus(fi) = &env.payload {
+                                                current_focus = Some(fi.clone());
+                                            }
+                                            if let EventPayload::State { from, to } =
+                                                env.payload.clone()
+                                            {
+                                                let tr = crate::daemon::snapshot::Transition {
+                                                    from,
+                                                    to,
+                                                    at: env.timestamp,
+                                                    by_signal: None,
+                                                };
+                                                last_transition = Some(tr.clone());
+                                                crate::daemon::snapshot::push_transition(tr);
+                                                current_state = to;
+                                            }
+                                            let _ = hints_tx.send(env.clone());
+                                        }
+                                        EventKind::Signal(_) => {
+                                            counts.signals_seen += 1;
+                                            if let EventPayload::Focus(fi) = &env.payload {
+                                                current_focus = Some(fi.clone());
+                                            }
+                                            // Persist signal envelope immediately
+                                            let _ = storage_tx
+                                                .send(StorageCommand::Envelope(env.clone()));
+                                            if let Some(h) = state_deriver.on_signal(env) {
+                                                counts.hints_seen += 1;
+                                                if let EventPayload::State { from, to } =
+                                                    h.payload.clone()
+                                                {
+                                                    // Capture the signal kind that led to this transition
+                                                    let sig = match &env.kind {
+                                                        EventKind::Signal(sk) => {
+                                                            Some(format!("{:?}", sk))
+                                                        }
+                                                        _ => None,
+                                                    };
+                                                    let tr = crate::daemon::snapshot::Transition {
+                                                        from,
+                                                        to,
+                                                        at: h.timestamp,
+                                                        by_signal: sig,
+                                                    };
+                                                    last_transition = Some(tr.clone());
+                                                    crate::daemon::snapshot::push_transition(tr);
+                                                    current_state = to;
+                                                }
+                                                let _ = hints_tx.send(h);
+                                            }
+                                        }
                                     }
                                 }
-                                for env in envelopes_with_lock
-                                    .iter()
-                                    .filter(|e| matches!(e.kind, EventKind::Signal(_)))
-                                {
-                                    counts.signals_seen += 1;
-                                    if let Some(h) = state_deriver.on_signal(env) {
-                                        let _ = store.add_envelopes(vec![h.clone()]);
-                                        if let Some(rec) = record_builder.on_hint(&h) {
-                                            let _ = store.add_records(vec![rec.clone()]);
-                                            recent_records.push_back(rec);
-                                        }
-
-                                        counts.hints_seen += 1;
-                                        if let EventPayload::State { from, to } = &h.payload {
-                                            last_transition =
-                                                Some(crate::daemon::snapshot::Transition {
-                                                    from: *from,
-                                                    to: *to,
-                                                    at: h.timestamp,
-                                                });
-                                        }
-                                    }
+                                // Drain any records produced by hints worker
+                                while let Ok(rec) = rec_fb_rx.try_recv() {
+                                    recent_records.push_back(rec);
                                 }
                                 let now = chrono::Utc::now();
                                 let since = now - retention;
@@ -723,7 +809,7 @@ impl EventCoordinator {
                                     )
                                 };
                                 // State-aware polling cadence
-                                let ms = match record_builder.current_state() {
+                                let ms = match current_state {
                                     crate::daemon::records::ActivityState::Active => 2000,
                                     crate::daemon::records::ActivityState::Passive => 10000,
                                     crate::daemon::records::ActivityState::Inactive => 20000,
@@ -734,7 +820,7 @@ impl EventCoordinator {
                                 {
                                     let aggregated_apps =
                                         build_app_tree(&agg, app_eph_max, app_eph_min);
-                                    let reason = match record_builder.current_state() {
+                                    let reason = match current_state {
                                         crate::daemon::records::ActivityState::Active => "Active",
                                         crate::daemon::records::ActivityState::Passive => "Passive",
                                         crate::daemon::records::ActivityState::Inactive => {
@@ -746,10 +832,10 @@ impl EventCoordinator {
                                         chrono::Utc::now()
                                             + chrono::Duration::milliseconds(ms as i64),
                                     );
-                                    let sm = crate::storage::storage_metrics();
+                                    let sm = sm_rx.borrow().clone();
                                     crate::daemon::snapshot::publish_basic(
-                                        record_builder.current_state(),
-                                        record_builder.current_focus(),
+                                        current_state,
+                                        current_focus.clone(),
                                         last_transition.clone(),
                                         counts.clone(),
                                         ms as u32,
@@ -791,95 +877,79 @@ impl EventCoordinator {
                                 // Adapt to EventEnvelope + derive lock boundaries
                                 let envelopes = adapter.adapt_batch(&raw_events_to_process);
                                 let envelopes_with_lock = lock_deriver.derive(&envelopes);
-
-                                // Persist envelopes for replay diagnostics
-                                if let Err(e) = store.add_envelopes(envelopes_with_lock.clone()) {
-                                    error!("Failed to store envelopes: {}", e);
-                                    crate::daemon::snapshot::push_health(format!(
-                                        "store envelopes error: {}",
-                                        e
-                                    ));
-                                }
-
-                                // New pipeline: feed signals to StateDeriver, hints to RecordBuilder
-                                let mut new_records = Vec::new();
-                                // Hints first
-                                for env in envelopes_with_lock
-                                    .iter()
-                                    .filter(|e| matches!(e.kind, EventKind::Hint(_)))
-                                {
-                                    if let Some(rec) = record_builder.on_hint(env) {
-                                        new_records.push(rec);
-                                    }
-
-                                    counts.hints_seen += 1;
-                                    if let EventPayload::State { from, to } = &env.payload {
-                                        last_transition =
-                                            Some(crate::daemon::snapshot::Transition {
-                                                from: *from,
-                                                to: *to,
-                                                at: env.timestamp,
-                                            });
-                                    }
-                                }
-                                // Then signals (which may derive state-change hints)
-                                for env in envelopes_with_lock
-                                    .iter()
-                                    .filter(|e| matches!(e.kind, EventKind::Signal(_)))
-                                {
-                                    counts.signals_seen += 1;
-                                    if let Some(h) = state_deriver.on_signal(env) {
-                                        if let Err(e) = store.add_envelopes(vec![h.clone()]) {
-                                            error!("Failed to store derived state hint: {}", e);
-                                            crate::daemon::snapshot::push_health(format!(
-                                                "store derived hint error: {}",
-                                                e
-                                            ));
+                                // Dispatch pipeline: signals and derived hints; hints worker persists hints
+                                // Dispatch via explicit channels
+                                for env in envelopes_with_lock.iter() {
+                                    match &env.kind {
+                                        EventKind::Hint(_) => {
+                                            counts.hints_seen += 1;
+                                            if let EventPayload::Focus(fi) = &env.payload {
+                                                current_focus = Some(fi.clone());
+                                            }
+                                            if let EventPayload::State { from, to } =
+                                                env.payload.clone()
+                                            {
+                                                let tr = crate::daemon::snapshot::Transition {
+                                                    from,
+                                                    to,
+                                                    at: env.timestamp,
+                                                    by_signal: None,
+                                                };
+                                                last_transition = Some(tr.clone());
+                                                crate::daemon::snapshot::push_transition(tr);
+                                                current_state = to;
+                                            }
+                                            let _ = hints_tx.send(env.clone());
                                         }
-                                        if let Some(rec) = record_builder.on_hint(&h) {
-                                            new_records.push(rec);
-                                        }
-
-                                        counts.hints_seen += 1;
-                                        if let EventPayload::State { from, to } = &h.payload {
-                                            last_transition =
-                                                Some(crate::daemon::snapshot::Transition {
-                                                    from: *from,
-                                                    to: *to,
-                                                    at: h.timestamp,
-                                                });
-                                        }
-                                    }
-                                }
-                                if !new_records.is_empty() {
-                                    info!("Generated {} new records", new_records.len());
-                                    for r in &new_records {
-                                        let ch = match r.state {
-                                            crate::daemon::records::ActivityState::Active => 'A',
-                                            crate::daemon::records::ActivityState::Passive => 'P',
-                                            crate::daemon::records::ActivityState::Inactive => 'I',
-                                            crate::daemon::records::ActivityState::Locked => 'L',
-                                        };
-                                        if state_hist.back().copied() != Some(ch) {
-                                            state_hist.push_back(ch);
-                                            if state_hist.len() > 10 {
-                                                state_hist.pop_front();
+                                        EventKind::Signal(_) => {
+                                            counts.signals_seen += 1;
+                                            if let EventPayload::Focus(fi) = &env.payload {
+                                                current_focus = Some(fi.clone());
+                                            }
+                                            let _ = storage_tx
+                                                .send(StorageCommand::Envelope(env.clone()));
+                                            if let Some(h) = state_deriver.on_signal(env) {
+                                                counts.hints_seen += 1;
+                                                if let EventPayload::State { from, to } =
+                                                    h.payload.clone()
+                                                {
+                                                    let sig = match &env.kind {
+                                                        EventKind::Signal(sk) => {
+                                                            Some(format!("{:?}", sk))
+                                                        }
+                                                        _ => None,
+                                                    };
+                                                    let tr = crate::daemon::snapshot::Transition {
+                                                        from,
+                                                        to,
+                                                        at: h.timestamp,
+                                                        by_signal: sig,
+                                                    };
+                                                    last_transition = Some(tr.clone());
+                                                    crate::daemon::snapshot::push_transition(tr);
+                                                    current_state = to;
+                                                }
+                                                let _ = hints_tx.send(h);
                                             }
                                         }
                                     }
-                                    let _hist_str: String = state_hist.iter().collect();
-                                    if let Err(e) = store.add_records(new_records.clone()) {
-                                        error!("Failed to store records: {}", e);
-                                        crate::daemon::snapshot::push_health(format!(
-                                            "store records error: {}",
-                                            e
-                                        ));
+                                }
+                                // Drain records produced by hints worker
+                                while let Ok(r) = rec_fb_rx.try_recv() {
+                                    let ch = match r.state {
+                                        crate::daemon::records::ActivityState::Active => 'A',
+                                        crate::daemon::records::ActivityState::Passive => 'P',
+                                        crate::daemon::records::ActivityState::Inactive => 'I',
+                                        crate::daemon::records::ActivityState::Locked => 'L',
+                                    };
+                                    if state_hist.back().copied() != Some(ch) {
+                                        state_hist.push_back(ch);
+                                        if state_hist.len() > 10 {
+                                            state_hist.pop_front();
+                                        }
                                     }
-                                    for r in new_records.into_iter() {
-                                        recent_records.push_back(r);
-
-                                        counts.records_emitted += 1;
-                                    }
+                                    recent_records.push_back(r);
+                                    counts.records_emitted += 1;
                                 }
 
                                 match compression_engine
@@ -922,12 +992,12 @@ impl EventCoordinator {
                                                     _ => true,
                                                 })
                                                 .collect();
-                                            if let Err(e) = store.add_events(to_store) {
-                                                error!("Failed to store raw events: {}", e);
-                                                crate::daemon::snapshot::push_health(format!(
-                                                    "store raw events error: {}",
-                                                    e
-                                                ));
+                                            for ev in to_store {
+                                                if let Err(e) =
+                                                    storage_tx.send(StorageCommand::RawEvent(ev))
+                                                {
+                                                    error!("Failed to enqueue raw event: {}", e);
+                                                }
                                             }
                                         }
                                     }
@@ -957,7 +1027,7 @@ impl EventCoordinator {
                                     )
                                 };
                                 // State-aware polling cadence
-                                let ms = match record_builder.current_state() {
+                                let ms = match current_state {
                                     crate::daemon::records::ActivityState::Active => 2000,
                                     crate::daemon::records::ActivityState::Passive => 10000,
                                     crate::daemon::records::ActivityState::Inactive => 20000,
@@ -968,7 +1038,7 @@ impl EventCoordinator {
                                 {
                                     let aggregated_apps =
                                         build_app_tree(&agg, app_eph_max, app_eph_min);
-                                    let reason = match record_builder.current_state() {
+                                    let reason = match current_state {
                                         crate::daemon::records::ActivityState::Active => "Active",
                                         crate::daemon::records::ActivityState::Passive => "Passive",
                                         crate::daemon::records::ActivityState::Inactive => {
@@ -980,10 +1050,10 @@ impl EventCoordinator {
                                         chrono::Utc::now()
                                             + chrono::Duration::milliseconds(ms as i64),
                                     );
-                                    let sm = crate::storage::storage_metrics();
+                                    let sm = sm_rx.borrow().clone();
                                     crate::daemon::snapshot::publish_basic(
-                                        record_builder.current_state(),
-                                        record_builder.current_focus(),
+                                        current_state,
+                                        current_focus.clone(),
                                         last_transition.clone(),
                                         counts.clone(),
                                         ms as u32,
@@ -1007,22 +1077,20 @@ impl EventCoordinator {
                     }
 
                     if let Some(state_hint) = state_deriver.on_tick(chrono::Utc::now()) {
-                        if let Err(e) = store.add_envelopes(vec![state_hint.clone()]) {
-                            error!("Failed to store tick-derived state hint: {}", e);
-                            crate::daemon::snapshot::push_health(format!(
-                                "store tick hint error: {}",
-                                e
-                            ));
+                        counts.hints_seen += 1;
+                        if let EventPayload::State { from, to } = state_hint.payload.clone() {
+                            let tr = crate::daemon::snapshot::Transition {
+                                from,
+                                to,
+                                at: state_hint.timestamp,
+                                by_signal: None,
+                            };
+                            last_transition = Some(tr.clone());
+                            crate::daemon::snapshot::push_transition(tr);
+                            current_state = to;
                         }
-                        if let Some(rec) = record_builder.on_hint(&state_hint) {
-                            if let Err(e) = store.add_records(vec![rec.clone()]) {
-                                error!("Failed to store timeout record: {}", e);
-                                crate::daemon::snapshot::push_health(format!(
-                                    "store timeout record error: {}",
-                                    e
-                                ));
-                            }
-                            recent_records.push_back(rec.clone());
+                        let _ = hints_tx.send(state_hint);
+                        while let Ok(rec) = rec_fb_rx.try_recv() {
                             let ch = match rec.state {
                                 crate::daemon::records::ActivityState::Active => 'A',
                                 crate::daemon::records::ActivityState::Passive => 'P',
@@ -1036,17 +1104,8 @@ impl EventCoordinator {
                                 }
                                 let _hist_str: String = state_hist.iter().collect();
                             }
-                        }
-
-                        {
-                            counts.hints_seen += 1;
-                            if let EventPayload::State { from, to } = &state_hint.payload {
-                                last_transition = Some(crate::daemon::snapshot::Transition {
-                                    from: *from,
-                                    to: *to,
-                                    at: state_hint.timestamp,
-                                });
-                            }
+                            recent_records.push_back(rec);
+                            counts.records_emitted += 1;
                         }
                         let now = chrono::Utc::now();
                         let since = now - retention;
@@ -1069,7 +1128,7 @@ impl EventCoordinator {
                                 max_windows,
                             )
                         };
-                        let ms = match record_builder.current_state() {
+                        let ms = match current_state {
                             crate::daemon::records::ActivityState::Active => 2000,
                             crate::daemon::records::ActivityState::Passive => 10000,
                             crate::daemon::records::ActivityState::Inactive => 20000,
@@ -1079,7 +1138,7 @@ impl EventCoordinator {
 
                         {
                             let aggregated_apps = build_app_tree(&agg, app_eph_max, app_eph_min);
-                            let reason = match record_builder.current_state() {
+                            let reason = match current_state {
                                 crate::daemon::records::ActivityState::Active => "Active",
                                 crate::daemon::records::ActivityState::Passive => "Passive",
                                 crate::daemon::records::ActivityState::Inactive => "Inactive",
@@ -1088,10 +1147,10 @@ impl EventCoordinator {
                             let next_timeout = Some(
                                 chrono::Utc::now() + chrono::Duration::milliseconds(ms as i64),
                             );
-                            let sm = crate::storage::storage_metrics();
+                            let sm = sm_rx.borrow().clone();
                             crate::daemon::snapshot::publish_basic(
-                                record_builder.current_state(),
-                                record_builder.current_focus(),
+                                current_state,
+                                current_focus.clone(),
                                 last_transition.clone(),
                                 counts.clone(),
                                 ms as u32,
@@ -1109,81 +1168,80 @@ impl EventCoordinator {
                     }
                 }
 
-                if let Some(final_record) = record_builder.finalize_all() {
-                    info!("Storing final record: {:?}", final_record.state);
-                    if let Err(e) = store.add_records(vec![final_record.clone()]) {
-                        error!("Failed to store final record: {}", e);
-                        crate::daemon::snapshot::push_health(format!(
-                            "store final record error: {}",
-                            e
-                        ));
+                // Shut down pipeline workers and flush remaining records
+                drop(hints_tx);
+                // Drain any remaining records from worker
+                while let Ok(rec) = rec_fb_rx.recv_timeout(Duration::from_millis(200)) {
+                    recent_records.push_back(rec);
+                    // stop if channel closes soon after
+                    if rec_fb_rx.recv_timeout(Duration::from_millis(1)).is_err() {
+                        break;
                     }
-
-                    recent_records.push_back(final_record);
-                    let now = chrono::Utc::now();
-                    let since = now - retention;
-                    while let Some(front) = recent_records.front() {
-                        let end = front.end_time.unwrap_or(now);
-                        if end < since {
-                            recent_records.pop_front();
-                        } else {
-                            break;
-                        }
-                    }
-
-                    let agg = {
-                        aggregate_activities_since(
-                            recent_records.make_contiguous(),
-                            since,
-                            now,
-                            eph_max,
-                            eph_min,
-                            max_windows,
-                        )
-                    };
-
-                    {
-                        let aggregated_apps = build_app_tree(&agg, app_eph_max, app_eph_min);
-                        let ms = match record_builder.current_state() {
-                            crate::daemon::records::ActivityState::Active => 2000,
-                            crate::daemon::records::ActivityState::Passive => 10000,
-                            crate::daemon::records::ActivityState::Inactive => 20000,
-                            crate::daemon::records::ActivityState::Locked => 30000,
-                        };
-                        let reason = match record_builder.current_state() {
-                            crate::daemon::records::ActivityState::Active => "Active",
-                            crate::daemon::records::ActivityState::Passive => "Passive",
-                            crate::daemon::records::ActivityState::Inactive => "Inactive",
-                            crate::daemon::records::ActivityState::Locked => "Locked",
-                        };
-                        let next_timeout =
-                            Some(chrono::Utc::now() + chrono::Duration::milliseconds(ms as i64));
-                        let sm = crate::storage::storage_metrics();
-                        crate::daemon::snapshot::publish_basic(
-                            record_builder.current_state(),
-                            record_builder.current_focus(),
-                            last_transition.clone(),
-                            counts.clone(),
-                            ms as u32,
-                            reason.to_string(),
-                            next_timeout,
-                            crate::daemon::snapshot::StorageInfo {
-                                backlog_count: sm.backlog_count,
-                                last_flush_at: sm.last_flush_at,
-                            },
-                            cfg_summary.clone(),
-                            crate::daemon::snapshot::current_health(),
-                            aggregated_apps,
-                        );
+                }
+                let _ = storage_tx.send(StorageCommand::Shutdown);
+                let now = chrono::Utc::now();
+                let since = now - retention;
+                while let Some(front) = recent_records.front() {
+                    let end = front.end_time.unwrap_or(now);
+                    if end < since {
+                        recent_records.pop_front();
+                    } else {
+                        break;
                     }
                 }
 
+                let agg = {
+                    aggregate_activities_since(
+                        recent_records.make_contiguous(),
+                        since,
+                        now,
+                        eph_max,
+                        eph_min,
+                        max_windows,
+                    )
+                };
+
+                let aggregated_apps = build_app_tree(&agg, app_eph_max, app_eph_min);
+                let ms = match current_state {
+                    crate::daemon::records::ActivityState::Active => 2000,
+                    crate::daemon::records::ActivityState::Passive => 10000,
+                    crate::daemon::records::ActivityState::Inactive => 20000,
+                    crate::daemon::records::ActivityState::Locked => 30000,
+                };
+                let reason = match current_state {
+                    crate::daemon::records::ActivityState::Active => "Active",
+                    crate::daemon::records::ActivityState::Passive => "Passive",
+                    crate::daemon::records::ActivityState::Inactive => "Inactive",
+                    crate::daemon::records::ActivityState::Locked => "Locked",
+                };
+                let next_timeout =
+                    Some(chrono::Utc::now() + chrono::Duration::milliseconds(ms as i64));
+                let sm = sm_rx.borrow().clone();
+                crate::daemon::snapshot::publish_basic(
+                    current_state,
+                    current_focus.clone(),
+                    last_transition.clone(),
+                    counts.clone(),
+                    ms as u32,
+                    reason.to_string(),
+                    next_timeout,
+                    crate::daemon::snapshot::StorageInfo {
+                        backlog_count: sm.backlog_count,
+                        last_flush_at: sm.last_flush_at,
+                    },
+                    cfg_summary.clone(),
+                    crate::daemon::snapshot::current_health(),
+                    aggregated_apps,
+                );
+
+                // Join worker threads
+                let _ = hints_thread.join();
+                let _ = storage_thread.join();
                 info!("Background thread completed");
             })
         };
 
         let shutdown_sender = sender.clone();
-        let pid_file_cleanup = pid_file.clone();
         ctrlc::set_handler(move || {
             info!("Step S: Ctrl+C received, sending shutdown signal");
             if let Err(e) = shutdown_sender.send(KronicalEvent::Shutdown) {
@@ -1194,9 +1252,6 @@ impl EventCoordinator {
             if let Err(e) = winshift::stop_hook() {
                 error!("Step S: Failed to stop winshift: {}", e);
             }
-
-            info!("Step S: Cleaning up PID file");
-            let _ = std::fs::remove_file(&pid_file_cleanup);
         })?;
 
         // poll_handle_arc already created earlier; reuse it for the handler
@@ -1245,27 +1300,23 @@ impl EventCoordinator {
         }
 
         info!("Step C: Cleaning up socket files");
-        if let Some(socket_dir) = pid_file.parent() {
-            let grpc_sock = socket_dir.join("kroni.sock");
-            let http_sock = socket_dir.join("kroni.http.sock");
+        let grpc_sock = crate::util::paths::grpc_uds(&workspace_dir);
+        let http_sock = crate::util::paths::http_uds(&workspace_dir);
 
-            if grpc_sock.exists() {
-                if let Err(e) = std::fs::remove_file(&grpc_sock) {
-                    error!("Failed to remove gRPC socket: {}", e);
-                } else {
-                    info!("Removed gRPC socket file");
-                }
+        if grpc_sock.exists() {
+            if let Err(e) = std::fs::remove_file(&grpc_sock) {
+                error!("Failed to remove gRPC socket: {}", e);
+            } else {
+                info!("Removed gRPC socket file");
             }
+        }
 
-            if http_sock.exists() {
-                if let Err(e) = std::fs::remove_file(&http_sock) {
-                    error!("Failed to remove HTTP socket: {}", e);
-                } else {
-                    info!("Removed HTTP socket file");
-                }
+        if http_sock.exists() {
+            if let Err(e) = std::fs::remove_file(&http_sock) {
+                error!("Failed to remove HTTP socket: {}", e);
+            } else {
+                info!("Removed HTTP socket file");
             }
-        } else {
-            error!("PID file has no parent; skipping socket cleanup");
         }
 
         info!("Step C: Kronical shutdown complete");

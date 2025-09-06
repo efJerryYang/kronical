@@ -1,12 +1,13 @@
-use crate::daemon::events::WindowFocusInfo;
-use crate::daemon::records::ActivityState;
-use once_cell::sync::Lazy;
+use crate::events::WindowFocusInfo;
+use crate::records::ActivityState;
+use once_cell::sync::OnceCell;
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::{
-    Arc, RwLock,
+    Arc,
     atomic::{AtomicU64, Ordering},
 };
+use tokio::sync::watch;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
@@ -15,6 +16,8 @@ pub struct Snapshot {
     pub activity_state: ActivityState,
     pub focus: Option<WindowFocusInfo>,
     pub last_transition: Option<Transition>,
+    #[serde(default)]
+    pub transitions_recent: Vec<Transition>,
     pub counts: Counts,
     pub cadence_ms: u32,
     pub cadence_reason: String,
@@ -30,6 +33,8 @@ pub struct Transition {
     pub from: ActivityState,
     pub to: ActivityState,
     pub at: chrono::DateTime<chrono::Utc>,
+    #[serde(default)]
+    pub by_signal: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -47,6 +52,7 @@ impl Snapshot {
             activity_state: ActivityState::Inactive,
             focus: None,
             last_transition: None,
+            transitions_recent: Vec::new(),
             counts: Counts::default(),
             cadence_ms: 0,
             cadence_reason: String::new(),
@@ -63,10 +69,35 @@ impl Snapshot {
 }
 
 pub static SNAPSHOT_SEQ: AtomicU64 = AtomicU64::new(0);
-pub static SNAPSHOT: Lazy<RwLock<Arc<Snapshot>>> =
-    Lazy::new(|| RwLock::new(Arc::new(Snapshot::empty())));
-static HEALTH_BUF: Lazy<RwLock<VecDeque<String>>> =
-    Lazy::new(|| RwLock::new(VecDeque::with_capacity(64)));
+// Channel-first health buffer: maintain the last 64 messages via a watch channel.
+// Avoids RwLock by cloning/modifying the current buffer and re-sending.
+static HEALTH_WATCH: OnceCell<(
+    watch::Sender<VecDeque<String>>,
+    watch::Receiver<VecDeque<String>>,
+)> = OnceCell::new();
+
+fn init_health_watch() -> &'static (
+    watch::Sender<VecDeque<String>>,
+    watch::Receiver<VecDeque<String>>,
+) {
+    HEALTH_WATCH.get_or_init(|| {
+        let initial: VecDeque<String> = VecDeque::with_capacity(64);
+        watch::channel(initial)
+    })
+}
+
+// Optional live snapshot watch channel
+static SNAP_WATCH: OnceCell<(watch::Sender<Arc<Snapshot>>, watch::Receiver<Arc<Snapshot>>)> =
+    OnceCell::new();
+
+fn init_snapshot_watch() -> &'static (watch::Sender<Arc<Snapshot>>, watch::Receiver<Arc<Snapshot>>)
+{
+    SNAP_WATCH.get_or_init(|| {
+        // Initialize with an empty snapshot value and update over time
+        let initial = Arc::new(Snapshot::empty());
+        watch::channel(initial)
+    })
+}
 
 fn monotonic_ns() -> u64 {
     use std::time::SystemTime;
@@ -74,6 +105,40 @@ fn monotonic_ns() -> u64 {
         .duration_since(SystemTime::UNIX_EPOCH)
         .unwrap_or_default();
     now.as_nanos() as u64
+}
+
+// Channel-first transitions buffer holding recent transitions with optional signal info
+static TRANSITIONS_WATCH: OnceCell<(
+    watch::Sender<VecDeque<Transition>>,
+    watch::Receiver<VecDeque<Transition>>,
+)> = OnceCell::new();
+
+fn init_transitions_watch() -> &'static (
+    watch::Sender<VecDeque<Transition>>,
+    watch::Receiver<VecDeque<Transition>>,
+) {
+    TRANSITIONS_WATCH.get_or_init(|| {
+        let initial: VecDeque<Transition> = VecDeque::with_capacity(64);
+        watch::channel(initial)
+    })
+}
+
+pub fn push_transition(t: Transition) {
+    let (tx, rx) = init_transitions_watch();
+    let mut buf = rx.borrow().clone();
+    if buf.len() >= 64 {
+        let _ = buf.pop_front();
+    }
+    buf.push_back(t);
+    let _ = tx.send(buf);
+}
+
+pub fn recent_transitions(limit: usize) -> Vec<Transition> {
+    let (_tx, rx) = init_transitions_watch();
+    let buf = rx.borrow();
+    let len = buf.len();
+    let n = limit.min(len);
+    buf.iter().rev().take(n).cloned().collect()
 }
 
 pub fn publish_basic(
@@ -96,6 +161,7 @@ pub fn publish_basic(
         activity_state: state,
         focus,
         last_transition,
+        transitions_recent: recent_transitions(5),
         counts,
         cadence_ms,
         cadence_reason,
@@ -105,9 +171,9 @@ pub fn publish_basic(
         health,
         aggregated_apps,
     };
-    if let Ok(mut guard) = SNAPSHOT.write() {
-        *guard = Arc::new(snap);
-    }
+    let arc = Arc::new(snap);
+    let (tx, _rx) = init_snapshot_watch();
+    let _ = tx.send(arc);
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -127,39 +193,30 @@ pub struct ConfigSummary {
     pub ephemeral_app_min_distinct_procs: usize,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct CountsSummary {
-    pub signals_seen: u64,
-    pub hints_seen: u64,
-    pub records_emitted: u64,
+pub fn get_current() -> Arc<Snapshot> {
+    let (_tx, rx) = init_snapshot_watch();
+    rx.borrow().clone()
 }
 
-// Replay info removed
-
-pub fn get_current() -> Arc<Snapshot> {
-    if let Ok(guard) = SNAPSHOT.read() {
-        guard.clone()
-    } else {
-        Arc::new(Snapshot::empty())
-    }
+pub fn watch_snapshot() -> watch::Receiver<Arc<Snapshot>> {
+    let (_tx, rx) = init_snapshot_watch();
+    rx.clone()
 }
 
 pub fn push_health(msg: impl Into<String>) {
     let s = msg.into();
-    if let Ok(mut q) = HEALTH_BUF.write() {
-        if q.len() >= 64 {
-            q.pop_front();
-        }
-        q.push_back(s);
+    let (tx, rx) = init_health_watch();
+    let mut buf = rx.borrow().clone();
+    if buf.len() >= 64 {
+        let _ = buf.pop_front();
     }
+    buf.push_back(s);
+    let _ = tx.send(buf);
 }
 
 pub fn current_health() -> Vec<String> {
-    if let Ok(q) = HEALTH_BUF.read() {
-        q.iter().cloned().collect()
-    } else {
-        Vec::new()
-    }
+    let (_tx, rx) = init_health_watch();
+    rx.borrow().iter().cloned().collect()
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

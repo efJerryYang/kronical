@@ -2,19 +2,7 @@ fn main() {
     println!("cargo:rerun-if-changed=proto/");
     println!("cargo:rerun-if-changed=build.rs");
 
-    // gRPC API generation
-    let feature_enabled = std::env::var("CARGO_FEATURE_KRONI_API").is_ok();
-    if feature_enabled {
-        println!("cargo:rerun-if-changed=proto/kroni.proto");
-        tonic_prost_build::configure()
-            .build_client(true)
-            .build_server(true)
-            .compile_well_known_types(true)
-            // Map well-known types to prost-types rather than generating a local google module
-            .extern_path(".google.protobuf", "::prost_types")
-            .compile_protos(&["proto/kroni.proto"], &["proto"]) // files, includes
-            .expect("Failed to compile kroni.proto");
-    }
+    // gRPC API generation moved to crates/rpc
 
     // macOS libproc bindings generation
 

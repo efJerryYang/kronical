@@ -105,5 +105,8 @@ impl RawEvent {
 }
 
 pub mod adapter;
-pub mod deriver;
+pub mod derive_hint;
+pub mod derive_signal;
+pub mod hints;
 pub mod model;
+pub mod signals;

@@ -2,9 +2,6 @@ use std::collections::HashMap;
 use std::hash::Hash;
 use std::time::{Duration, Instant};
 
-// Simple size-bounded LRU with optional TTL semantics.
-// Evicts the least-recently-accessed entry when capacity is exceeded.
-// For small capacities (<= a few thousand), a linear scan on eviction is acceptable.
 pub struct LruCache<K, V> {
     map: HashMap<K, (V, Instant)>,
     capacity: usize,
@@ -36,10 +33,8 @@ impl<K: Eq + Hash + Clone, V: Clone> LruCache<K, V> {
     pub fn get_cloned(&mut self, key: &K) -> Option<V> {
         let now = Instant::now();
         if let Some((v, ts)) = self.map.get_mut(key) {
-            // TTL check
             if let Some(ttl) = self.ttl {
                 if now.duration_since(*ts) > ttl {
-                    // expired
                     self.map.remove(key);
                     return None;
                 }
@@ -60,7 +55,6 @@ impl<K: Eq + Hash + Clone, V: Clone> LruCache<K, V> {
         if self.map.len() <= self.capacity {
             return;
         }
-        // Evict least-recently-accessed (smallest Instant)
         if let Some((oldest_key, _)) = self
             .map
             .iter()

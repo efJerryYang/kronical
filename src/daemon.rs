@@ -1,8 +1,9 @@
 pub mod compressor;
 pub mod coordinator;
-pub mod events;
-pub mod records;
-pub mod snapshot;
+// Re-export core modules to maintain stable paths
+pub use kronical_core::events;
+pub use kronical_core::records;
+pub use kronical_core::snapshot;
 
 // Grouped subsystems
 pub mod server; // gRPC + HTTP
