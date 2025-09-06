@@ -1,4 +1,5 @@
-pub mod config;
-pub mod lru;
-pub mod maps;
-pub mod paths;
+// Re-export from common crate to keep crate::util::* paths stable
+pub use kronical_common::config;
+pub use kronical_common::lru;
+pub use kronical_common::maps;
+pub use kronical_common::paths;

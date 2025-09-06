@@ -1964,6 +1964,7 @@ dependencies = [
  "futures-util",
  "hyper",
  "hyper-util",
+ "kronical-common",
  "libc",
  "log",
  "once_cell",
@@ -1988,6 +1989,16 @@ dependencies = [
  "tracing-subscriber",
  "uiohook-rs",
  "winshift",
+]
+
+[[package]]
+name = "kronical-common"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "config",
+ "dirs",
+ "serde",
 ]
 
 [[package]]

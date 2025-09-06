@@ -57,6 +57,7 @@ duckdb = { version = "1.3.2", features = [
     "r2d2",
     "uuid",
 ] }
+kronical-common = { path = "crates/common" }
 
 # gRPC API
 tonic = { version = "0.14", features = ["transport"], optional = true }
@@ -109,3 +110,8 @@ path = "src/lib.rs"
 [build-dependencies]
 tonic-prost-build = { version = "0.14" }
 bindgen = "0.72"
+
+[workspace]
+members = [
+    "crates/common",
+]

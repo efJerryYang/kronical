@@ -34,7 +34,6 @@ pub struct AppConfig {
 
 impl Default for AppConfig {
     fn default() -> Self {
-        // Be resilient in environments without HOME by falling back to CWD.
         let base_dir = dirs::home_dir()
             .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
             .or_else(|| std::env::current_dir().ok())
@@ -70,7 +69,6 @@ impl AppConfig {
         let config_path = workspace_dir.join("config.toml");
 
         let mut builder = Config::builder()
-            // Avoid panics on non-UTF8 paths by using lossy conversion.
             .set_default("workspace_dir", workspace_dir.to_string_lossy().as_ref())?
             .set_default("db_backend", "duckdb")?
             .set_default("retention_minutes", 72 * 60)?
@@ -90,17 +88,14 @@ impl AppConfig {
             .set_default("tracker_batch_size", 60)?
             .set_default("tracker_refresh_secs", 1.0)?;
 
-        // Load config file if it exists
         if config_path.exists() {
             builder = builder.add_source(File::from(config_path));
         }
 
-        // Allow environment variables to override config
         builder = builder.add_source(Environment::with_prefix("KRONICAL"));
 
         let config = builder.build()?;
         let app_config: AppConfig = config.try_deserialize()?;
-
         Ok(app_config)
     }
 }
