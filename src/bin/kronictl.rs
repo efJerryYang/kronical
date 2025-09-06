@@ -636,7 +636,7 @@ fn sse_watch_via_http(uds_path: &PathBuf, pretty: bool) -> Result<()> {
                     data_buf.trim_end(),
                 ) {
                     if pretty {
-                        print_snapshot_line(&snap);
+                        print_snapshot_pretty(&snap);
                     } else {
                         println!("{}", data_buf.trim_end());
                     }
@@ -885,12 +885,8 @@ fn grpc_watch(_uds_http_sock: &PathBuf, pretty: bool) -> Result<()> {
         let mut s: Streaming<kronical::kroni_api::kroni::v1::SnapshotReply> = stream;
         while let Some(item) = s.message().await? {
             if pretty {
-                println!(
-                    "seq={} state={:?} cadence={}ms",
-                    item.seq,
-                    item.activity_state,
-                    item.cadence.as_ref().map(|c| c.current_ms).unwrap_or(0)
-                );
+                let snap = map_pb_snapshot(item);
+                print_snapshot_pretty(&snap);
             } else {
                 let snap = map_pb_snapshot(item);
                 println!("{}", serde_json::to_string(&snap).unwrap_or_default());
@@ -904,6 +900,7 @@ fn grpc_watch(_uds_http_sock: &PathBuf, pretty: bool) -> Result<()> {
 fn print_snapshot_pretty(s: &kronical::daemon::snapshot::Snapshot) {
     println!("Kronical Snapshot");
     println!("- seq: {}", s.seq);
+    println!("- mono_ns: {}", s.mono_ns);
     println!("- state: {:?}", s.activity_state);
     if let Some(f) = &s.focus {
         println!("- focus: {} [{}] - {}", f.app_name, f.pid, f.window_title);
@@ -930,16 +927,40 @@ fn print_snapshot_pretty(s: &kronical::daemon::snapshot::Snapshot) {
             .unwrap_or("".into())
     );
     println!(
-        "- config: active={}s idle={}s retention={}m eph_max={}s eph_min={}",
+        "- config: active={}s idle={}s retention={}m eph_max={}s eph_min={} eph_app_max={}s eph_app_min_procs={}",
         s.config.active_grace_secs,
         s.config.idle_threshold_secs,
         s.config.retention_minutes,
         s.config.ephemeral_max_duration_secs,
-        s.config.ephemeral_min_distinct_ids
+        s.config.ephemeral_min_distinct_ids,
+        s.config.ephemeral_app_max_duration_secs,
+        s.config.ephemeral_app_min_distinct_procs
     );
-    // Replay removed
     if !s.health.is_empty() {
         println!("- health: {}", s.health.join(", "));
+    }
+    println!("- apps ({}):", s.aggregated_apps.len());
+    for app in &s.aggregated_apps {
+        println!(
+            "  - app: {} [{}] total={} ({}s)",
+            app.app_name, app.pid, app.total_duration_pretty, app.total_duration_secs
+        );
+        if !app.windows.is_empty() {
+            println!("    windows ({}):", app.windows.len());
+            for w in &app.windows {
+                println!("      - title: {}", w.window_title);
+                println!(
+                    "        id: {} first_seen: {} last_seen: {} dur: {}s{}",
+                    w.window_id,
+                    w.first_seen,
+                    w.last_seen,
+                    w.duration_seconds,
+                    if w.is_group { " (group)" } else { "" }
+                );
+            }
+        } else {
+            println!("    windows: -");
+        }
     }
 }
 
