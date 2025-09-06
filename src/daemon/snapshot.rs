@@ -1,12 +1,13 @@
 use crate::daemon::events::WindowFocusInfo;
 use crate::daemon::records::ActivityState;
-use once_cell::sync::Lazy;
+use once_cell::sync::{Lazy, OnceCell};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::{
     Arc, RwLock,
     atomic::{AtomicU64, Ordering},
 };
+use tokio::sync::watch;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Snapshot {
@@ -68,6 +69,19 @@ pub static SNAPSHOT: Lazy<RwLock<Arc<Snapshot>>> =
 static HEALTH_BUF: Lazy<RwLock<VecDeque<String>>> =
     Lazy::new(|| RwLock::new(VecDeque::with_capacity(64)));
 
+// Optional live snapshot watch channel
+static SNAP_WATCH: OnceCell<(watch::Sender<Arc<Snapshot>>, watch::Receiver<Arc<Snapshot>>)> =
+    OnceCell::new();
+
+fn init_snapshot_watch() -> &'static (watch::Sender<Arc<Snapshot>>, watch::Receiver<Arc<Snapshot>>)
+{
+    SNAP_WATCH.get_or_init(|| {
+        // Initialize with current snapshot value
+        let initial = get_current();
+        watch::channel(initial)
+    })
+}
+
 fn monotonic_ns() -> u64 {
     use std::time::SystemTime;
     let now = SystemTime::now()
@@ -105,9 +119,12 @@ pub fn publish_basic(
         health,
         aggregated_apps,
     };
+    let arc = Arc::new(snap);
     if let Ok(mut guard) = SNAPSHOT.write() {
-        *guard = Arc::new(snap);
+        *guard = arc.clone();
     }
+    let (tx, _rx) = init_snapshot_watch();
+    let _ = tx.send(arc);
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -127,12 +144,7 @@ pub struct ConfigSummary {
     pub ephemeral_app_min_distinct_procs: usize,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
-pub struct CountsSummary {
-    pub signals_seen: u64,
-    pub hints_seen: u64,
-    pub records_emitted: u64,
-}
+// CountsSummary removed; use Counts directly where needed
 
 // Replay info removed
 
@@ -142,6 +154,11 @@ pub fn get_current() -> Arc<Snapshot> {
     } else {
         Arc::new(Snapshot::empty())
     }
+}
+
+pub fn watch_snapshot() -> watch::Receiver<Arc<Snapshot>> {
+    let (_tx, rx) = init_snapshot_watch();
+    rx.clone()
 }
 
 pub fn push_health(msg: impl Into<String>) {

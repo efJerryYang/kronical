@@ -1,10 +1,11 @@
 use crate::daemon::events::WindowFocusInfo;
 use crate::daemon::events::model::{EventEnvelope, EventKind, EventPayload, HintKind};
+use crate::util::interner::StringInterner;
 use crate::util::maps::{HashMap, HashSet};
 use chrono::{DateTime, Utc};
 // no-op: keep minimal imports to avoid unused warnings
 use serde::{Deserialize, Serialize};
-use std::sync::{Arc, Weak};
+use std::sync::Arc;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum ActivityState {
@@ -184,7 +185,7 @@ mod tests {
     use super::*;
     use crate::daemon::events::RawEvent;
     use crate::daemon::events::adapter::EventAdapter;
-    use crate::daemon::events::deriver::StateDeriver;
+    use crate::daemon::events::derive_hint::StateDeriver;
     use crate::daemon::events::model::{DefaultStateEngine, EventSource, SignalKind, StateEngine};
 
     fn mk_env_signal(kind: SignalKind) -> EventEnvelope {
@@ -652,43 +653,4 @@ fn normalize_title(s: &str) -> String {
     s.trim().to_lowercase()
 }
 
-pub struct StringInterner {
-    map: HashMap<String, Weak<String>>,
-    max_entries: usize,
-}
-
-impl StringInterner {
-    pub fn new() -> Self {
-        Self {
-            map: HashMap::new(),
-            max_entries: 4096,
-        }
-    }
-
-    pub fn intern(&mut self, s: &str) -> Arc<String> {
-        self.cleanup_dead_references();
-
-        if let Some(weak_ref) = self.map.get(s) {
-            if let Some(arc_string) = weak_ref.upgrade() {
-                return arc_string;
-            }
-        }
-
-        if self.map.len() >= self.max_entries {
-            self.cleanup_dead_references();
-        }
-
-        let arc_string = Arc::new(s.to_string());
-        self.map.insert(s.to_string(), Arc::downgrade(&arc_string));
-        arc_string
-    }
-
-    fn cleanup_dead_references(&mut self) {
-        self.map.retain(|_, weak_ref| weak_ref.strong_count() > 0);
-
-        if self.map.len() >= self.max_entries {
-            self.map.clear();
-            self.map.shrink_to_fit();
-        }
-    }
-}
+// StringInterner moved to crate::util::interner

@@ -3,3 +3,4 @@ pub use kronical_common::config;
 pub use kronical_common::lru;
 pub use kronical_common::maps;
 pub use kronical_common::paths;
+pub mod interner;

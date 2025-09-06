@@ -1,5 +1,5 @@
 use crate::daemon::events::WindowFocusInfo;
-use crate::daemon::records::StringInterner;
+use crate::util::interner::StringInterner;
 use crate::util::lru::LruCache;
 use chrono::{DateTime, Utc};
 use log::{debug, error, info, warn};
@@ -330,5 +330,12 @@ impl Clone for FocusEventWrapper {
             last_titles: Arc::clone(&self.last_titles),
             string_interner: Arc::clone(&self.string_interner),
         }
+    }
+}
+
+impl Drop for FocusEventWrapper {
+    fn drop(&mut self) {
+        // Signal polling thread to stop on drop
+        self.should_stop_polling.store(true, Ordering::Relaxed);
     }
 }

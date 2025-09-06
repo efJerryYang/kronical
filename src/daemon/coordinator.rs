@@ -1,6 +1,7 @@
 use crate::daemon::compressor::CompressionEngine;
 use crate::daemon::events::adapter::EventAdapter;
-use crate::daemon::events::deriver::{LockDeriver, StateDeriver};
+use crate::daemon::events::derive_hint::StateDeriver;
+use crate::daemon::events::derive_signal::LockDeriver;
 use crate::daemon::events::model::{EventKind, EventPayload, SignalKind};
 use crate::daemon::events::{
     KeyboardEventData, MouseEventData, MouseEventKind, MousePosition, WindowFocusInfo,
@@ -418,6 +419,8 @@ impl EventCoordinator {
             };
 
             let mut last_transition: Option<crate::daemon::snapshot::Transition> = None;
+            // Subscribe to live storage metrics updates
+            let sm_rx = crate::storage::storage_metrics_watch();
 
             let poll_handle_arc2 = std::sync::Arc::clone(&poll_handle_arc);
             let ags = self.active_grace_secs;
@@ -819,7 +822,7 @@ impl EventCoordinator {
                                         chrono::Utc::now()
                                             + chrono::Duration::milliseconds(ms as i64),
                                     );
-                                    let sm = crate::storage::storage_metrics();
+                                    let sm = sm_rx.borrow().clone();
                                     crate::daemon::snapshot::publish_basic(
                                         current_state,
                                         current_focus.clone(),
@@ -1027,7 +1030,7 @@ impl EventCoordinator {
                                         chrono::Utc::now()
                                             + chrono::Duration::milliseconds(ms as i64),
                                     );
-                                    let sm = crate::storage::storage_metrics();
+                                    let sm = sm_rx.borrow().clone();
                                     crate::daemon::snapshot::publish_basic(
                                         current_state,
                                         current_focus.clone(),
@@ -1121,7 +1124,7 @@ impl EventCoordinator {
                             let next_timeout = Some(
                                 chrono::Utc::now() + chrono::Duration::milliseconds(ms as i64),
                             );
-                            let sm = crate::storage::storage_metrics();
+                            let sm = sm_rx.borrow().clone();
                             crate::daemon::snapshot::publish_basic(
                                 current_state,
                                 current_focus.clone(),
@@ -1190,7 +1193,7 @@ impl EventCoordinator {
                 };
                 let next_timeout =
                     Some(chrono::Utc::now() + chrono::Duration::milliseconds(ms as i64));
-                let sm = crate::storage::storage_metrics();
+                let sm = sm_rx.borrow().clone();
                 crate::daemon::snapshot::publish_basic(
                     current_state,
                     current_focus.clone(),

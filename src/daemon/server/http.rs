@@ -9,7 +9,6 @@ use hyper_util::service::TowerToHyperService;
 use log::{info, warn};
 use std::convert::Infallible;
 use std::path::PathBuf;
-use std::time::Duration;
 use tokio::net::UnixListener;
 use tower::Service;
 
@@ -20,9 +19,9 @@ async fn snapshot_handler() -> Json<snapshot::Snapshot> {
 
 async fn stream_handler() -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
     use tokio_stream::StreamExt;
-    use tokio_stream::wrappers::IntervalStream;
-    let stream = IntervalStream::new(tokio::time::interval(Duration::from_millis(500))).map(|_| {
-        let snap = snapshot::get_current();
+    use tokio_stream::wrappers::WatchStream;
+    let rx = snapshot::watch_snapshot();
+    let stream = WatchStream::new(rx).map(|snap| {
         let data = serde_json::to_string(&*snap).unwrap_or_else(|_| "{}".into());
         Ok(Event::default().data(data))
     });

@@ -1965,10 +1965,10 @@ dependencies = [
  "hyper",
  "hyper-util",
  "kronical-common",
+ "kronical-rpc",
  "libc",
  "log",
  "once_cell",
- "prost",
  "prost-types",
  "ratatui",
  "ringbuf",
@@ -1981,8 +1981,6 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tonic",
- "tonic-prost",
- "tonic-prost-build",
  "tower",
  "tracing",
  "tracing-appender",
@@ -1999,6 +1997,17 @@ dependencies = [
  "config",
  "dirs",
  "serde",
+]
+
+[[package]]
+name = "kronical-rpc"
+version = "0.1.0"
+dependencies = [
+ "prost",
+ "prost-types",
+ "tonic",
+ "tonic-prost",
+ "tonic-prost-build",
 ]
 
 [[package]]
@@ -3696,6 +3705,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

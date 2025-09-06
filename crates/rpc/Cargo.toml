@@ -1,0 +1,17 @@
+[package]
+name = "kronical-rpc"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "kronical_rpc"
+path = "src/lib.rs"
+
+[dependencies]
+tonic = { version = "0.14", features = ["transport"] }
+prost = { version = "0.14" }
+prost-types = { version = "0.14" }
+tonic-prost = { version = "0.14" }
+
+[build-dependencies]
+tonic-prost-build = { version = "0.14" }

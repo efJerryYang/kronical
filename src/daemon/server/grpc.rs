@@ -18,7 +18,7 @@ use std::pin::Pin;
 use std::sync::mpsc::Sender;
 use tokio::net::UnixListener;
 use tokio_stream::StreamExt;
-use tokio_stream::wrappers::IntervalStream;
+use tokio_stream::wrappers::WatchStream;
 use tonic::{Request, Response, Status, transport::Server};
 
 static SYSTEM_TRACKER_DB_PATH: OnceCell<PathBuf> = OnceCell::new();
@@ -52,9 +52,9 @@ impl Kroni for KroniSvc {
         &self,
         _req: Request<WatchRequest>,
     ) -> Result<Response<Self::WatchStream>, Status> {
-        let stream =
-            IntervalStream::new(tokio::time::interval(std::time::Duration::from_millis(500)))
-                .map(|_| Ok(to_pb(&snapshot::get_current())));
+        // Prefer pushing updates via watch channel; fall back to interval if watch not ready
+        let rx = snapshot::watch_snapshot();
+        let stream = WatchStream::new(rx).map(|arc| Ok(to_pb(&arc)));
         Ok(Response::new(Box::pin(stream)))
     }
 
