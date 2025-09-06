@@ -47,15 +47,15 @@ impl DuckDbStorage {
     fn init_db(conn: &Connection) -> Result<()> {
         conn.execute_batch(
             r"CREATE TABLE IF NOT EXISTS raw_events (
-                id INTEGER,
+                id BIGINT,
                 timestamp TIMESTAMPTZ NOT NULL,
                 event_type TEXT NOT NULL,
                 data TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_raw_events_timestamp ON raw_events(timestamp);
             CREATE TABLE IF NOT EXISTS raw_envelopes (
-                id INTEGER,
-                event_id INTEGER,
+                id BIGINT,
+                event_id BIGINT,
                 timestamp TIMESTAMPTZ NOT NULL,
                 source TEXT NOT NULL,
                 kind TEXT NOT NULL,
@@ -66,7 +66,7 @@ impl DuckDbStorage {
             );
             CREATE INDEX IF NOT EXISTS idx_raw_envelopes_timestamp ON raw_envelopes(timestamp);
             CREATE TABLE IF NOT EXISTS activity_records (
-                id INTEGER,
+                id BIGINT,
                 start_time TIMESTAMPTZ NOT NULL,
                 end_time TIMESTAMPTZ,
                 state TEXT NOT NULL,
@@ -173,6 +173,9 @@ impl DuckDbStorage {
 
             if let Err(e) = result {
                 eprintln!("Failed to write to DuckDB: {}", e);
+                // If a statement fails inside a transaction, DuckDB aborts the transaction.
+                // Roll back and start a new transaction to clear the aborted state.
+                let _ = conn.execute_batch("ROLLBACK; BEGIN TRANSACTION;");
                 crate::daemon::snapshot::push_health(format!("duckdb write error: {}", e));
             }
 

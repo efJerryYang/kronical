@@ -388,7 +388,7 @@ fn run_monitor_loop<B: Backend>(terminal: &mut Terminal<B>, data_file: PathBuf) 
                                     ];
                                     let p = Paragraph::new(lines).block(top);
                                     f.render_widget(p, layout[0]);
-                                    // Middle: Aggregated apps summary
+                                    // Middle: Details (moved above Apps)
                                     let mut app_lines: Vec<Line> = Vec::new();
                                     if !snap.aggregated_apps.is_empty() {
                                         app_lines.push(Line::from("Apps (latest first):"));
@@ -417,12 +417,7 @@ fn run_monitor_loop<B: Backend>(terminal: &mut Terminal<B>, data_file: PathBuf) 
                                     } else {
                                         app_lines.push(Line::from("Apps: (no recent activity)"));
                                     }
-                                    let p_apps = Paragraph::new(app_lines)
-                                        .block(Block::default().title("Apps").borders(Borders::ALL))
-                                        .wrap(Wrap { trim: true });
-                                    f.render_widget(p_apps, layout[1]);
-
-                                    // Bottom: Details
+                                    // Build Details content
                                     let mut details: Vec<Line> = Vec::new();
                                     details.push(Line::from(format!(
                                         "Counts: signals={} hints={} records={}",
@@ -450,12 +445,19 @@ fn run_monitor_loop<B: Backend>(terminal: &mut Terminal<B>, data_file: PathBuf) 
                                             details.push(Line::from(format!("- {}", h)));
                                         }
                                     }
+                                    // Render Details in the middle panel
                                     let p2 = Paragraph::new(details)
                                         .block(
                                             Block::default().title("Details").borders(Borders::ALL),
                                         )
                                         .wrap(Wrap { trim: true });
-                                    f.render_widget(p2, layout[2]);
+                                    f.render_widget(p2, layout[1]);
+
+                                    // Bottom: Aggregated apps summary (moved below Details)
+                                    let p_apps = Paragraph::new(app_lines)
+                                        .block(Block::default().title("Apps").borders(Borders::ALL))
+                                        .wrap(Wrap { trim: true });
+                                    f.render_widget(p_apps, layout[2]);
                                 })?;
                             }
                             data_buf.clear();
