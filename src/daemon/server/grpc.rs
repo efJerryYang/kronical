@@ -52,7 +52,7 @@ impl Kroni for KroniSvc {
         &self,
         _req: Request<WatchRequest>,
     ) -> Result<Response<Self::WatchStream>, Status> {
-        // Prefer pushing updates via watch channel; fall back to interval if watch not ready
+        // Stream updates via the snapshot watch channel
         let rx = snapshot::watch_snapshot();
         let stream = WatchStream::new(rx).map(|arc| Ok(to_pb(&arc)));
         Ok(Response::new(Box::pin(stream)))

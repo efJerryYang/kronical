@@ -1181,13 +1181,4 @@ fn show_tracker_data_grpc(
     Ok(())
 }
 
-#[cfg(not(feature = "kroni-api"))]
-fn show_tracker_data_grpc(
-    _workspace_dir: &PathBuf,
-    _count: Option<usize>,
-    _daemon_pid: u32,
-) -> Result<()> {
-    Err(anyhow::anyhow!(
-        "gRPC API not available. Compile with --features kroni-api to enable system tracker access."
-    ))
-}
+// gRPC API always available; feature gate removed
