@@ -19,7 +19,14 @@ async fn metrics_increase_across_consecutive_requests_after_flush() {
 
     // Start tracker with short interval and large batch to require flush
     let pid = std::process::id();
-    let mut tracker = DuckDbSystemTracker::new(pid, 0.25, 100, db_path.clone());
+    let mut tracker = DuckDbSystemTracker::new(
+        pid,
+        0.25,
+        100,
+        db_path.clone(),
+        kronical::util::config::DatabaseBackendConfig::Duckdb,
+        10,
+    );
     tracker.start().unwrap();
 
     // Point the gRPC service at this DB

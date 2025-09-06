@@ -95,6 +95,7 @@ pub enum StorageCommand {
     RawEvent(RawEvent),
     Record(ActivityRecord),
     Envelope(EventEnvelope),
+    CompactEvents(Vec<CompactEvent>),
     Shutdown,
 }
 

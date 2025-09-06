@@ -113,6 +113,14 @@ impl DuckDbStorage {
                 state TEXT NOT NULL,
                 focus_info TEXT
             );
+            CREATE TABLE IF NOT EXISTS compact_events (
+                start_time TIMESTAMPTZ NOT NULL,
+                end_time TIMESTAMPTZ NOT NULL,
+                kind TEXT NOT NULL,
+                payload TEXT,
+                raw_event_ids TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_compact_events_start_time ON compact_events(start_time);
             CREATE INDEX IF NOT EXISTS idx_activity_records_start_time ON activity_records(start_time);
             ",
         )?;
@@ -212,6 +220,62 @@ impl DuckDbStorage {
                         env.sensitive,
                     ])
                 }
+                Ok(StorageCommand::CompactEvents(events)) => {
+                    for ce in events.into_iter() {
+                        use crate::daemon::compressor::CompactEvent as CE;
+                        match ce {
+                            CE::Scroll(s) => {
+                                let _ = conn.execute(
+                                    "INSERT INTO compact_events (start_time, end_time, kind, payload, raw_event_ids) VALUES (?, ?, ?, ?, ?)",
+                                    params![
+                                        s.start_time,
+                                        s.end_time,
+                                        "compact:scroll",
+                                        serde_json::to_string(&s).ok(),
+                                        serde_json::to_string(&s.raw_event_ids).unwrap_or("[]".to_string()),
+                                    ],
+                                );
+                            }
+                            CE::MouseTrajectory(t) => {
+                                let _ = conn.execute(
+                                    "INSERT INTO compact_events (start_time, end_time, kind, payload, raw_event_ids) VALUES (?, ?, ?, ?, ?)",
+                                    params![
+                                        t.start_time,
+                                        t.end_time,
+                                        "compact:mouse_traj",
+                                        serde_json::to_string(&t).ok(),
+                                        serde_json::to_string(&t.raw_event_ids).unwrap_or("[]".to_string()),
+                                    ],
+                                );
+                            }
+                            CE::Keyboard(k) => {
+                                let _ = conn.execute(
+                                    "INSERT INTO compact_events (start_time, end_time, kind, payload, raw_event_ids) VALUES (?, ?, ?, ?, ?)",
+                                    params![
+                                        k.start_time,
+                                        k.end_time,
+                                        "compact:keyboard",
+                                        serde_json::to_string(&k).ok(),
+                                        serde_json::to_string(&k.raw_event_ids).unwrap_or("[]".to_string()),
+                                    ],
+                                );
+                            }
+                            CE::Focus(f) => {
+                                let _ = conn.execute(
+                                    "INSERT INTO compact_events (start_time, end_time, kind, payload, raw_event_ids) VALUES (?, ?, ?, ?, ?)",
+                                    params![
+                                        f.timestamp,
+                                        f.timestamp,
+                                        "compact:focus",
+                                        serde_json::to_string(&f).ok(),
+                                        serde_json::to_string(&vec![f.event_id]).unwrap_or("[]".to_string()),
+                                    ],
+                                );
+                            }
+                        }
+                    }
+                    Ok(1)
+                }
                 Ok(StorageCommand::Shutdown) => break,
                 Err(_) => break,
             };
@@ -266,8 +330,15 @@ impl StorageBackend for DuckDbStorage {
 
     fn add_compact_events(
         &mut self,
-        _events: Vec<crate::daemon::compressor::CompactEvent>,
+        events: Vec<crate::daemon::compressor::CompactEvent>,
     ) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        self.sender
+            .send(StorageCommand::CompactEvents(events))
+            .context("Failed to send compact events to writer")?;
+        inc_backlog();
         Ok(())
     }
 

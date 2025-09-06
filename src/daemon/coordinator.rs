@@ -670,6 +670,11 @@ impl EventCoordinator {
                                     error!("store add_envelopes error: {}", e2);
                                 }
                             }
+                            StorageCommand::CompactEvents(evts) => {
+                                if let Err(e2) = store_writer.add_compact_events(evts) {
+                                    error!("store add_compact_events error: {}", e2);
+                                }
+                            }
                             StorageCommand::Shutdown => {
                                 info!("Storage writer shutdown received");
                                 break;
@@ -998,6 +1003,17 @@ impl EventCoordinator {
                                                 {
                                                     error!("Failed to enqueue raw event: {}", e);
                                                 }
+                                            }
+                                        }
+
+                                        if !compact_events.is_empty() {
+                                            if let Err(e) = storage_tx
+                                                .send(StorageCommand::CompactEvents(compact_events))
+                                            {
+                                                error!(
+                                                    "Failed to enqueue compact events to storage: {}",
+                                                    e
+                                                );
                                             }
                                         }
                                     }

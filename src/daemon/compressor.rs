@@ -62,6 +62,7 @@ pub struct CompactScrollSequence {
     pub total_rotation: i32,
     pub scroll_count: u32,
     pub position: MousePosition,
+    pub raw_event_ids: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -86,12 +87,14 @@ impl ScrollCompressor {
     fn extract_scroll_events(
         &self,
         events: &[RawEvent],
-    ) -> Vec<(DateTime<Utc>, MousePosition, i32, i32, WheelAxis)> {
+    ) -> Vec<(u64, DateTime<Utc>, MousePosition, i32, i32, WheelAxis)> {
         events
             .iter()
             .filter_map(|event| {
                 if let RawEvent::MouseInput {
-                    timestamp, data, ..
+                    timestamp,
+                    event_id,
+                    data,
                 } = event
                 {
                     // Only accept events that came from uiohook WheelEvent with explicit fields
@@ -100,6 +103,7 @@ impl ScrollCompressor {
                     {
                         let signed_amount = if rotation >= 0 { amount } else { -amount };
                         Some((
+                            *event_id,
                             *timestamp,
                             data.position.clone(),
                             signed_amount,
@@ -153,7 +157,7 @@ impl EventCompressor for ScrollCompressor {
         let mut sequences = Vec::new();
         let mut current_sequence: Option<CompactScrollSequence> = None;
 
-        for (timestamp, position, signed_amount, rotation, axis) in scroll_events {
+        for (event_id, timestamp, position, signed_amount, rotation, axis) in scroll_events {
             let scroll_direction = self.determine_direction(signed_amount, axis);
 
             match &mut current_sequence {
@@ -166,6 +170,7 @@ impl EventCompressor for ScrollCompressor {
                     seq.total_amount += signed_amount as i32;
                     seq.total_rotation += rotation;
                     seq.scroll_count += 1;
+                    seq.raw_event_ids.push(event_id);
                 }
                 _ => {
                     // Start new sequence
@@ -180,6 +185,7 @@ impl EventCompressor for ScrollCompressor {
                         total_rotation: rotation,
                         scroll_count: 1,
                         position,
+                        raw_event_ids: vec![event_id],
                     });
                 }
             }
@@ -207,6 +213,7 @@ pub struct CompactMouseTrajectory {
     pub simplified_path: Vec<MousePosition>,
     pub total_distance: f32,
     pub max_velocity: f32,
+    pub raw_event_ids: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -233,25 +240,31 @@ impl MouseTrajectoryCompressor {
     fn extract_mouse_events(
         &self,
         events: &[RawEvent],
-    ) -> Vec<(DateTime<Utc>, MousePosition, MouseTrajectoryType)> {
+    ) -> Vec<(u64, DateTime<Utc>, MousePosition, MouseTrajectoryType)> {
         events
             .iter()
             .filter_map(|event| {
                 if let RawEvent::MouseInput {
-                    timestamp, data, ..
+                    timestamp,
+                    event_id,
+                    data,
                 } = event
                 {
                     // Only include movement/dragged events; ignore clicks/press/release
                     if let Some(kind) = data.event_type {
                         match kind {
                             crate::daemon::events::MouseEventKind::Moved => Some((
+                                *event_id,
                                 *timestamp,
                                 data.position.clone(),
                                 MouseTrajectoryType::Movement,
                             )),
-                            crate::daemon::events::MouseEventKind::Dragged => {
-                                Some((*timestamp, data.position.clone(), MouseTrajectoryType::Drag))
-                            }
+                            crate::daemon::events::MouseEventKind::Dragged => Some((
+                                *event_id,
+                                *timestamp,
+                                data.position.clone(),
+                                MouseTrajectoryType::Drag,
+                            )),
                             _ => None,
                         }
                     } else {
@@ -351,11 +364,11 @@ impl EventCompressor for MouseTrajectoryCompressor {
         }
 
         let mut trajectories = Vec::new();
-        let mut current_path: Vec<(DateTime<Utc>, MousePosition)> = Vec::new();
+        let mut current_path: Vec<(u64, DateTime<Utc>, MousePosition)> = Vec::new();
         let mut current_type: Option<MouseTrajectoryType> = None;
 
-        for (timestamp, position, trajectory_type) in mouse_events {
-            if let Some((last_time, last_pos)) = current_path.last() {
+        for (event_id, timestamp, position, trajectory_type) in mouse_events {
+            if let Some((_, last_time, last_pos)) = current_path.last() {
                 let time_gap = (timestamp - *last_time).num_milliseconds();
                 let distance = self.calculate_distance(last_pos, &position);
                 let type_changed = current_type.is_some_and(|t| t != trajectory_type);
@@ -371,7 +384,7 @@ impl EventCompressor for MouseTrajectoryCompressor {
                 }
             }
 
-            current_path.push((timestamp, position));
+            current_path.push((event_id, timestamp, position));
             current_type = Some(trajectory_type);
         }
 
@@ -391,18 +404,21 @@ impl EventCompressor for MouseTrajectoryCompressor {
 impl MouseTrajectoryCompressor {
     fn build_trajectory(
         &self,
-        path: Vec<(DateTime<Utc>, MousePosition)>,
+        path: Vec<(u64, DateTime<Utc>, MousePosition)>,
         trajectory_type: MouseTrajectoryType,
     ) -> CompactMouseTrajectory {
-        let start_time = path.first().unwrap().0;
-        let end_time = path.last().unwrap().0;
-        let start_position = path.first().unwrap().1.clone();
-        let end_position = path.last().unwrap().1.clone();
+        let start_time = path.first().unwrap().1;
+        let end_time = path.last().unwrap().1;
+        let start_position = path.first().unwrap().2.clone();
+        let end_position = path.last().unwrap().2.clone();
 
-        let positions: Vec<MousePosition> = path.iter().map(|(_, pos)| pos.clone()).collect();
+        let positions: Vec<MousePosition> = path.iter().map(|(_, _, pos)| pos.clone()).collect();
         let simplified_path = self.douglas_peucker(&positions, self.douglas_peucker_epsilon);
         let total_distance = self.calculate_path_distance(&positions);
-        let max_velocity = self.calculate_max_velocity(&path);
+        let path_ts_pos: Vec<(DateTime<Utc>, MousePosition)> =
+            path.iter().map(|(_, ts, pos)| (*ts, pos.clone())).collect();
+        let max_velocity = self.calculate_max_velocity(&path_ts_pos);
+        let raw_event_ids: Vec<u64> = path.into_iter().map(|(id, _, _)| id).collect();
 
         CompactMouseTrajectory {
             start_time,
@@ -413,61 +429,54 @@ impl MouseTrajectoryCompressor {
             simplified_path,
             total_distance,
             max_velocity,
+            raw_event_ids,
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompactKeyboardEvent {
-    pub timestamp: DateTime<Utc>,
-    pub key_code: u16,
-    pub key_char: Option<char>,
-    pub event_type: KeyboardEventType,
-    pub raw_code: u16,
+pub struct CompactKeyboardActivity {
+    pub start_time: DateTime<Utc>,
+    pub end_time: DateTime<Utc>,
+    pub keystrokes: u32,
+    pub keys_per_minute: f32,
+    pub density_per_sec: f32,
+    pub raw_event_ids: Vec<u64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub enum KeyboardEventType {
-    Pressed,
-    Released,
-    Typed,
+pub struct KeyboardActivityCompressor {
+    max_gap_ms: i64,
 }
 
-pub struct IdentityKeyboardCompressor;
-
-impl IdentityKeyboardCompressor {
+impl KeyboardActivityCompressor {
     pub fn new() -> Self {
-        Self
+        // Default gap to group bursts of typing (30s)
+        Self { max_gap_ms: 30_000 }
     }
 
-    fn extract_keyboard_events(&self, events: &[RawEvent]) -> Vec<CompactKeyboardEvent> {
+    #[allow(dead_code)]
+    pub fn with_gap_ms(max_gap_ms: i64) -> Self {
+        Self { max_gap_ms }
+    }
+
+    fn extract_keyboard_events(&self, events: &[RawEvent]) -> Vec<(u64, DateTime<Utc>)> {
         events
             .iter()
-            .filter_map(|event| {
-                if let RawEvent::KeyboardInput {
-                    timestamp, data, ..
-                } = event
-                {
-                    // Map from our internal representation to the compact format
-                    // For now, we'll use a default event type since we need to enhance our RawEvent structure
-                    Some(CompactKeyboardEvent {
-                        timestamp: *timestamp,
-                        key_code: data.key_code.unwrap_or(0),
-                        key_char: data.key_char,
-                        event_type: KeyboardEventType::Pressed, // Default for now
-                        raw_code: data.key_code.unwrap_or(0),
-                    })
-                } else {
-                    None
-                }
+            .filter_map(|event| match event {
+                RawEvent::KeyboardInput {
+                    timestamp,
+                    event_id,
+                    ..
+                } => Some((*event_id, *timestamp)),
+                _ => None,
             })
             .collect()
     }
 }
 
-impl EventCompressor for IdentityKeyboardCompressor {
+impl EventCompressor for KeyboardActivityCompressor {
     type Input = RawEvent;
-    type Output = CompactKeyboardEvent;
+    type Output = CompactKeyboardActivity;
 
     fn can_compress(&self, events: &[Self::Input]) -> bool {
         events
@@ -476,11 +485,65 @@ impl EventCompressor for IdentityKeyboardCompressor {
     }
 
     fn compress(&mut self, events: Vec<Self::Input>) -> Vec<Self::Output> {
-        self.extract_keyboard_events(&events)
+        let mut keys: Vec<(u64, DateTime<Utc>)> = self.extract_keyboard_events(&events);
+        if keys.is_empty() {
+            return Vec::new();
+        }
+        // Ensure temporal order
+        keys.sort_by_key(|(_, ts)| *ts);
+
+        let mut out = Vec::new();
+        let mut group_ids: Vec<u64> = Vec::new();
+        let mut group_start = keys[0].1;
+        let mut group_end = keys[0].1;
+        group_ids.push(keys[0].0);
+
+        for (id, ts) in keys.into_iter().skip(1) {
+            let gap = (ts - group_end).num_milliseconds();
+            if gap <= self.max_gap_ms {
+                // Continue group
+                group_end = ts;
+                group_ids.push(id);
+            } else {
+                // Flush current group
+                let duration_secs = (group_end - group_start).num_seconds().max(1) as f32;
+                let keystrokes = group_ids.len() as u32;
+                let kpm = (keystrokes as f32) / (duration_secs / 60.0);
+                let density = (keystrokes as f32) / duration_secs; // keys per second
+                out.push(CompactKeyboardActivity {
+                    start_time: group_start,
+                    end_time: group_end,
+                    keystrokes,
+                    keys_per_minute: kpm,
+                    density_per_sec: density,
+                    raw_event_ids: std::mem::take(&mut group_ids),
+                });
+
+                // Start new group
+                group_start = ts;
+                group_end = ts;
+                group_ids.push(id);
+            }
+        }
+        // Flush final group
+        let duration_secs = (group_end - group_start).num_seconds().max(1) as f32;
+        let keystrokes = group_ids.len() as u32;
+        let kpm = (keystrokes as f32) / (duration_secs / 60.0);
+        let density = (keystrokes as f32) / duration_secs;
+        out.push(CompactKeyboardActivity {
+            start_time: group_start,
+            end_time: group_end,
+            keystrokes,
+            keys_per_minute: kpm,
+            density_per_sec: density,
+            raw_event_ids: group_ids,
+        });
+
+        out
     }
 
     fn name(&self) -> &'static str {
-        "IdentityKeyboardCompressor"
+        "KeyboardActivityCompressor"
     }
 }
 
@@ -491,6 +554,7 @@ pub struct CompactFocusEvent {
     pub window_title_id: StringId,
     pub pid: i32,
     pub window_position: Option<MousePosition>,
+    pub event_id: u64,
 }
 
 pub struct FocusEventProcessor {
@@ -531,8 +595,8 @@ impl EventCompressor for FocusEventProcessor {
             .filter_map(|event| {
                 if let RawEvent::WindowFocusChange {
                     timestamp,
+                    event_id,
                     focus_info,
-                    ..
                 } = event
                 {
                     let app_name_id = self.string_interner.intern(&focus_info.app_name);
@@ -544,6 +608,7 @@ impl EventCompressor for FocusEventProcessor {
                         window_title_id,
                         pid: focus_info.pid,
                         window_position: focus_info.window_position,
+                        event_id,
                     })
                 } else {
                     None
@@ -561,7 +626,7 @@ impl EventCompressor for FocusEventProcessor {
 pub enum CompactEvent {
     Scroll(CompactScrollSequence),
     MouseTrajectory(CompactMouseTrajectory),
-    Keyboard(CompactKeyboardEvent),
+    Keyboard(CompactKeyboardActivity),
     Focus(CompactFocusEvent),
 }
 
@@ -573,7 +638,7 @@ impl CompactEvent {
                 std::mem::size_of::<CompactMouseTrajectory>()
                     + (t.simplified_path.len() * std::mem::size_of::<MousePosition>())
             }
-            CompactEvent::Keyboard(_) => std::mem::size_of::<CompactKeyboardEvent>(),
+            CompactEvent::Keyboard(_) => std::mem::size_of::<CompactKeyboardActivity>(),
             CompactEvent::Focus(_) => std::mem::size_of::<CompactFocusEvent>(),
         }
     }
@@ -582,7 +647,7 @@ impl CompactEvent {
 pub struct CompressionEngine {
     scroll_compressor: ScrollCompressor,
     mouse_compressor: MouseTrajectoryCompressor,
-    keyboard_compressor: IdentityKeyboardCompressor,
+    keyboard_compressor: KeyboardActivityCompressor,
     focus_processor: FocusEventProcessor,
     total_compact_events: usize,
     total_compact_events_bytes: usize,
@@ -597,7 +662,7 @@ impl CompressionEngine {
         Self {
             scroll_compressor: ScrollCompressor::new(),
             mouse_compressor: MouseTrajectoryCompressor::new(),
-            keyboard_compressor: IdentityKeyboardCompressor::new(),
+            keyboard_compressor: KeyboardActivityCompressor::new(),
             focus_processor: FocusEventProcessor::with_cap(max_strings),
             total_compact_events: 0,
             total_compact_events_bytes: 0,

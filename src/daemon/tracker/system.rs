@@ -417,6 +417,15 @@ pub struct DuckDbSystemMetricsStore {
 }
 
 impl DuckDbSystemMetricsStore {
+    pub fn new_in_memory() -> Result<Self> {
+        // Default to a modest cap unless configured otherwise
+        Self::new_in_memory_with_limit(10)
+    }
+
+    pub fn new_file(db_path: &PathBuf) -> Result<Self> {
+        Self::new_file_with_limit(db_path, 10)
+    }
+
     pub fn new_in_memory_with_limit(limit_mb: u64) -> Result<Self> {
         let conn = Connection::open_in_memory()?;
         conn.execute_batch(&format!(
@@ -970,7 +979,14 @@ mod tests {
         let temp_dir = tempdir()?;
         let db_path = temp_dir.path().join("tracker_test.duckdb");
 
-        let mut tracker = DuckDbSystemTracker::new(1234, 1.0, 10, db_path.clone());
+        let mut tracker = DuckDbSystemTracker::new(
+            1234,
+            1.0,
+            10,
+            db_path.clone(),
+            crate::util::config::DatabaseBackendConfig::Duckdb,
+            10,
+        );
 
         assert!(!tracker.is_running());
 

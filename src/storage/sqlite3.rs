@@ -78,6 +78,14 @@ impl SqliteStorage {
                 state TEXT NOT NULL,
                 focus_info TEXT
             );
+            CREATE TABLE IF NOT EXISTS compact_events (
+                start_time TEXT NOT NULL,
+                end_time TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                payload TEXT,
+                raw_event_ids TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_compact_events_start_time ON compact_events(start_time);
             CREATE INDEX IF NOT EXISTS idx_activity_records_start_time ON activity_records(start_time);"
         )?;
         Ok(())
@@ -161,6 +169,51 @@ impl SqliteStorage {
                         ],
                     )
                 }
+                StorageCommand::CompactEvents(events) => {
+                    use crate::daemon::compressor::CompactEvent as CE;
+                    let mut last_res: rusqlite::Result<usize> = Ok(0);
+                    for ce in events.into_iter() {
+                        let (start_time, end_time, kind_s, payload_js, raw_ids_js) = match &ce {
+                            CE::Scroll(s) => (
+                                s.start_time.to_rfc3339(),
+                                s.end_time.to_rfc3339(),
+                                "compact:scroll".to_string(),
+                                serde_json::to_string(&s).ok(),
+                                serde_json::to_string(&s.raw_event_ids).unwrap_or("[]".to_string()),
+                            ),
+                            CE::MouseTrajectory(t) => (
+                                t.start_time.to_rfc3339(),
+                                t.end_time.to_rfc3339(),
+                                "compact:mouse_traj".to_string(),
+                                serde_json::to_string(&t).ok(),
+                                serde_json::to_string(&t.raw_event_ids).unwrap_or("[]".to_string()),
+                            ),
+                            CE::Keyboard(k) => (
+                                k.start_time.to_rfc3339(),
+                                k.end_time.to_rfc3339(),
+                                "compact:keyboard".to_string(),
+                                serde_json::to_string(&k).ok(),
+                                serde_json::to_string(&k.raw_event_ids).unwrap_or("[]".to_string()),
+                            ),
+                            CE::Focus(f) => (
+                                f.timestamp.to_rfc3339(),
+                                f.timestamp.to_rfc3339(),
+                                "compact:focus".to_string(),
+                                serde_json::to_string(&f).ok(),
+                                serde_json::to_string(&vec![f.event_id])
+                                    .unwrap_or("[]".to_string()),
+                            ),
+                        };
+                        last_res = tx.execute(
+                            "INSERT INTO compact_events (start_time, end_time, kind, payload, raw_event_ids) VALUES (?, ?, ?, ?, ?)",
+                            params![start_time, end_time, kind_s, payload_js, raw_ids_js],
+                        );
+                        if last_res.is_err() {
+                            break;
+                        }
+                    }
+                    last_res
+                }
                 StorageCommand::Shutdown => break,
             };
 
@@ -211,8 +264,15 @@ impl StorageBackend for SqliteStorage {
 
     fn add_compact_events(
         &mut self,
-        _events: Vec<crate::daemon::compressor::CompactEvent>,
+        events: Vec<crate::daemon::compressor::CompactEvent>,
     ) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        self.sender
+            .send(StorageCommand::CompactEvents(events))
+            .context("Failed to send compact events to writer")?;
+        inc_backlog();
         Ok(())
     }
 
