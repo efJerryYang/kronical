@@ -1,10 +1,12 @@
 use crate::daemon::events::WindowFocusInfo;
 use crate::util::interner::StringInterner;
 use crate::util::lru::LruCache;
+use anyhow::Result;
 use chrono::{DateTime, Utc};
+use kronical_common::threading::{ThreadHandle, ThreadRegistry};
 use log::{debug, error, info, warn};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant};
 use sysinfo::{Pid, System};
 
@@ -74,6 +76,7 @@ pub struct FocusEventWrapper {
     tx: mpsc::Sender<FocusMsg>,
     poll_ms: Arc<AtomicU64>,
     should_stop: Arc<AtomicBool>,
+    worker_handle: Arc<Mutex<Option<ThreadHandle>>>,
 }
 
 enum FocusMsg {
@@ -90,7 +93,8 @@ impl FocusEventWrapper {
         poll_interval: Duration,
         caps: FocusCacheCaps,
         poll_handle: Arc<AtomicU64>,
-    ) -> Self {
+        threads: ThreadRegistry,
+    ) -> Result<Self> {
         let (tx, rx) = mpsc::channel::<FocusMsg>();
         poll_handle.store(poll_interval.as_millis() as u64, Ordering::Relaxed);
         let poll_ms = poll_handle;
@@ -98,15 +102,16 @@ impl FocusEventWrapper {
 
         let worker_stop = Arc::clone(&should_stop);
         let worker_poll_ms = Arc::clone(&poll_ms);
-        std::thread::spawn(move || {
+        let worker_handle = threads.spawn("focus-worker", move || {
             run_focus_worker(callback, rx, worker_poll_ms, worker_stop, caps);
-        });
+        })?;
 
-        Self {
+        Ok(Self {
             tx,
             poll_ms,
             should_stop,
-        }
+            worker_handle: Arc::new(Mutex::new(Some(worker_handle))),
+        })
     }
 
     fn send(&self, msg: FocusMsg) {
@@ -143,6 +148,13 @@ impl Drop for FocusEventWrapper {
         // Best-effort stop
         let _ = self.tx.send(FocusMsg::Stop);
         self.should_stop.store(true, Ordering::Relaxed);
+        if let Ok(mut handle) = self.worker_handle.lock() {
+            if let Some(thread) = handle.take() {
+                if let Err(e) = thread.join() {
+                    warn!("Focus worker thread panicked: {:?}", e);
+                }
+            }
+        }
     }
 }
 

@@ -49,7 +49,8 @@ impl KronicalEventHandler {
         sender: mpsc::Sender<KronicalEvent>,
         caps: FocusCacheCaps,
         poll_handle: std::sync::Arc<std::sync::atomic::AtomicU64>,
-    ) -> Self {
+        threads: ThreadRegistry,
+    ) -> Result<Self> {
         let callback = Arc::new(FocusCallback {
             sender: sender.clone(),
         });
@@ -59,12 +60,13 @@ impl KronicalEventHandler {
             Duration::from_millis(initial_ms),
             caps,
             poll_handle,
-        );
+            threads,
+        )?;
 
-        Self {
+        Ok(Self {
             sender,
             focus_wrapper,
-        }
+        })
     }
 }
 
@@ -189,6 +191,7 @@ pub struct EventCoordinator {
     tracker_batch_size: usize,
     tracker_db_backend: crate::util::config::DatabaseBackendConfig,
     duckdb_memory_limit_mb_tracker: u64,
+    threads: ThreadRegistry,
 }
 
 impl EventCoordinator {
@@ -229,7 +232,12 @@ impl EventCoordinator {
             tracker_batch_size,
             tracker_db_backend,
             duckdb_memory_limit_mb_tracker,
+            threads: ThreadRegistry::new(),
         }
+    }
+
+    pub fn thread_registry(&self) -> ThreadRegistry {
+        self.threads.clone()
     }
 
     pub fn start_main_thread(
@@ -241,7 +249,7 @@ impl EventCoordinator {
         info!("Step A: Starting Kronical on MAIN THREAD (required for hooks)");
 
         let (sender, receiver) = mpsc::channel();
-        let thread_registry = ThreadRegistry::new();
+        let thread_registry = self.thread_registry();
 
         // Start API servers (gRPC + HTTP/SSE) via unified API facade.
         let uds_grpc = crate::util::paths::grpc_uds(&workspace_dir);
@@ -328,7 +336,8 @@ impl EventCoordinator {
                 title_cache_ttl_secs: self.title_cache_ttl_secs,
             },
             std::sync::Arc::clone(&poll_handle_arc),
-        );
+            thread_registry.clone(),
+        )?;
 
         info!("Step M1: Setting up UIohook on main thread");
         let uiohook = Uiohook::new(handler.clone());

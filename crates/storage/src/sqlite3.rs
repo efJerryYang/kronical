@@ -1,11 +1,11 @@
 use crate::{StorageBackend, StorageCommand, dec_backlog, inc_backlog, set_last_flush};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use kronical_common::threading::{ThreadHandle, ThreadRegistry};
 use rusqlite::{Connection, params};
 use serde_json;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
-use std::thread;
 
 use kronical_core::compression::CompactEvent;
 use kronical_core::events::RawEvent;
@@ -20,13 +20,14 @@ use kronical_core::snapshot;
 pub struct SqliteStorage {
     db_path: PathBuf,
     sender: mpsc::Sender<StorageCommand>,
-    writer_thread: Option<thread::JoinHandle<()>>,
+    writer_thread: Option<ThreadHandle>,
 }
 
 impl SqliteStorage {
     pub fn new<P: AsRef<Path>>(
         db_path: P,
         snapshot_bus: Arc<snapshot::SnapshotBus>,
+        threads: ThreadRegistry,
     ) -> Result<Self> {
         let db_path = db_path.as_ref().to_path_buf();
 
@@ -42,9 +43,9 @@ impl SqliteStorage {
 
         let db_path_clone = db_path.clone();
         let bus_for_writer = Arc::clone(&snapshot_bus);
-        let writer_thread = thread::spawn(move || {
+        let writer_thread = threads.spawn("sqlite-writer", move || {
             Self::background_writer(db_path_clone, receiver, bus_for_writer);
-        });
+        })?;
 
         Ok(Self {
             db_path,
@@ -483,7 +484,9 @@ impl Drop for SqliteStorage {
     fn drop(&mut self) {
         let _ = self.sender.send(StorageCommand::Shutdown);
         if let Some(thread) = self.writer_thread.take() {
-            thread.join().expect("Background writer thread panicked");
+            if let Err(e) = thread.join() {
+                eprintln!("Background writer thread panicked: {:?}", e);
+            }
         }
     }
 }

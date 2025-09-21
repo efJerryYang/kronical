@@ -2166,6 +2166,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "duckdb",
+ "kronical-common",
  "kronical-core",
  "log",
  "once_cell",

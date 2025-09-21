@@ -15,6 +15,7 @@ duckdb = { version = "1.3.2", features = [
     "uuid",
 ] }
 kronical-core = { path = "../core" }
+kronical-common = { path = "../common" }
 log = "0.4"
 once_cell = "1.19"
 rusqlite = { version = "0.37", features = ["bundled"] }

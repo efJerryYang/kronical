@@ -185,31 +185,6 @@ fn main() {
 
     let snapshot_bus = Arc::new(SnapshotBus::new());
 
-    let data_store: Box<dyn StorageBackend> = match config.db_backend {
-        DatabaseBackendConfig::Duckdb => {
-            match DuckDbStorage::new_with_limit(
-                &data_file,
-                config.duckdb_memory_limit_mb_main,
-                Arc::clone(&snapshot_bus),
-            ) {
-                Ok(s) => Box::new(s),
-                Err(e) => {
-                    error!("Failed to initialize DuckDB store: {}", e);
-                    std::process::exit(1);
-                }
-            }
-        }
-        DatabaseBackendConfig::Sqlite3 => {
-            match SqliteStorage::new(&data_file, Arc::clone(&snapshot_bus)) {
-                Ok(s) => Box::new(s),
-                Err(e) => {
-                    error!("Failed to initialize SQLite store: {}", e);
-                    std::process::exit(1);
-                }
-            }
-        }
-    };
-
     let coordinator = EventCoordinator::new(
         config.retention_minutes,
         config.active_grace_secs,
@@ -229,6 +204,38 @@ fn main() {
         config.tracker_db_backend.clone(),
         config.duckdb_memory_limit_mb_tracker,
     );
+
+    let thread_registry = coordinator.thread_registry();
+
+    let data_store: Box<dyn StorageBackend> = match config.db_backend {
+        DatabaseBackendConfig::Duckdb => {
+            match DuckDbStorage::new_with_limit(
+                &data_file,
+                config.duckdb_memory_limit_mb_main,
+                Arc::clone(&snapshot_bus),
+                thread_registry.clone(),
+            ) {
+                Ok(s) => Box::new(s),
+                Err(e) => {
+                    error!("Failed to initialize DuckDB store: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+        DatabaseBackendConfig::Sqlite3 => {
+            match SqliteStorage::new(
+                &data_file,
+                Arc::clone(&snapshot_bus),
+                thread_registry.clone(),
+            ) {
+                Ok(s) => Box::new(s),
+                Err(e) => {
+                    error!("Failed to initialize SQLite store: {}", e);
+                    std::process::exit(1);
+                }
+            }
+        }
+    };
 
     info!("Kronical daemon will run on MAIN THREAD (required by macOS hooks)");
     let result = coordinator.start_main_thread(

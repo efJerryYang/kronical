@@ -110,6 +110,8 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::{thread, time::Duration as StdDuration};
 
+    use kronical_common::threading::ThreadRegistry;
+
     use kronical_core::compression::{
         CompactEvent, CompactFocusEvent, CompactKeyboardActivity, CompactMouseTrajectory,
         CompactScrollSequence, MouseTrajectoryType, ScrollDirection, StringId,
@@ -336,7 +338,8 @@ mod tests {
             let bus = Arc::new(snapshot::SnapshotBus::new());
             let sample = build_sample_data();
 
-            let mut storage = DuckDbStorage::new(&db_path, Arc::clone(&bus)).expect("duckdb init");
+            let mut storage = DuckDbStorage::new(&db_path, Arc::clone(&bus), ThreadRegistry::new())
+                .expect("duckdb init");
 
             assert_eq!(rx.borrow().backlog_count, 0);
             storage
@@ -381,9 +384,13 @@ mod tests {
 
             drop(conn);
 
-            let mut reader =
-                DuckDbStorage::new_with_limit(&db_path, 32, Arc::new(snapshot::SnapshotBus::new()))
-                    .expect("duckdb reader");
+            let mut reader = DuckDbStorage::new_with_limit(
+                &db_path,
+                32,
+                Arc::new(snapshot::SnapshotBus::new()),
+                ThreadRegistry::new(),
+            )
+            .expect("duckdb reader");
 
             let since = sample.base_ts - Duration::seconds(10);
             let records = reader
@@ -438,7 +445,8 @@ mod tests {
             let bus = Arc::new(snapshot::SnapshotBus::new());
             let sample = build_sample_data();
 
-            let mut storage = SqliteStorage::new(&db_path, Arc::clone(&bus)).expect("sqlite init");
+            let mut storage = SqliteStorage::new(&db_path, Arc::clone(&bus), ThreadRegistry::new())
+                .expect("sqlite init");
             assert_eq!(rx.borrow().backlog_count, 0);
             storage
                 .add_compact_events(Vec::new())
@@ -478,8 +486,12 @@ mod tests {
 
             drop(conn);
 
-            let mut reader = SqliteStorage::new(&db_path, Arc::new(snapshot::SnapshotBus::new()))
-                .expect("sqlite reader");
+            let mut reader = SqliteStorage::new(
+                &db_path,
+                Arc::new(snapshot::SnapshotBus::new()),
+                ThreadRegistry::new(),
+            )
+            .expect("sqlite reader");
 
             let since = sample.base_ts - Duration::seconds(10);
             let records = reader
@@ -534,7 +546,8 @@ mod tests {
             let bus = Arc::new(snapshot::SnapshotBus::new());
             let sample = build_sample_data();
 
-            let mut storage = DuckDbStorage::new(&db_path, Arc::clone(&bus)).expect("duckdb init");
+            let mut storage = DuckDbStorage::new(&db_path, Arc::clone(&bus), ThreadRegistry::new())
+                .expect("duckdb init");
 
             for i in 0..100 {
                 let mut raw = sample.raw_event.clone();
@@ -572,7 +585,8 @@ mod tests {
             let bus = Arc::new(snapshot::SnapshotBus::new());
             let sample = build_sample_data();
 
-            let mut storage = SqliteStorage::new(&db_path, Arc::clone(&bus)).expect("sqlite init");
+            let mut storage = SqliteStorage::new(&db_path, Arc::clone(&bus), ThreadRegistry::new())
+                .expect("sqlite init");
 
             for i in 0..100 {
                 let mut raw = sample.raw_event.clone();
@@ -610,7 +624,8 @@ mod tests {
             let bus = Arc::new(snapshot::SnapshotBus::new());
             let sample = build_sample_data();
 
-            let mut storage = DuckDbStorage::new(&db_path, Arc::clone(&bus)).expect("duckdb init");
+            let mut storage = DuckDbStorage::new(&db_path, Arc::clone(&bus), ThreadRegistry::new())
+                .expect("duckdb init");
 
             let focus_env = EventEnvelope {
                 id: 50,
@@ -674,9 +689,13 @@ mod tests {
             .expect("insert manual row");
             drop(conn);
 
-            let mut reader =
-                DuckDbStorage::new_with_limit(&db_path, 32, Arc::new(snapshot::SnapshotBus::new()))
-                    .expect("duckdb reader");
+            let mut reader = DuckDbStorage::new_with_limit(
+                &db_path,
+                32,
+                Arc::new(snapshot::SnapshotBus::new()),
+                ThreadRegistry::new(),
+            )
+            .expect("duckdb reader");
 
             let envelopes = reader
                 .fetch_envelopes_between(sample.base_ts, sample.base_ts + Duration::seconds(10))
@@ -739,7 +758,8 @@ mod tests {
         let sample = build_sample_data();
 
         {
-            let _storage = DuckDbStorage::new(&db_path, Arc::clone(&bus)).expect("duckdb init");
+            let _storage = DuckDbStorage::new(&db_path, Arc::clone(&bus), ThreadRegistry::new())
+                .expect("duckdb init");
         }
 
         let conn = DuckDbConnection::open(&db_path).expect("open duckdb");
@@ -755,9 +775,13 @@ mod tests {
         )
         .expect("insert manual record");
 
-        let mut reader =
-            DuckDbStorage::new_with_limit(&db_path, 32, Arc::new(snapshot::SnapshotBus::new()))
-                .expect("duckdb reader");
+        let mut reader = DuckDbStorage::new_with_limit(
+            &db_path,
+            32,
+            Arc::new(snapshot::SnapshotBus::new()),
+            ThreadRegistry::new(),
+        )
+        .expect("duckdb reader");
         let records = reader
             .fetch_records_since(sample.base_ts - Duration::seconds(5))
             .expect("fetch records");
@@ -777,7 +801,8 @@ mod tests {
             let bus = Arc::new(snapshot::SnapshotBus::new());
             let sample = build_sample_data();
 
-            let mut storage = SqliteStorage::new(&db_path, Arc::clone(&bus)).expect("sqlite init");
+            let mut storage = SqliteStorage::new(&db_path, Arc::clone(&bus), ThreadRegistry::new())
+                .expect("sqlite init");
 
             let focus_env = EventEnvelope {
                 id: 150,
@@ -841,8 +866,12 @@ mod tests {
             .expect("insert manual row");
             drop(conn);
 
-            let mut reader = SqliteStorage::new(&db_path, Arc::new(snapshot::SnapshotBus::new()))
-                .expect("sqlite reader");
+            let mut reader = SqliteStorage::new(
+                &db_path,
+                Arc::new(snapshot::SnapshotBus::new()),
+                ThreadRegistry::new(),
+            )
+            .expect("sqlite reader");
             let envelopes = reader
                 .fetch_envelopes_between(sample.base_ts, sample.base_ts + Duration::seconds(10))
                 .expect("fetch envelopes");
@@ -898,7 +927,8 @@ mod tests {
         let sample = build_sample_data();
 
         {
-            let _storage = SqliteStorage::new(&db_path, Arc::clone(&bus)).expect("sqlite init");
+            let _storage = SqliteStorage::new(&db_path, Arc::clone(&bus), ThreadRegistry::new())
+                .expect("sqlite init");
         }
 
         let conn = SqliteConnection::open(&db_path).expect("open sqlite");
@@ -914,8 +944,12 @@ mod tests {
         )
         .expect("insert manual record");
 
-        let mut reader = SqliteStorage::new(&db_path, Arc::new(snapshot::SnapshotBus::new()))
-            .expect("sqlite reader");
+        let mut reader = SqliteStorage::new(
+            &db_path,
+            Arc::new(snapshot::SnapshotBus::new()),
+            ThreadRegistry::new(),
+        )
+        .expect("sqlite reader");
         let records = reader
             .fetch_records_since(sample.base_ts - Duration::seconds(1))
             .expect("fetch records");

@@ -2,10 +2,10 @@ use crate::{StorageBackend, StorageCommand, dec_backlog, inc_backlog, set_last_f
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use duckdb::{Connection, params};
+use kronical_common::threading::{ThreadHandle, ThreadRegistry};
 use serde_json;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, mpsc};
-use std::thread;
 
 use kronical_core::compression::CompactEvent;
 use kronical_core::events::RawEvent;
@@ -18,7 +18,7 @@ use kronical_core::snapshot;
 pub struct DuckDbStorage {
     db_path: PathBuf,
     sender: mpsc::Sender<StorageCommand>,
-    writer_thread: Option<thread::JoinHandle<()>>,
+    writer_thread: Option<ThreadHandle>,
     memory_limit_mb: Option<u64>,
 }
 
@@ -26,6 +26,7 @@ impl DuckDbStorage {
     pub fn new<P: AsRef<Path>>(
         db_path: P,
         snapshot_bus: Arc<snapshot::SnapshotBus>,
+        threads: ThreadRegistry,
     ) -> Result<Self> {
         let db_path = db_path.as_ref().to_path_buf();
 
@@ -41,9 +42,9 @@ impl DuckDbStorage {
 
         let db_path_clone = db_path.clone();
         let bus_for_writer = Arc::clone(&snapshot_bus);
-        let writer_thread = thread::spawn(move || {
+        let writer_thread = threads.spawn("duckdb-writer", move || {
             Self::background_writer(db_path_clone, receiver, bus_for_writer);
-        });
+        })?;
 
         Ok(Self {
             db_path,
@@ -57,6 +58,7 @@ impl DuckDbStorage {
         db_path: P,
         limit_mb: u64,
         snapshot_bus: Arc<snapshot::SnapshotBus>,
+        threads: ThreadRegistry,
     ) -> Result<Self> {
         let db_path = db_path.as_ref().to_path_buf();
 
@@ -77,7 +79,7 @@ impl DuckDbStorage {
 
         let db_path_clone = db_path.clone();
         let bus_for_writer = Arc::clone(&snapshot_bus);
-        let writer_thread = thread::spawn(move || {
+        let writer_thread = threads.spawn("duckdb-writer", move || {
             let conn =
                 Connection::open(&db_path_clone).expect("Failed to open DB in writer thread");
             // Apply memory limit for the writer connection as well.
@@ -87,7 +89,7 @@ impl DuckDbStorage {
             ));
             // Hand off to a helper that assumes an initialized connection
             Self::background_writer_with_conn(conn, receiver, bus_for_writer);
-        });
+        })?;
 
         Ok(Self {
             db_path,
@@ -548,7 +550,9 @@ impl Drop for DuckDbStorage {
     fn drop(&mut self) {
         let _ = self.sender.send(StorageCommand::Shutdown);
         if let Some(thread) = self.writer_thread.take() {
-            thread.join().expect("Background writer thread panicked");
+            if let Err(e) = thread.join() {
+                eprintln!("Background writer thread panicked: {:?}", e);
+            }
         }
     }
 }
