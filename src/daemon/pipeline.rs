@@ -647,7 +647,37 @@ fn build_app_tree(
                 is_group: true,
             });
         }
+        let mut temporal: Vec<SnapshotWindow> = Vec::with_capacity(agg.temporal_groups.len());
+        for (idx, g) in agg.temporal_groups.iter().enumerate() {
+            let avg = if g.occurrence_count > 0 {
+                g.total_duration_seconds / g.occurrence_count as u64
+            } else {
+                0
+            };
+            let title = format!(
+                "{} (temporal locality) ×{} avg {} max {}",
+                g.title_key,
+                g.occurrence_count,
+                pretty_format_duration(avg),
+                pretty_format_duration(g.max_duration_seconds),
+            );
+            let window_id = format!(
+                "group-temporal:{}:{}:{}",
+                g.title_key,
+                g.anchor_last_seen.timestamp(),
+                idx
+            );
+            temporal.push(SnapshotWindow {
+                window_id,
+                window_title: title,
+                first_seen: g.first_seen,
+                last_seen: g.last_seen,
+                duration_seconds: g.total_duration_seconds,
+                is_group: true,
+            });
+        }
         windows.append(&mut groups);
+        windows.append(&mut temporal);
         windows.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
         items.push(SnapshotApp {
             app_name: (*agg.app_name).clone(),

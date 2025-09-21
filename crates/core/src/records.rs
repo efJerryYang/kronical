@@ -1,6 +1,6 @@
 use crate::events::WindowFocusInfo;
 use crate::events::model::{EventEnvelope, EventKind, EventPayload, HintKind};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -43,6 +43,7 @@ pub struct AggregatedActivity {
     pub process_start_time: u64,
     pub windows: HashMap<u32, WindowActivity>,
     pub ephemeral_groups: HashMap<String, EphemeralGroup>,
+    pub temporal_groups: Vec<TemporalGroup>,
     pub total_duration_seconds: u64,
     pub first_seen: DateTime<Utc>,
     pub last_seen: DateTime<Utc>,
@@ -56,6 +57,18 @@ pub struct EphemeralGroup {
     pub total_duration_seconds: u64,
     pub first_seen: DateTime<Utc>,
     pub last_seen: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TemporalGroup {
+    pub title_key: String,
+    pub distinct_ids: HashSet<u32>,
+    pub occurrence_count: u32,
+    pub total_duration_seconds: u64,
+    pub max_duration_seconds: u64,
+    pub first_seen: DateTime<Utc>,
+    pub last_seen: DateTime<Utc>,
+    pub anchor_last_seen: DateTime<Utc>,
 }
 
 pub struct RecordBuilder {
@@ -208,6 +221,7 @@ pub fn aggregate_activities_since(
                     process_start_time: focus_info.process_start_time,
                     windows: HashMap::new(),
                     ephemeral_groups: HashMap::new(),
+                    temporal_groups: Vec::new(),
                     total_duration_seconds: 0,
                     first_seen: rec_start,
                     last_seen: rec_end,
@@ -283,6 +297,56 @@ pub fn aggregate_activities_since(
             }
         }
 
+        // Secondary pass: temporal locality groups for windows with similar recent activity.
+        let mut temporal_clusters: Vec<TemporalGroup> = Vec::new();
+        let mut grouped_ids: HashSet<u32> = HashSet::new();
+        let mut by_title: HashMap<String, Vec<(u32, WindowActivity)>> = HashMap::new();
+        for (id, w) in agg.windows.iter() {
+            let title_key = normalize_title(&w.window_title);
+            by_title.entry(title_key).or_default().push((*id, w.clone()));
+        }
+        let threshold = Duration::minutes(60);
+        for (title_key, mut items) in by_title.into_iter() {
+            if items.len() < 2 {
+                continue;
+            }
+            items.sort_by(|a, b| b.1.last_seen.cmp(&a.1.last_seen));
+            let mut current: Vec<(u32, WindowActivity)> = Vec::new();
+            let mut prev_last_seen: Option<DateTime<Utc>> = None;
+            for (win_id, win) in items.into_iter() {
+                if current.is_empty() {
+                    prev_last_seen = Some(win.last_seen);
+                    current.push((win_id, win));
+                    continue;
+                }
+                let prev = prev_last_seen.expect("cluster should have last_seen");
+                let diff = prev.signed_duration_since(win.last_seen);
+                if diff <= threshold {
+                    prev_last_seen = Some(win.last_seen);
+                    current.push((win_id, win));
+                } else {
+                    if current.len() >= 2 {
+                        grouped_ids.extend(current.iter().map(|(wid, _)| *wid));
+                        temporal_clusters.push(build_temporal_group(&title_key, &current));
+                    }
+                    current = vec![(win_id, win)];
+                    prev_last_seen = Some(current[0].1.last_seen);
+                }
+            }
+            if current.len() >= 2 {
+                grouped_ids.extend(current.iter().map(|(wid, _)| *wid));
+                temporal_clusters.push(build_temporal_group(&title_key, &current));
+            }
+        }
+        for id in grouped_ids {
+            agg.windows.remove(&id);
+        }
+        if !temporal_clusters.is_empty() {
+            agg.temporal_groups = temporal_clusters;
+        } else {
+            agg.temporal_groups.clear();
+        }
+
         // LRU trim: keep most recent windows by last_seen
         if max_windows_per_app > 0 && agg.windows.len() > max_windows_per_app {
             let mut win_vec: Vec<(u32, WindowActivity)> =
@@ -302,6 +366,39 @@ pub fn aggregate_activities_since(
     let mut apps: Vec<AggregatedActivity> = app_map.into_values().collect();
     apps.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
     apps
+}
+
+fn build_temporal_group(title_key: &str, windows: &[(u32, WindowActivity)]) -> TemporalGroup {
+    debug_assert!(windows.len() >= 2);
+    let mut distinct_ids: HashSet<u32> = HashSet::new();
+    let mut total: u64 = 0;
+    let mut max_duration: u64 = 0;
+    let mut first_seen = windows[0].1.first_seen;
+    let mut last_seen = windows[0].1.last_seen;
+    for (win_id, win) in windows.iter() {
+        distinct_ids.insert(*win_id);
+        total = total.saturating_add(win.duration_seconds);
+        max_duration = max_duration.max(win.duration_seconds);
+        if win.first_seen < first_seen {
+            first_seen = win.first_seen;
+        }
+        if win.last_seen > last_seen {
+            last_seen = win.last_seen;
+        }
+    }
+
+    let occurrence = distinct_ids.len() as u32;
+
+    TemporalGroup {
+        title_key: title_key.to_string(),
+        distinct_ids,
+        occurrence_count: occurrence,
+        total_duration_seconds: total,
+        max_duration_seconds: max_duration,
+        first_seen,
+        last_seen,
+        anchor_last_seen: last_seen,
+    }
 }
 
 fn normalize_title(s: &str) -> String {
