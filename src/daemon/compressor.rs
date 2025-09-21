@@ -575,6 +575,7 @@ impl CompressionEngine {
         }
     }
 
+    #[cfg_attr(feature = "hotpath", hotpath::measure)]
     pub fn compress_events(
         &mut self,
         raw_events: Vec<RawEvent>,

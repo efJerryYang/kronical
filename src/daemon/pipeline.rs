@@ -22,6 +22,9 @@ use std::thread::{self, JoinHandle};
 use std::time::Duration;
 use uiohook_rs::hook::wheel::{WHEEL_HORIZONTAL_DIRECTION, WHEEL_VERTICAL_DIRECTION};
 
+#[cfg(feature = "hotpath")]
+use hotpath::Format;
+
 #[derive(Debug, Clone)]
 pub struct PipelineConfig {
     pub retention_minutes: u64,
@@ -74,6 +77,13 @@ pub fn spawn_pipeline(config: PipelineConfig, resources: PipelineResources) -> P
 
     let data_thread = thread::spawn(move || {
         info!("Background data processing thread started");
+
+        #[cfg(feature = "hotpath")]
+        let _hotpath_guard = hotpath::init(
+            "pipeline::data_thread".to_string(),
+            &[50, 95, 99],
+            Format::Table,
+        );
 
         let mut compression_engine = CompressionEngine::with_focus_cap(focus_interner_max_strings);
         let mut adapter = EventAdapter::new();
@@ -521,6 +531,7 @@ pub fn spawn_pipeline(config: PipelineConfig, resources: PipelineResources) -> P
     PipelineHandles { data_thread }
 }
 
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn publish_snapshot(
     snapshot_bus: &snapshot::SnapshotBus,
     recent_records: &mut VecDeque<ActivityRecord>,
@@ -594,6 +605,7 @@ fn publish_snapshot(
     );
 }
 
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn build_app_tree(
     aggregated_activities: &[AggregatedActivity],
     app_short_max_duration_secs: u64,
@@ -768,6 +780,7 @@ fn pretty_format_duration(seconds: u64) -> String {
     result
 }
 
+#[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn convert_kronid_to_raw(event: KronicalEvent) -> Result<RawEvent> {
     let now = Utc::now();
     let event_id = now.timestamp_millis() as u64;

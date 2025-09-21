@@ -56,10 +56,14 @@ doc:
 	$(Q)cargo doc $(TARGET_FLAGS) $(FEATURE_FLAGS) --no-deps $(CARGO_LOG_FLAG)
 
 coverage:
-	$(ANNOUNCE) "cargo llvm-cov --workspace $(FEATURE_FLAGS) --fail-under-lines 0 --lcov --output-path coverage/lcov.info"
-	$(Q)cargo llvm-cov --workspace $(FEATURE_FLAGS) --fail-under-lines 0 --lcov --output-path coverage/lcov.info
-	$(ANNOUNCE) "cargo llvm-cov report --workspace $(FEATURE_FLAGS) --html --output-dir coverage/html"
-	$(Q)cargo llvm-cov report --workspace $(FEATURE_FLAGS) --html --output-dir coverage/html
+	$(ANNOUNCE) "rm -rf coverage"
+	$(Q)rm -rf coverage
+	$(ANNOUNCE) "mkdir -p coverage"
+	$(Q)mkdir -p coverage
+	$(ANNOUNCE) "cargo llvm-cov --workspace $(FEATURE_FLAGS) --remap-path-prefix --fail-under-lines 0 --lcov --output-path coverage/lcov.info"
+	$(Q)cargo llvm-cov --workspace $(FEATURE_FLAGS) --remap-path-prefix --fail-under-lines 0 --lcov --output-path coverage/lcov.info
+	$(ANNOUNCE) "cargo llvm-cov report $(FEATURE_FLAGS) --remap-path-prefix --html --output-dir coverage"
+	$(Q)cargo llvm-cov report $(FEATURE_FLAGS) --remap-path-prefix --html --output-dir coverage
 
 all: check build
 
