@@ -1,5 +1,6 @@
 use crate::daemon::events::MouseEventKind;
 use crate::daemon::events::WindowFocusInfo;
+use crate::daemon::runtime::ThreadRegistry;
 use crate::daemon::tracker::SystemTracker;
 use crate::daemon::tracker::{FocusCacheCaps, FocusChangeCallback, FocusEventWrapper};
 use crate::storage::StorageBackend;
@@ -240,14 +241,17 @@ impl EventCoordinator {
         info!("Step A: Starting Kronical on MAIN THREAD (required for hooks)");
 
         let (sender, receiver) = mpsc::channel();
+        let thread_registry = ThreadRegistry::new();
 
         // Start API servers (gRPC + HTTP/SSE) via unified API facade.
         let uds_grpc = crate::util::paths::grpc_uds(&workspace_dir);
         let uds_http = crate::util::paths::http_uds(&workspace_dir);
-        if let Err(e) = crate::daemon::api::spawn_all(uds_grpc, uds_http, Arc::clone(&snapshot_bus))
-        {
-            error!("Failed to start API servers: {}", e);
-        }
+        let api_handles = crate::daemon::api::spawn_all(
+            uds_grpc,
+            uds_http,
+            Arc::clone(&snapshot_bus),
+            thread_registry.clone(),
+        )?;
 
         if self.tracker_enabled {
             let current_pid = std::process::id();
@@ -263,7 +267,7 @@ impl EventCoordinator {
                 self.tracker_db_backend.clone(),
                 self.duckdb_memory_limit_mb_tracker,
             );
-            if let Err(e) = tracker.start() {
+            if let Err(e) = tracker.start_with_registry(thread_registry.clone()) {
                 error!("Failed to start system tracker: {}", e);
             } else {
                 info!(
@@ -299,7 +303,8 @@ impl EventCoordinator {
                 poll_handle: Arc::clone(&poll_handle_arc),
                 snapshot_bus: Arc::clone(&snapshot_bus),
             },
-        );
+            thread_registry.clone(),
+        )?;
 
         let shutdown_sender = sender.clone();
         ctrlc::set_handler(move || {
@@ -378,6 +383,8 @@ impl EventCoordinator {
                 info!("Removed HTTP socket file");
             }
         }
+
+        api_handles.join_all();
 
         info!("Step C: Kronical shutdown complete");
         Ok(())

@@ -10,15 +10,16 @@ use crate::daemon::events::{
 use crate::daemon::records::{
     ActivityRecord, ActivityState, AggregatedActivity, aggregate_activities_since,
 };
+use crate::daemon::runtime::{ThreadHandle, ThreadRegistry};
 use crate::daemon::snapshot;
 use crate::storage::{StorageBackend, StorageCommand, storage_metrics_watch};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Utc;
 use log::{debug, error, info, trace};
 use std::collections::{HashMap as StdHashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::Duration;
 use uiohook_rs::hook::wheel::{WHEEL_HORIZONTAL_DIRECTION, WHEEL_VERTICAL_DIRECTION};
 
@@ -46,7 +47,7 @@ pub struct PipelineResources {
 }
 
 pub struct PipelineHandles {
-    data_thread: JoinHandle<()>,
+    data_thread: ThreadHandle,
 }
 
 impl PipelineHandles {
@@ -55,7 +56,11 @@ impl PipelineHandles {
     }
 }
 
-pub fn spawn_pipeline(config: PipelineConfig, resources: PipelineResources) -> PipelineHandles {
+pub fn spawn_pipeline(
+    config: PipelineConfig,
+    resources: PipelineResources,
+    threads: ThreadRegistry,
+) -> Result<PipelineHandles> {
     let PipelineConfig {
         retention_minutes,
         active_grace_secs,
@@ -75,148 +80,263 @@ pub fn spawn_pipeline(config: PipelineConfig, resources: PipelineResources) -> P
         snapshot_bus,
     } = resources;
 
-    let data_thread = thread::spawn(move || {
-        info!("Background data processing thread started");
+    let threads_for_data = threads.clone();
+    let data_thread = threads
+        .spawn("pipeline-data", move || {
+            let threads = threads_for_data.clone();
+            info!("Background data processing thread started");
 
-        #[cfg(feature = "hotpath")]
-        let _hotpath_guard = hotpath::init(
-            "pipeline::data_thread".to_string(),
-            &[50, 95, 99],
-            Format::Table,
-        );
+            #[cfg(feature = "hotpath")]
+            let _hotpath_guard = hotpath::init(
+                "pipeline::data_thread".to_string(),
+                &[50, 95, 99],
+                Format::Table,
+            );
 
-        let mut compression_engine = CompressionEngine::with_focus_cap(focus_interner_max_strings);
-        let mut adapter = EventAdapter::new();
-        let mut lock_deriver = LockDeriver::new();
-        let mut store = storage;
-        let mut pending_raw_events: Vec<RawEvent> = Vec::new();
-        let mut state_hist: VecDeque<char> = VecDeque::new();
-        let mut recent_records: VecDeque<ActivityRecord> = VecDeque::new();
-        let mut current_focus: Option<WindowFocusInfo> = None;
-        let retention = chrono::Duration::minutes(retention_minutes as i64);
-        let eph_max = ephemeral_max_duration_secs;
-        let eph_min = ephemeral_min_distinct_ids;
-        let max_windows = max_windows_per_app;
-        let app_eph_max = ephemeral_app_max_duration_secs;
-        let app_eph_min = ephemeral_app_min_distinct_procs;
+            let mut compression_engine =
+                CompressionEngine::with_focus_cap(focus_interner_max_strings);
+            let mut adapter = EventAdapter::new();
+            let mut lock_deriver = LockDeriver::new();
+            let mut store = storage;
+            let mut pending_raw_events: Vec<RawEvent> = Vec::new();
+            let mut state_hist: VecDeque<char> = VecDeque::new();
+            let mut recent_records: VecDeque<ActivityRecord> = VecDeque::new();
+            let mut current_focus: Option<WindowFocusInfo> = None;
+            let retention = chrono::Duration::minutes(retention_minutes as i64);
+            let eph_max = ephemeral_max_duration_secs;
+            let eph_min = ephemeral_min_distinct_ids;
+            let max_windows = max_windows_per_app;
+            let app_eph_max = ephemeral_app_max_duration_secs;
+            let app_eph_min = ephemeral_app_min_distinct_procs;
 
-        let mut counts = snapshot::Counts {
-            signals_seen: 0,
-            hints_seen: 0,
-            records_emitted: 0,
-        };
-        let mut last_transition: Option<snapshot::Transition> = None;
+            let mut counts = snapshot::Counts {
+                signals_seen: 0,
+                hints_seen: 0,
+                records_emitted: 0,
+            };
+            let mut last_transition: Option<snapshot::Transition> = None;
 
-        let sm_rx = storage_metrics_watch();
-        let poll_handle_inner = Arc::clone(&poll_handle);
-        let ags = active_grace_secs;
-        let its = idle_threshold_secs;
+            let sm_rx = storage_metrics_watch();
+            let poll_handle_inner = Arc::clone(&poll_handle);
+            let ags = active_grace_secs;
+            let its = idle_threshold_secs;
 
-        let cfg_summary = snapshot::ConfigSummary {
-            active_grace_secs,
-            idle_threshold_secs,
-            retention_minutes,
-            ephemeral_max_duration_secs,
-            ephemeral_min_distinct_ids,
-            ephemeral_app_max_duration_secs,
-            ephemeral_app_min_distinct_procs,
-        };
+            let cfg_summary = snapshot::ConfigSummary {
+                active_grace_secs,
+                idle_threshold_secs,
+                retention_minutes,
+                ephemeral_max_duration_secs,
+                ephemeral_min_distinct_ids,
+                ephemeral_app_max_duration_secs,
+                ephemeral_app_min_distinct_procs,
+            };
 
-        let mut event_count = 0u64;
-        let now0 = Utc::now();
-        let since0 = now0 - retention;
-        match store.fetch_records_since(since0) {
-            Ok(mut recs) => {
-                for r in recs.drain(..) {
-                    recent_records.push_back(r);
+            let mut event_count = 0u64;
+            let now0 = Utc::now();
+            let since0 = now0 - retention;
+            match store.fetch_records_since(since0) {
+                Ok(mut recs) => {
+                    for r in recs.drain(..) {
+                        recent_records.push_back(r);
+                    }
+                    let _ = aggregate_activities_since(
+                        recent_records.make_contiguous(),
+                        since0,
+                        now0,
+                        eph_max,
+                        eph_min,
+                        max_windows,
+                    );
+                    info!(
+                        "Hydrated {} records from DB since {}",
+                        recent_records.len(),
+                        since0
+                    );
                 }
-                let _ = aggregate_activities_since(
-                    recent_records.make_contiguous(),
-                    since0,
-                    now0,
-                    eph_max,
-                    eph_min,
-                    max_windows,
-                );
-                info!(
-                    "Hydrated {} records from DB since {}",
-                    recent_records.len(),
-                    since0
-                );
+                Err(e) => error!("Failed to hydrate records from DB: {}", e),
             }
-            Err(e) => error!("Failed to hydrate records from DB: {}", e),
-        }
 
-        let (hints_tx, hints_rx) = mpsc::channel::<EventEnvelope>();
-        let (rec_fb_tx, rec_fb_rx) = mpsc::channel::<ActivityRecord>();
-        let (storage_tx, storage_rx) = mpsc::channel::<StorageCommand>();
+            let (hints_tx, hints_rx) = mpsc::channel::<EventEnvelope>();
+            let (rec_fb_tx, rec_fb_rx) = mpsc::channel::<ActivityRecord>();
+            let (storage_tx, storage_rx) = mpsc::channel::<StorageCommand>();
 
-        let mut store_writer = store;
-        let storage_thread = thread::spawn(move || {
-            info!("Storage writer thread started");
-            while let Ok(cmd) = storage_rx.recv() {
-                match cmd {
-                    StorageCommand::RawEvent(e) => {
-                        if let Err(e2) = store_writer.add_events(vec![e]) {
-                            error!("store add_events error: {}", e2);
+            let mut store_writer = store;
+            let threads_for_storage = threads.clone();
+            let storage_thread = match threads_for_storage.spawn("pipeline-storage", move || {
+                info!("Storage writer thread started");
+                while let Ok(cmd) = storage_rx.recv() {
+                    match cmd {
+                        StorageCommand::RawEvent(e) => {
+                            if let Err(e2) = store_writer.add_events(vec![e]) {
+                                error!("store add_events error: {}", e2);
+                            }
+                        }
+                        StorageCommand::Record(r) => {
+                            if let Err(e2) = store_writer.add_records(vec![r]) {
+                                error!("store add_records error: {}", e2);
+                            }
+                        }
+                        StorageCommand::Envelope(env) => {
+                            if let Err(e2) = store_writer.add_envelopes(vec![env]) {
+                                error!("store add_envelopes error: {}", e2);
+                            }
+                        }
+                        StorageCommand::CompactEvents(evts) => {
+                            if let Err(e2) = store_writer.add_compact_events(evts) {
+                                error!("store add_compact_events error: {}", e2);
+                            }
+                        }
+                        StorageCommand::Shutdown => {
+                            info!("Storage writer shutdown received");
+                            break;
                         }
                     }
-                    StorageCommand::Record(r) => {
-                        if let Err(e2) = store_writer.add_records(vec![r]) {
-                            error!("store add_records error: {}", e2);
-                        }
+                }
+                info!("Storage writer thread exiting");
+            }) {
+                Ok(handle) => handle,
+                Err(e) => {
+                    error!("Failed to spawn storage writer thread: {}", e);
+                    return;
+                }
+            };
+
+            let hints_storage_tx = storage_tx.clone();
+            let hints_fb_tx = rec_fb_tx.clone();
+            let threads_for_hints = threads.clone();
+            let hints_thread = match threads_for_hints.spawn("pipeline-hints", move || {
+                info!("Hints worker thread started");
+                let mut record_builder =
+                    crate::daemon::records::RecordBuilder::new(ActivityState::Inactive);
+                while let Ok(env) = hints_rx.recv() {
+                    if let Err(e) = hints_storage_tx.send(StorageCommand::Envelope(env.clone())) {
+                        error!("Failed to enqueue hint envelope to storage: {}", e);
                     }
-                    StorageCommand::Envelope(env) => {
-                        if let Err(e2) = store_writer.add_envelopes(vec![env]) {
-                            error!("store add_envelopes error: {}", e2);
+                    if let Some(rec) = record_builder.on_hint(&env) {
+                        if let Err(e) = hints_storage_tx.send(StorageCommand::Record(rec.clone())) {
+                            error!("Failed to enqueue record to storage: {}", e);
                         }
+                        let _ = hints_fb_tx.send(rec);
                     }
-                    StorageCommand::CompactEvents(evts) => {
-                        if let Err(e2) = store_writer.add_compact_events(evts) {
-                            error!("store add_compact_events error: {}", e2);
+                }
+                if let Some(final_rec) = record_builder.finalize_all() {
+                    let _ = hints_storage_tx.send(StorageCommand::Record(final_rec.clone()));
+                    let _ = hints_fb_tx.send(final_rec);
+                }
+                info!("Hints worker thread exiting");
+            }) {
+                Ok(handle) => handle,
+                Err(e) => {
+                    error!("Failed to spawn hints worker thread: {}", e);
+                    let _ = storage_thread.join();
+                    return;
+                }
+            };
+
+            let mut state_deriver = StateDeriver::new(Utc::now(), ags as i64, its as i64);
+            let mut current_state = ActivityState::Inactive;
+
+            loop {
+                match event_rx.recv_timeout(Duration::from_millis(50)) {
+                    Ok(KronicalEvent::Shutdown) => {
+                        info!("Shutdown signal received, flushing pending events and finalizing");
+                        if !pending_raw_events.is_empty() {
+                            let raw_events_to_process = std::mem::take(&mut pending_raw_events);
+                            let envelopes = adapter.adapt_batch(&raw_events_to_process);
+                            let envelopes_with_lock = lock_deriver.derive(&envelopes);
+                            for env in envelopes_with_lock.iter() {
+                                match &env.kind {
+                                    EventKind::Hint(_) => {
+                                        counts.hints_seen += 1;
+                                        if let EventPayload::Focus(fi) = &env.payload {
+                                            current_focus = Some(fi.clone());
+                                        }
+                                        if let EventPayload::State { from, to } =
+                                            env.payload.clone()
+                                        {
+                                            let tr = snapshot::Transition {
+                                                from,
+                                                to,
+                                                at: env.timestamp,
+                                                by_signal: None,
+                                            };
+                                            last_transition = Some(tr.clone());
+                                            snapshot_bus.push_transition(tr);
+                                            current_state = to;
+                                        }
+                                        let _ = hints_tx.send(env.clone());
+                                    }
+                                    EventKind::Signal(_) => {
+                                        counts.signals_seen += 1;
+                                        if let EventPayload::Focus(fi) = &env.payload {
+                                            current_focus = Some(fi.clone());
+                                        }
+                                        let _ =
+                                            storage_tx.send(StorageCommand::Envelope(env.clone()));
+                                        if let Some(h) = state_deriver.on_signal(env) {
+                                            counts.hints_seen += 1;
+                                            if let EventPayload::State { from, to } =
+                                                h.payload.clone()
+                                            {
+                                                let sig = match &env.kind {
+                                                    EventKind::Signal(sk) => {
+                                                        Some(format!("{:?}", sk))
+                                                    }
+                                                    _ => None,
+                                                };
+                                                let tr = snapshot::Transition {
+                                                    from,
+                                                    to,
+                                                    at: h.timestamp,
+                                                    by_signal: sig,
+                                                };
+                                                last_transition = Some(tr.clone());
+                                                snapshot_bus.push_transition(tr);
+                                                current_state = to;
+                                            }
+                                            let _ = hints_tx.send(h);
+                                        }
+                                    }
+                                }
+                            }
+                            while let Ok(r) = rec_fb_rx.try_recv() {
+                                let ch = match r.state {
+                                    ActivityState::Active => 'A',
+                                    ActivityState::Passive => 'P',
+                                    ActivityState::Inactive => 'I',
+                                    ActivityState::Locked => 'L',
+                                };
+                                if state_hist.back().copied() != Some(ch) {
+                                    state_hist.push_back(ch);
+                                    if state_hist.len() > 10 {
+                                        state_hist.pop_front();
+                                    }
+                                }
+                                recent_records.push_back(r);
+                                counts.records_emitted += 1;
+                            }
                         }
-                    }
-                    StorageCommand::Shutdown => {
-                        info!("Storage writer shutdown received");
                         break;
                     }
-                }
-            }
-            info!("Storage writer thread exiting");
-        });
+                    Ok(event) => {
+                        event_count += 1;
+                        debug!("Processing event #{}: {:?}", event_count, event);
 
-        let hints_storage_tx = storage_tx.clone();
-        let hints_fb_tx = rec_fb_tx.clone();
-        let hints_thread = thread::spawn(move || {
-            info!("Hints worker thread started");
-            let mut record_builder =
-                crate::daemon::records::RecordBuilder::new(ActivityState::Inactive);
-            while let Ok(env) = hints_rx.recv() {
-                if let Err(e) = hints_storage_tx.send(StorageCommand::Envelope(env.clone())) {
-                    error!("Failed to enqueue hint envelope to storage: {}", e);
-                }
-                if let Some(rec) = record_builder.on_hint(&env) {
-                    if let Err(e) = hints_storage_tx.send(StorageCommand::Record(rec.clone())) {
-                        error!("Failed to enqueue record to storage: {}", e);
+                        if let Ok(raw_event) = convert_kronid_to_raw(event) {
+                            pending_raw_events.push(raw_event);
+                            trace!(
+                                "Added raw event to pending batch (total: {})",
+                                pending_raw_events.len()
+                            );
+                        }
                     }
-                    let _ = hints_fb_tx.send(rec);
-                }
-            }
-            if let Some(final_rec) = record_builder.finalize_all() {
-                let _ = hints_storage_tx.send(StorageCommand::Record(final_rec.clone()));
-                let _ = hints_fb_tx.send(final_rec);
-            }
-            info!("Hints worker thread exiting");
-        });
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if pending_raw_events.is_empty() {
+                            continue;
+                        }
 
-        let mut state_deriver = StateDeriver::new(Utc::now(), ags as i64, its as i64);
-        let mut current_state = ActivityState::Inactive;
+                        debug!("Processing {} pending raw events", pending_raw_events.len());
 
-        loop {
-            match event_rx.recv_timeout(Duration::from_millis(50)) {
-                Ok(KronicalEvent::Shutdown) => {
-                    info!("Shutdown signal received, flushing pending events and finalizing");
-                    if !pending_raw_events.is_empty() {
                         let raw_events_to_process = std::mem::take(&mut pending_raw_events);
                         let envelopes = adapter.adapt_batch(&raw_events_to_process);
                         let envelopes_with_lock = lock_deriver.derive(&envelopes);
@@ -269,6 +389,7 @@ pub fn spawn_pipeline(config: PipelineConfig, resources: PipelineResources) -> P
                                 }
                             }
                         }
+
                         while let Ok(r) = rec_fb_rx.try_recv() {
                             let ch = match r.state {
                                 ActivityState::Active => 'A',
@@ -285,82 +406,101 @@ pub fn spawn_pipeline(config: PipelineConfig, resources: PipelineResources) -> P
                             recent_records.push_back(r);
                             counts.records_emitted += 1;
                         }
-                    }
-                    break;
-                }
-                Ok(event) => {
-                    event_count += 1;
-                    debug!("Processing event #{}: {:?}", event_count, event);
 
-                    if let Ok(raw_event) = convert_kronid_to_raw(event) {
-                        pending_raw_events.push(raw_event);
-                        trace!(
-                            "Added raw event to pending batch (total: {})",
-                            pending_raw_events.len()
+                        match compression_engine.compress_events(raw_events_to_process.clone()) {
+                            Ok((processed_events, compact_events)) => {
+                                if !processed_events.is_empty() {
+                                    let mut suppress: HashSet<u64> = HashSet::new();
+                                    let mut locked = false;
+                                    for env in &envelopes_with_lock {
+                                        match &env.kind {
+                                            EventKind::Signal(SignalKind::LockStart) => {
+                                                locked = true
+                                            }
+                                            EventKind::Signal(SignalKind::LockEnd) => {
+                                                locked = false
+                                            }
+                                            EventKind::Signal(
+                                                SignalKind::KeyboardInput | SignalKind::MouseInput,
+                                            ) if locked => {
+                                                suppress.insert(env.id);
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+                                    let to_store: Vec<_> = processed_events
+                                        .into_iter()
+                                        .filter(|ev| match ev {
+                                            RawEvent::KeyboardInput { event_id, .. }
+                                            | RawEvent::MouseInput { event_id, .. } => {
+                                                !suppress.contains(event_id)
+                                            }
+                                            _ => true,
+                                        })
+                                        .collect();
+                                    for ev in to_store {
+                                        if let Err(e) =
+                                            storage_tx.send(StorageCommand::RawEvent(ev))
+                                        {
+                                            error!("Failed to enqueue raw event: {}", e);
+                                        }
+                                    }
+                                }
+
+                                if !compact_events.is_empty() {
+                                    if let Err(e) = storage_tx
+                                        .send(StorageCommand::CompactEvents(compact_events))
+                                    {
+                                        error!(
+                                            "Failed to enqueue compact events to storage: {}",
+                                            e
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => error!("Failed to compress events: {}", e),
+                        }
+
+                        publish_snapshot(
+                            snapshot_bus.as_ref(),
+                            &mut recent_records,
+                            &sm_rx,
+                            &mut counts,
+                            &current_state,
+                            &current_focus,
+                            &last_transition,
+                            &cfg_summary,
+                            &poll_handle_inner,
+                            retention,
+                            eph_max,
+                            eph_min,
+                            max_windows,
+                            app_eph_max,
+                            app_eph_min,
                         );
                     }
+                    Err(mpsc::RecvTimeoutError::Disconnected) => {
+                        info!("Channel disconnected, exiting");
+                        break;
+                    }
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if pending_raw_events.is_empty() {
-                        continue;
+
+                if let Some(state_hint) = state_deriver.on_tick(Utc::now()) {
+                    counts.hints_seen += 1;
+                    if let EventPayload::State { from, to } = state_hint.payload.clone() {
+                        let tr = snapshot::Transition {
+                            from,
+                            to,
+                            at: state_hint.timestamp,
+                            by_signal: None,
+                        };
+                        last_transition = Some(tr.clone());
+                        snapshot_bus.push_transition(tr);
+                        current_state = to;
                     }
-
-                    debug!("Processing {} pending raw events", pending_raw_events.len());
-
-                    let raw_events_to_process = std::mem::take(&mut pending_raw_events);
-                    let envelopes = adapter.adapt_batch(&raw_events_to_process);
-                    let envelopes_with_lock = lock_deriver.derive(&envelopes);
-                    for env in envelopes_with_lock.iter() {
-                        match &env.kind {
-                            EventKind::Hint(_) => {
-                                counts.hints_seen += 1;
-                                if let EventPayload::Focus(fi) = &env.payload {
-                                    current_focus = Some(fi.clone());
-                                }
-                                if let EventPayload::State { from, to } = env.payload.clone() {
-                                    let tr = snapshot::Transition {
-                                        from,
-                                        to,
-                                        at: env.timestamp,
-                                        by_signal: None,
-                                    };
-                                    last_transition = Some(tr.clone());
-                                    snapshot_bus.push_transition(tr);
-                                    current_state = to;
-                                }
-                                let _ = hints_tx.send(env.clone());
-                            }
-                            EventKind::Signal(_) => {
-                                counts.signals_seen += 1;
-                                if let EventPayload::Focus(fi) = &env.payload {
-                                    current_focus = Some(fi.clone());
-                                }
-                                let _ = storage_tx.send(StorageCommand::Envelope(env.clone()));
-                                if let Some(h) = state_deriver.on_signal(env) {
-                                    counts.hints_seen += 1;
-                                    if let EventPayload::State { from, to } = h.payload.clone() {
-                                        let sig = match &env.kind {
-                                            EventKind::Signal(sk) => Some(format!("{:?}", sk)),
-                                            _ => None,
-                                        };
-                                        let tr = snapshot::Transition {
-                                            from,
-                                            to,
-                                            at: h.timestamp,
-                                            by_signal: sig,
-                                        };
-                                        last_transition = Some(tr.clone());
-                                        snapshot_bus.push_transition(tr);
-                                        current_state = to;
-                                    }
-                                    let _ = hints_tx.send(h);
-                                }
-                            }
-                        }
-                    }
-
-                    while let Ok(r) = rec_fb_rx.try_recv() {
-                        let ch = match r.state {
+                    let _ = hints_tx.send(state_hint);
+                    while let Ok(rec) = rec_fb_rx.try_recv() {
+                        let ch = match rec.state {
                             ActivityState::Active => 'A',
                             ActivityState::Passive => 'P',
                             ActivityState::Inactive => 'I',
@@ -372,53 +512,8 @@ pub fn spawn_pipeline(config: PipelineConfig, resources: PipelineResources) -> P
                                 state_hist.pop_front();
                             }
                         }
-                        recent_records.push_back(r);
+                        recent_records.push_back(rec);
                         counts.records_emitted += 1;
-                    }
-
-                    match compression_engine.compress_events(raw_events_to_process.clone()) {
-                        Ok((processed_events, compact_events)) => {
-                            if !processed_events.is_empty() {
-                                let mut suppress: HashSet<u64> = HashSet::new();
-                                let mut locked = false;
-                                for env in &envelopes_with_lock {
-                                    match &env.kind {
-                                        EventKind::Signal(SignalKind::LockStart) => locked = true,
-                                        EventKind::Signal(SignalKind::LockEnd) => locked = false,
-                                        EventKind::Signal(
-                                            SignalKind::KeyboardInput | SignalKind::MouseInput,
-                                        ) if locked => {
-                                            suppress.insert(env.id);
-                                        }
-                                        _ => {}
-                                    }
-                                }
-                                let to_store: Vec<_> = processed_events
-                                    .into_iter()
-                                    .filter(|ev| match ev {
-                                        RawEvent::KeyboardInput { event_id, .. }
-                                        | RawEvent::MouseInput { event_id, .. } => {
-                                            !suppress.contains(event_id)
-                                        }
-                                        _ => true,
-                                    })
-                                    .collect();
-                                for ev in to_store {
-                                    if let Err(e) = storage_tx.send(StorageCommand::RawEvent(ev)) {
-                                        error!("Failed to enqueue raw event: {}", e);
-                                    }
-                                }
-                            }
-
-                            if !compact_events.is_empty() {
-                                if let Err(e) =
-                                    storage_tx.send(StorageCommand::CompactEvents(compact_events))
-                                {
-                                    error!("Failed to enqueue compact events to storage: {}", e);
-                                }
-                            }
-                        }
-                        Err(e) => error!("Failed to compress events: {}", e),
                     }
 
                     publish_snapshot(
@@ -439,96 +534,46 @@ pub fn spawn_pipeline(config: PipelineConfig, resources: PipelineResources) -> P
                         app_eph_min,
                     );
                 }
-                Err(mpsc::RecvTimeoutError::Disconnected) => {
-                    info!("Channel disconnected, exiting");
+            }
+
+            drop(hints_tx);
+            while let Ok(rec) = rec_fb_rx.recv_timeout(Duration::from_millis(200)) {
+                recent_records.push_back(rec);
+                if rec_fb_rx.recv_timeout(Duration::from_millis(1)).is_err() {
                     break;
                 }
             }
+            let _ = storage_tx.send(StorageCommand::Shutdown);
 
-            if let Some(state_hint) = state_deriver.on_tick(Utc::now()) {
-                counts.hints_seen += 1;
-                if let EventPayload::State { from, to } = state_hint.payload.clone() {
-                    let tr = snapshot::Transition {
-                        from,
-                        to,
-                        at: state_hint.timestamp,
-                        by_signal: None,
-                    };
-                    last_transition = Some(tr.clone());
-                    snapshot_bus.push_transition(tr);
-                    current_state = to;
-                }
-                let _ = hints_tx.send(state_hint);
-                while let Ok(rec) = rec_fb_rx.try_recv() {
-                    let ch = match rec.state {
-                        ActivityState::Active => 'A',
-                        ActivityState::Passive => 'P',
-                        ActivityState::Inactive => 'I',
-                        ActivityState::Locked => 'L',
-                    };
-                    if state_hist.back().copied() != Some(ch) {
-                        state_hist.push_back(ch);
-                        if state_hist.len() > 10 {
-                            state_hist.pop_front();
-                        }
-                    }
-                    recent_records.push_back(rec);
-                    counts.records_emitted += 1;
-                }
+            publish_snapshot(
+                snapshot_bus.as_ref(),
+                &mut recent_records,
+                &sm_rx,
+                &mut counts,
+                &current_state,
+                &current_focus,
+                &last_transition,
+                &cfg_summary,
+                &poll_handle_inner,
+                retention,
+                eph_max,
+                eph_min,
+                max_windows,
+                app_eph_max,
+                app_eph_min,
+            );
 
-                publish_snapshot(
-                    snapshot_bus.as_ref(),
-                    &mut recent_records,
-                    &sm_rx,
-                    &mut counts,
-                    &current_state,
-                    &current_focus,
-                    &last_transition,
-                    &cfg_summary,
-                    &poll_handle_inner,
-                    retention,
-                    eph_max,
-                    eph_min,
-                    max_windows,
-                    app_eph_max,
-                    app_eph_min,
-                );
+            if let Err(e) = hints_thread.join() {
+                error!("Hints worker thread panicked: {:?}", e);
             }
-        }
-
-        drop(hints_tx);
-        while let Ok(rec) = rec_fb_rx.recv_timeout(Duration::from_millis(200)) {
-            recent_records.push_back(rec);
-            if rec_fb_rx.recv_timeout(Duration::from_millis(1)).is_err() {
-                break;
+            if let Err(e) = storage_thread.join() {
+                error!("Storage writer thread panicked: {:?}", e);
             }
-        }
-        let _ = storage_tx.send(StorageCommand::Shutdown);
+            info!("Background thread completed");
+        })
+        .context("spawn pipeline data thread")?;
 
-        publish_snapshot(
-            snapshot_bus.as_ref(),
-            &mut recent_records,
-            &sm_rx,
-            &mut counts,
-            &current_state,
-            &current_focus,
-            &last_transition,
-            &cfg_summary,
-            &poll_handle_inner,
-            retention,
-            eph_max,
-            eph_min,
-            max_windows,
-            app_eph_max,
-            app_eph_min,
-        );
-
-        let _ = hints_thread.join();
-        let _ = storage_thread.join();
-        info!("Background thread completed");
-    });
-
-    PipelineHandles { data_thread }
+    Ok(PipelineHandles { data_thread })
 }
 
 #[cfg_attr(feature = "hotpath", hotpath::measure)]

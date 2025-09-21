@@ -1,3 +1,4 @@
+use crate::daemon::runtime::{ThreadHandle, ThreadRegistry};
 use anyhow::Result;
 use log::info;
 use std::path::PathBuf;
@@ -5,8 +6,23 @@ use std::sync::Arc;
 
 /// Join handles for running API transports.
 pub struct ApiHandles {
-    pub grpc: Option<std::thread::JoinHandle<()>>,
-    pub http: Option<std::thread::JoinHandle<()>>,
+    pub grpc: Option<ThreadHandle>,
+    pub http: Option<ThreadHandle>,
+}
+
+impl ApiHandles {
+    pub fn join_all(self) {
+        if let Some(handle) = self.grpc {
+            if let Err(e) = handle.join() {
+                log::error!("gRPC server thread panicked: {:?}", e);
+            }
+        }
+        if let Some(handle) = self.http {
+            if let Err(e) = handle.join() {
+                log::error!("HTTP server thread panicked: {:?}", e);
+            }
+        }
+    }
 }
 
 /// Spawn both gRPC and HTTP/SSE API servers over Unix Domain Sockets.
@@ -15,10 +31,19 @@ pub fn spawn_all(
     grpc_uds: PathBuf,
     http_uds: PathBuf,
     snapshot_bus: Arc<crate::daemon::snapshot::SnapshotBus>,
+    threads: ThreadRegistry,
 ) -> Result<ApiHandles> {
-    let grpc = crate::daemon::server::grpc::spawn_server(grpc_uds, Arc::clone(&snapshot_bus))?;
+    let grpc = crate::daemon::server::grpc::spawn_server(
+        grpc_uds,
+        Arc::clone(&snapshot_bus),
+        threads.clone(),
+    )?;
     info!("Kroni gRPC API server started");
-    let http = crate::daemon::server::http::spawn_http_server(http_uds, Arc::clone(&snapshot_bus))?;
+    let http = crate::daemon::server::http::spawn_http_server(
+        http_uds,
+        Arc::clone(&snapshot_bus),
+        threads,
+    )?;
     info!("HTTP admin/SSE server started");
     Ok(ApiHandles {
         grpc: Some(grpc),
@@ -48,6 +73,7 @@ pub fn set_system_tracker_control_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::daemon::runtime::ThreadRegistry;
     use crate::daemon::server::grpc::trigger_grpc_shutdown;
     use crate::daemon::server::http::{reset_http_accept_budget, set_http_accept_budget};
     use crate::daemon::snapshot::SnapshotBus;
@@ -78,7 +104,12 @@ mod tests {
         let bus = Arc::new(SnapshotBus::new());
 
         set_http_accept_budget(0);
-        let handles = match spawn_all(grpc_path.clone(), http_path.clone(), Arc::clone(&bus)) {
+        let handles = match spawn_all(
+            grpc_path.clone(),
+            http_path.clone(),
+            Arc::clone(&bus),
+            ThreadRegistry::new(),
+        ) {
             Ok(handles) => handles,
             Err(e) => {
                 let msg = e.to_string();
@@ -97,11 +128,7 @@ mod tests {
 
         trigger_grpc_shutdown();
 
-        let grpc_handle = handles.grpc.expect("grpc handle present");
-        grpc_handle.join().expect("join grpc");
-
-        let http_handle = handles.http.expect("http handle present");
-        http_handle.join().expect("join http");
+        handles.join_all();
 
         let _ = std::fs::remove_file(&grpc_path);
         let _ = std::fs::remove_file(&http_path);

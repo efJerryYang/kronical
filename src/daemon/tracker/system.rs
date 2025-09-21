@@ -1,4 +1,5 @@
-use anyhow::Result;
+use crate::daemon::runtime::{ThreadHandle, ThreadRegistry};
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -43,6 +44,7 @@ pub struct SystemTracker {
     control_tx: Option<mpsc::Sender<ControlMsg>>,
     backend: crate::util::config::DatabaseBackendConfig,
     duckdb_memory_limit_mb: u64,
+    thread_handle: Option<ThreadHandle>,
 }
 
 #[derive(Debug, Clone)]
@@ -72,10 +74,15 @@ impl SystemTracker {
             control_tx: None,
             backend,
             duckdb_memory_limit_mb,
+            thread_handle: None,
         }
     }
 
     pub fn start(&mut self) -> Result<()> {
+        self.start_with_registry(ThreadRegistry::new())
+    }
+
+    pub fn start_with_registry(&mut self, threads: ThreadRegistry) -> Result<()> {
         if self.started.swap(true, Ordering::SeqCst) {
             return Err(anyhow::anyhow!("System tracker is already running"));
         }
@@ -96,196 +103,190 @@ impl SystemTracker {
         // Expose control channel to APIs (e.g., gRPC) so they can request a flush.
         crate::daemon::api::set_system_tracker_control_tx(control_tx.clone());
 
-        // Create the metrics store instance once within this thread.
-        // Also set up a query channel so the gRPC server can ask this
-        // thread to execute reads on the same in-process instance.
         let (query_tx, query_rx) = mpsc::channel::<MetricsQueryReq>();
-
         crate::daemon::api::set_system_tracker_query_tx(query_tx.clone());
 
-        thread::spawn(move || {
-            // Open the store according to configured backend
-            let mut store: Box<dyn SystemMetricsStore + Send> = match backend {
-                crate::util::config::DatabaseBackendConfig::Duckdb => {
-                    match DuckDbSystemMetricsStore::new_file_with_limit(&db_path, duckdb_limit) {
-                        Ok(s) => Box::new(s),
-                        Err(e) => {
-                            tracing::error!("Failed to create DuckDB store: {}", e);
-                            return;
+        let handle = threads
+            .spawn("system-tracker", move || {
+                let mut store: Box<dyn SystemMetricsStore + Send> = match backend {
+                    crate::util::config::DatabaseBackendConfig::Duckdb => {
+                        match DuckDbSystemMetricsStore::new_file_with_limit(&db_path, duckdb_limit)
+                        {
+                            Ok(s) => Box::new(s),
+                            Err(e) => {
+                                tracing::error!("Failed to create DuckDB store: {}", e);
+                                return;
+                            }
                         }
                     }
-                }
-                crate::util::config::DatabaseBackendConfig::Sqlite3 => {
-                    match SqliteSystemMetricsStore::new_file(&db_path) {
-                        Ok(s) => Box::new(s),
-                        Err(e) => {
-                            tracing::error!("Failed to create SQLite store: {}", e);
-                            return;
-                        }
-                    }
-                }
-            };
-
-            let mut metrics_buffer = Vec::new();
-            let mut last_disk_io = 0u64;
-            let mut batch_count = 0;
-
-            let flush_buffer =
-                |buffer: &mut Vec<SystemMetrics>,
-                 store: &mut Box<dyn SystemMetricsStore + Send>| {
-                    if !buffer.is_empty() {
-                        if let Err(e) = store.insert_metrics_batch(buffer, pid) {
-                            tracing::error!("Failed to flush metrics batch: {}", e);
-                        } else {
-                            tracing::debug!("Flushed {} metrics to metrics store", buffer.len());
-                            buffer.clear();
+                    crate::util::config::DatabaseBackendConfig::Sqlite3 => {
+                        match SqliteSystemMetricsStore::new_file(&db_path) {
+                            Ok(s) => Box::new(s),
+                            Err(e) => {
+                                tracing::error!("Failed to create SQLite store: {}", e);
+                                return;
+                            }
                         }
                     }
                 };
 
-            // Try to capture an initial sample so early flushes have data.
-            if let Ok((cpu_percent, memory_bytes, disk_io_delta, current_total_disk_io)) =
-                collect_system_metrics(pid, last_disk_io)
-            {
-                last_disk_io = current_total_disk_io;
-                metrics_buffer.push(SystemMetrics {
-                    timestamp: Utc::now(),
-                    cpu_percent,
-                    memory_bytes,
-                    disk_io_bytes: disk_io_delta,
-                });
-                batch_count += 1;
-            }
+                let mut metrics_buffer = Vec::new();
+                let mut last_disk_io = 0u64;
+                let mut batch_count = 0;
 
-            let mut running = true;
-            // When a Flush control message is received, we defer the actual flush
-            // until after capturing the current sample to mimic prior semantics.
-            let mut pending_flush_acks: Vec<mpsc::Sender<()>> = Vec::new();
-            while running {
-                // Drain any pending control messages (non-blocking)
-                loop {
-                    match control_rx.try_recv() {
-                        Ok(ControlMsg::Stop) => {
-                            running = false;
-                        }
-                        Ok(ControlMsg::Flush(ack_tx)) => {
-                            pending_flush_acks.push(ack_tx);
-                        }
-                        Err(mpsc::TryRecvError::Empty) => break,
-                        Err(mpsc::TryRecvError::Disconnected) => {
-                            running = false;
-                            break;
-                        }
-                    }
-                }
-
-                let start_time = std::time::Instant::now();
-
-                match collect_system_metrics(pid, last_disk_io) {
-                    Ok((cpu_percent, memory_bytes, disk_io_delta, current_total_disk_io)) => {
-                        last_disk_io = current_total_disk_io;
-
-                        let metrics = SystemMetrics {
-                            timestamp: Utc::now(),
-                            cpu_percent,
-                            memory_bytes,
-                            disk_io_bytes: disk_io_delta,
-                        };
-
-                        metrics_buffer.push(metrics);
-                        batch_count += 1;
-
-                        if batch_count % batch_size == 0 {
-                            if let Err(e) = store.insert_metrics_batch(&metrics_buffer, pid) {
-                                tracing::error!("Failed to insert metrics batch: {}", e);
+                let flush_buffer =
+                    |buffer: &mut Vec<SystemMetrics>,
+                     store: &mut Box<dyn SystemMetricsStore + Send>| {
+                        if !buffer.is_empty() {
+                            if let Err(e) = store.insert_metrics_batch(buffer, pid) {
+                                tracing::error!("Failed to flush metrics batch: {}", e);
                             } else {
                                 tracing::debug!(
-                                    "Inserted {} metrics to metrics store",
+                                    "Flushed {} metrics to metrics store",
+                                    buffer.len()
+                                );
+                                buffer.clear();
+                            }
+                        }
+                    };
+
+                if let Ok((cpu_percent, memory_bytes, disk_io_delta, current_total_disk_io)) =
+                    collect_system_metrics(pid, last_disk_io)
+                {
+                    last_disk_io = current_total_disk_io;
+                    metrics_buffer.push(SystemMetrics {
+                        timestamp: Utc::now(),
+                        cpu_percent,
+                        memory_bytes,
+                        disk_io_bytes: disk_io_delta,
+                    });
+                    batch_count += 1;
+                }
+
+                let mut running = true;
+                let mut pending_flush_acks: Vec<mpsc::Sender<()>> = Vec::new();
+                while running {
+                    loop {
+                        match control_rx.try_recv() {
+                            Ok(ControlMsg::Stop) => {
+                                running = false;
+                            }
+                            Ok(ControlMsg::Flush(ack_tx)) => {
+                                pending_flush_acks.push(ack_tx);
+                            }
+                            Err(mpsc::TryRecvError::Empty) => break,
+                            Err(mpsc::TryRecvError::Disconnected) => {
+                                running = false;
+                                break;
+                            }
+                        }
+                    }
+
+                    let start_time = std::time::Instant::now();
+
+                    match collect_system_metrics(pid, last_disk_io) {
+                        Ok((cpu_percent, memory_bytes, disk_io_delta, current_total_disk_io)) => {
+                            last_disk_io = current_total_disk_io;
+
+                            let metrics = SystemMetrics {
+                                timestamp: Utc::now(),
+                                cpu_percent,
+                                memory_bytes,
+                                disk_io_bytes: disk_io_delta,
+                            };
+
+                            metrics_buffer.push(metrics);
+                            batch_count += 1;
+
+                            if batch_count % batch_size == 0 {
+                                if let Err(e) = store.insert_metrics_batch(&metrics_buffer, pid) {
+                                    tracing::error!("Failed to insert metrics batch: {}", e);
+                                } else {
+                                    tracing::debug!(
+                                        "Inserted {} metrics to metrics store",
+                                        metrics_buffer.len()
+                                    );
+                                    metrics_buffer.clear();
+                                }
+                            }
+
+                            if !pending_flush_acks.is_empty() {
+                                tracing::info!(
+                                    "Tracker flush requested; flushing {} buffered samples",
                                     metrics_buffer.len()
                                 );
-                                metrics_buffer.clear();
-                            }
-                        }
-
-                        if !pending_flush_acks.is_empty() {
-                            tracing::info!(
-                                "Tracker flush requested; flushing {} buffered samples",
-                                metrics_buffer.len()
-                            );
-                            flush_buffer(&mut metrics_buffer, &mut store);
-                            for ack in pending_flush_acks.drain(..) {
-                                let _ = ack.send(());
-                            }
-                        }
-                    }
-                    Err(e) => {
-                        tracing::warn!("Failed to collect system metrics: {}", e);
-                        // Even if collection failed, honor a pending flush to persist any buffered samples
-                        if !pending_flush_acks.is_empty() {
-                            tracing::info!(
-                                "Tracker flush requested (error path); flushing {} buffered samples",
-                                metrics_buffer.len()
-                            );
-                            flush_buffer(&mut metrics_buffer, &mut store);
-                            for ack in pending_flush_acks.drain(..) {
-                                let _ = ack.send(());
-                            }
-                        }
-                    }
-                }
-
-                // Process any pending queries from the gRPC server quickly.
-                loop {
-                    match query_rx.try_recv() {
-                        Ok(req) => {
-                            // Ensure freshest view by flushing any buffered samples
-                            flush_buffer(&mut metrics_buffer, &mut store);
-                            let result = match req.query {
-                                MetricsQuery::ByLimit { pid, limit } => {
-                                    let mut rows = match store.get_metrics_for_pid(pid, Some(limit))
-                                    {
-                                        Ok(v) => v,
-                                        Err(e) => {
-                                            let _ = req.reply.send(Err(e.to_string()));
-                                            continue;
-                                        }
-                                    };
-                                    rows.reverse();
-                                    Ok(rows)
+                                flush_buffer(&mut metrics_buffer, &mut store);
+                                for ack in pending_flush_acks.drain(..) {
+                                    let _ = ack.send(());
                                 }
-                                MetricsQuery::ByRange { pid, start, end } => {
-                                    match store.get_metrics_in_time_range(pid, start, end) {
-                                        Ok(v) => Ok(v),
-                                        Err(e) => Err(e.to_string()),
+                            }
+                        }
+                        Err(e) => {
+                            tracing::warn!("Failed to collect system metrics: {}", e);
+                            if !pending_flush_acks.is_empty() {
+                                tracing::info!(
+                                    "Tracker flush requested (error path); flushing {} buffered samples",
+                                    metrics_buffer.len()
+                                );
+                                flush_buffer(&mut metrics_buffer, &mut store);
+                                for ack in pending_flush_acks.drain(..) {
+                                    let _ = ack.send(());
+                                }
+                            }
+                        }
+                    }
+
+                    loop {
+                        match query_rx.try_recv() {
+                            Ok(req) => {
+                                flush_buffer(&mut metrics_buffer, &mut store);
+                                let result = match req.query {
+                                    MetricsQuery::ByLimit { pid, limit } => {
+                                        let mut rows = match store.get_metrics_for_pid(pid, Some(limit))
+                                        {
+                                            Ok(v) => v,
+                                            Err(e) => {
+                                                let _ = req.reply.send(Err(e.to_string()));
+                                                continue;
+                                            }
+                                        };
+                                        rows.reverse();
+                                        Ok(rows)
                                     }
-                                }
-                            };
-                            let _ = req.reply.send(result);
+                                    MetricsQuery::ByRange { pid, start, end } => {
+                                        match store.get_metrics_in_time_range(pid, start, end) {
+                                            Ok(v) => Ok(v),
+                                            Err(e) => Err(e.to_string()),
+                                        }
+                                    }
+                                };
+                                let _ = req.reply.send(result);
+                            }
+                            Err(mpsc::TryRecvError::Empty) => break,
+                            Err(mpsc::TryRecvError::Disconnected) => break,
                         }
-                        Err(mpsc::TryRecvError::Empty) => break,
-                        Err(mpsc::TryRecvError::Disconnected) => break,
+                    }
+
+                    let elapsed = start_time.elapsed();
+                    if elapsed < interval {
+                        thread::sleep(interval - elapsed);
                     }
                 }
 
-                // Note: control messages are drained at the start of each loop
-
-                let elapsed = start_time.elapsed();
-                if elapsed < interval {
-                    thread::sleep(interval - elapsed);
+                if !metrics_buffer.is_empty() {
+                    if let Err(e) = store.insert_metrics_batch(&metrics_buffer, pid) {
+                        tracing::error!("Failed to flush final metrics batch: {}", e);
+                    } else {
+                        tracing::debug!(
+                            "Flushed final {} metrics to metrics store",
+                            metrics_buffer.len()
+                        );
+                    }
                 }
-            }
+            })
+            .context("spawn system tracker thread")?;
 
-            if !metrics_buffer.is_empty() {
-                if let Err(e) = store.insert_metrics_batch(&metrics_buffer, pid) {
-                    tracing::error!("Failed to flush final metrics batch: {}", e);
-                } else {
-                    tracing::debug!(
-                        "Flushed final {} metrics to metrics store",
-                        metrics_buffer.len()
-                    );
-                }
-            }
-        });
+        self.thread_handle = Some(handle);
 
         Ok(())
     }
@@ -296,6 +297,11 @@ impl SystemTracker {
         }
         if let Some(tx) = &self.control_tx {
             let _ = tx.send(ControlMsg::Stop);
+        }
+        if let Some(handle) = self.thread_handle.take() {
+            if let Err(e) = handle.join() {
+                tracing::error!("System tracker thread panicked: {:?}", e);
+            }
         }
         info!("System tracker stop requested");
         Ok(())

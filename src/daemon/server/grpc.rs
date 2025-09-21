@@ -1,3 +1,4 @@
+use crate::daemon::runtime::{ThreadHandle, ThreadRegistry};
 use crate::daemon::snapshot;
 use crate::kroni_api::kroni::v1::kroni_server::{Kroni, KroniServer};
 use crate::kroni_api::kroni::v1::{
@@ -7,7 +8,7 @@ use crate::kroni_api::kroni::v1::{
     snapshot_reply::SnapshotApp as PbApp, snapshot_reply::SnapshotWindow as PbWin,
     snapshot_reply::Storage, snapshot_reply::Transition,
 };
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use futures_core::Stream;
 use log::{info, warn};
@@ -357,7 +358,8 @@ pub fn to_pb(s: &snapshot::Snapshot) -> SnapshotReply {
 pub fn spawn_server(
     uds_path: PathBuf,
     snapshot_bus: Arc<snapshot::SnapshotBus>,
-) -> Result<std::thread::JoinHandle<()>> {
+    threads: ThreadRegistry,
+) -> Result<ThreadHandle> {
     if uds_path.exists() {
         warn!("Removing stale UDS: {:?}", uds_path);
         let _ = std::fs::remove_file(&uds_path);
@@ -371,45 +373,47 @@ pub fn spawn_server(
     #[cfg(test)]
     let shutdown_notify_for_thread = Arc::clone(&shutdown_notify);
 
-    let handle = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .expect("build runtime");
-        rt.block_on(async move {
-            let uds = UnixListener::bind(&uds_path).expect("bind uds");
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mut perms = std::fs::metadata(&uds_path).expect("meta").permissions();
-                perms.set_mode(0o600);
-                std::fs::set_permissions(&uds_path, perms).expect("chmod");
-            }
-            let incoming = tokio_stream::wrappers::UnixListenerStream::new(uds);
-            let svc = KroniSvc::new(bus_for_thread);
-            tx.send(()).ok();
-            info!("kroni API listening on {:?}", uds_path);
-            #[cfg(test)]
-            {
-                let shutdown = shutdown_notify_for_thread;
-                Server::builder()
-                    .add_service(KroniServer::new(svc))
-                    .serve_with_incoming_shutdown(incoming, async move {
-                        shutdown.notified().await;
-                    })
-                    .await
-                    .expect("serve");
-            }
-            #[cfg(not(test))]
-            {
-                Server::builder()
-                    .add_service(KroniServer::new(svc))
-                    .serve_with_incoming(incoming)
-                    .await
-                    .expect("serve");
-            }
-        });
-    });
+    let handle = threads
+        .spawn("grpc-server", move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("build runtime");
+            rt.block_on(async move {
+                let uds = UnixListener::bind(&uds_path).expect("bind uds");
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let mut perms = std::fs::metadata(&uds_path).expect("meta").permissions();
+                    perms.set_mode(0o600);
+                    std::fs::set_permissions(&uds_path, perms).expect("chmod");
+                }
+                let incoming = tokio_stream::wrappers::UnixListenerStream::new(uds);
+                let svc = KroniSvc::new(bus_for_thread);
+                tx.send(()).ok();
+                info!("kroni API listening on {:?}", uds_path);
+                #[cfg(test)]
+                {
+                    let shutdown = shutdown_notify_for_thread;
+                    Server::builder()
+                        .add_service(KroniServer::new(svc))
+                        .serve_with_incoming_shutdown(incoming, async move {
+                            shutdown.notified().await;
+                        })
+                        .await
+                        .expect("serve");
+                }
+                #[cfg(not(test))]
+                {
+                    Server::builder()
+                        .add_service(KroniServer::new(svc))
+                        .serve_with_incoming(incoming)
+                        .await
+                        .expect("serve");
+                }
+            });
+        })
+        .context("spawn gRPC server thread")?;
     match rx.recv_timeout(Duration::from_millis(500)) {
         Ok(()) => Ok(handle),
         Err(_) => {
@@ -438,6 +442,7 @@ mod tests {
     use super::*;
     use crate::daemon::events::WindowFocusInfo;
     use crate::daemon::records::ActivityState;
+    use crate::daemon::runtime::ThreadRegistry;
     use crate::daemon::snapshot::{
         ConfigSummary, Counts as SnapshotCounts, Snapshot, SnapshotApp, SnapshotWindow,
         StorageInfo, Transition as SnapshotTransition,
@@ -677,20 +682,21 @@ mod tests {
             Vec::new(),
         );
 
-        let handle = match super::spawn_server(uds_path.clone(), Arc::clone(&bus)) {
-            Ok(handle) => handle,
-            Err(e) => {
-                let msg = e.to_string();
-                assert!(
-                    msg.contains("Operation not permitted")
-                        || msg.contains("failed to signal readiness"),
-                    "unexpected spawn error: {}",
-                    msg
-                );
-                let _ = std::fs::remove_file(&uds_path);
-                return;
-            }
-        };
+        let handle =
+            match super::spawn_server(uds_path.clone(), Arc::clone(&bus), ThreadRegistry::new()) {
+                Ok(handle) => handle,
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(
+                        msg.contains("Operation not permitted")
+                            || msg.contains("failed to signal readiness"),
+                        "unexpected spawn error: {}",
+                        msg
+                    );
+                    let _ = std::fs::remove_file(&uds_path);
+                    return;
+                }
+            };
 
         super::trigger_grpc_shutdown();
         handle.join().expect("join thread");

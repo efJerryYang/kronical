@@ -1,5 +1,6 @@
+use crate::daemon::runtime::{ThreadHandle, ThreadRegistry};
 use crate::daemon::snapshot;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use axum::extract::State;
 use axum::response::sse::{Event, Sse};
 use axum::{Json, Router, routing::get};
@@ -54,7 +55,8 @@ async fn stream_handler(
 pub fn spawn_http_server(
     uds_path: PathBuf,
     snapshot_bus: Arc<snapshot::SnapshotBus>,
-) -> Result<std::thread::JoinHandle<()>> {
+    threads: ThreadRegistry,
+) -> Result<ThreadHandle> {
     if uds_path.exists() {
         warn!("Removing stale HTTP admin UDS: {:?}", uds_path);
         let _ = std::fs::remove_file(&uds_path);
@@ -62,7 +64,8 @@ pub fn spawn_http_server(
 
     let (tx, rx) = std::sync::mpsc::channel();
     let bus_for_thread = Arc::clone(&snapshot_bus);
-    let handle = std::thread::spawn(move || {
+    let handle = threads
+        .spawn("http-server", move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -111,7 +114,8 @@ pub fn spawn_http_server(
                 });
             }
         });
-    });
+    })
+    .context("spawn HTTP server thread")?;
     match rx.recv_timeout(Duration::from_millis(500)) {
         Ok(()) => Ok(handle),
         Err(_) => {
@@ -138,6 +142,7 @@ mod tests {
     use super::*;
     use crate::daemon::events::WindowFocusInfo;
     use crate::daemon::records::ActivityState;
+    use crate::daemon::runtime::ThreadRegistry;
     use crate::daemon::snapshot::{
         ConfigSummary, Counts as SnapshotCounts, SnapshotBus, StorageInfo,
     };
@@ -248,7 +253,11 @@ mod tests {
         publish_sample(&bus, "spawn");
 
         super::set_http_accept_budget(0);
-        let handle = match super::spawn_http_server(uds_path.clone(), Arc::clone(&bus)) {
+        let handle = match super::spawn_http_server(
+            uds_path.clone(),
+            Arc::clone(&bus),
+            ThreadRegistry::new(),
+        ) {
             Ok(handle) => handle,
             Err(e) => {
                 let msg = e.to_string();
