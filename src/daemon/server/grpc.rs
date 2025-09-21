@@ -370,3 +370,204 @@ pub fn spawn_server(
 }
 
 // Note: gRPC integration tests live under tests/ to avoid OnceCell contention.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::daemon::events::WindowFocusInfo;
+    use crate::daemon::records::ActivityState;
+    use crate::daemon::snapshot::{
+        ConfigSummary, Counts as SnapshotCounts, Snapshot, SnapshotApp, SnapshotWindow,
+        StorageInfo, Transition as SnapshotTransition,
+    };
+    use crate::kroni_api::kroni::v1::{SnapshotRequest, WatchRequest};
+    use chrono::{Duration, TimeZone, Utc};
+    use prost_types::Timestamp;
+    use std::sync::Arc;
+    use tokio_stream::StreamExt;
+    use tonic::Request;
+
+    fn sample_focus() -> WindowFocusInfo {
+        WindowFocusInfo {
+            pid: 4242,
+            process_start_time: 99,
+            app_name: Arc::new("Terminal".to_string()),
+            window_title: Arc::new("Build log".to_string()),
+            window_id: 7,
+            window_instance_start: Utc.with_ymd_and_hms(2024, 5, 1, 12, 30, 0).unwrap(),
+            window_position: None,
+            window_size: Some((1440, 900)),
+        }
+    }
+
+    #[test]
+    fn ts_to_utc_rejects_out_of_range_nanos() {
+        let ts = Timestamp {
+            seconds: 1,
+            nanos: 1_500_000_000,
+        };
+        assert!(ts_to_utc(&ts).is_err());
+    }
+
+    #[test]
+    fn snapshot_conversion_preserves_focus_and_counts() {
+        let mut snapshot = Snapshot::empty();
+        snapshot.seq = 42;
+        snapshot.mono_ns = 9_876_543;
+        snapshot.activity_state = ActivityState::Active;
+        snapshot.focus = Some(sample_focus());
+        snapshot.last_transition = Some(SnapshotTransition {
+            from: ActivityState::Inactive,
+            to: ActivityState::Active,
+            at: Utc.with_ymd_and_hms(2024, 5, 1, 12, 29, 0).unwrap(),
+            by_signal: Some("keyboard".to_string()),
+        });
+        snapshot.counts = SnapshotCounts {
+            signals_seen: 12,
+            hints_seen: 8,
+            records_emitted: 3,
+        };
+        snapshot.cadence_ms = 750;
+        snapshot.cadence_reason = "focus-change".to_string();
+        snapshot.next_timeout = Some(Utc::now() + Duration::seconds(30));
+        snapshot.storage = StorageInfo {
+            backlog_count: 4,
+            last_flush_at: Some(Utc::now()),
+        };
+        snapshot.config = ConfigSummary {
+            active_grace_secs: 5,
+            idle_threshold_secs: 300,
+            retention_minutes: 60,
+            ephemeral_max_duration_secs: 90,
+            ephemeral_min_distinct_ids: 3,
+            ephemeral_app_max_duration_secs: 120,
+            ephemeral_app_min_distinct_procs: 2,
+        };
+        snapshot.health = vec!["ok".into(), "pipeline".into()];
+        snapshot.aggregated_apps = vec![SnapshotApp {
+            app_name: "Terminal".into(),
+            pid: 4242,
+            process_start_time: 99,
+            windows: vec![SnapshotWindow {
+                window_id: "7".into(),
+                window_title: "Build log".into(),
+                first_seen: Utc.with_ymd_and_hms(2024, 5, 1, 12, 0, 0).unwrap(),
+                last_seen: Utc.with_ymd_and_hms(2024, 5, 1, 12, 30, 0).unwrap(),
+                duration_seconds: 1_200,
+                is_group: false,
+            }],
+            total_duration_secs: 1_200,
+            total_duration_pretty: "20m".into(),
+        }];
+
+        let reply = to_pb(&snapshot);
+
+        assert_eq!(reply.seq, 42);
+        assert_eq!(reply.activity_state, PbState::Active as i32);
+        let focus = reply.focus.expect("focus converted");
+        assert_eq!(focus.app, "Terminal");
+        assert_eq!(focus.window_id, "7");
+        assert!(focus.since.is_some());
+
+        let transition = reply.last_transition.expect("transition converted");
+        assert_eq!(transition.from, PbState::Inactive as i32);
+        assert_eq!(transition.to, PbState::Active as i32);
+        assert!(transition.at.is_some());
+
+        let counts = reply.counts.expect("counts");
+        assert_eq!(counts.signals_seen, 12);
+        assert_eq!(counts.records_emitted, 3);
+
+        let storage = reply.storage.expect("storage");
+        assert_eq!(storage.backlog_count, 4);
+        assert!(storage.last_flush.is_some());
+
+        let config = reply.config.expect("config");
+        assert_eq!(config.idle_threshold_secs, 300);
+        assert_eq!(config.ephemeral_min_distinct_ids, 3);
+
+        assert_eq!(reply.health, vec!["ok", "pipeline"]);
+        assert_eq!(reply.aggregated_apps.len(), 1);
+        let window = &reply.aggregated_apps[0].windows[0];
+        assert_eq!(window.window_id, "7");
+        assert_eq!(window.duration_seconds, 1_200);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_call_returns_latest_state() {
+        let bus = Arc::new(snapshot::SnapshotBus::new());
+        bus.publish_basic(
+            ActivityState::Active,
+            Some(sample_focus()),
+            None,
+            SnapshotCounts {
+                signals_seen: 4,
+                hints_seen: 2,
+                records_emitted: 1,
+            },
+            500,
+            "tick".into(),
+            None,
+            StorageInfo {
+                backlog_count: 3,
+                last_flush_at: None,
+            },
+            ConfigSummary::default(),
+            vec!["healthy".into()],
+            Vec::new(),
+        );
+
+        let svc = KroniSvc::new(Arc::clone(&bus));
+        let reply = svc
+            .snapshot(Request::new(SnapshotRequest {
+                sections: Vec::new(),
+                detail: "summary".into(),
+            }))
+            .await
+            .expect("snapshot call succeeds")
+            .into_inner();
+
+        assert_eq!(reply.activity_state, PbState::Active as i32);
+        assert_eq!(reply.counts.unwrap().signals_seen, 4);
+        assert_eq!(reply.storage.unwrap().backlog_count, 3);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn watch_stream_emits_updates() {
+        let bus = Arc::new(snapshot::SnapshotBus::new());
+        let svc = KroniSvc::new(Arc::clone(&bus));
+
+        let mut stream = svc
+            .watch(Request::new(WatchRequest {
+                sections: Vec::new(),
+                detail: "summary".into(),
+            }))
+            .await
+            .expect("watch call succeeds")
+            .into_inner();
+
+        let first = stream.next().await.expect("first item").expect("ok");
+        assert_eq!(first.activity_state, PbState::Inactive as i32);
+
+        bus.publish_basic(
+            ActivityState::Active,
+            Some(sample_focus()),
+            None,
+            SnapshotCounts::default(),
+            250,
+            "hook".into(),
+            None,
+            StorageInfo {
+                backlog_count: 1,
+                last_flush_at: None,
+            },
+            ConfigSummary::default(),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let second = stream.next().await.expect("second item").expect("ok");
+        assert_eq!(second.activity_state, PbState::Active as i32);
+        assert_eq!(second.focus.unwrap().title, "Build log");
+    }
+}

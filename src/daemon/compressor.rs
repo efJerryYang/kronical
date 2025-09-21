@@ -622,3 +622,157 @@ impl CompressionEngine {
         Ok((raw_events, compact_events))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::daemon::events::{
+        KeyboardEventData, MouseEventData, MouseEventKind, MousePosition, WheelAxis,
+    };
+    use chrono::{TimeZone, Utc};
+
+    fn scroll_event(millis: i64, amount: i32, rotation: i32, axis: WheelAxis, id: u64) -> RawEvent {
+        RawEvent::MouseInput {
+            timestamp: Utc.timestamp_millis_opt(millis).single().unwrap(),
+            event_id: id,
+            data: MouseEventData {
+                position: MousePosition { x: 0, y: 0 },
+                button: None,
+                click_count: None,
+                event_type: Some(MouseEventKind::Moved),
+                wheel_amount: Some(amount.abs()),
+                wheel_rotation: Some(rotation),
+                wheel_axis: Some(axis),
+            },
+        }
+    }
+
+    fn mouse_event(millis: i64, pos: (i32, i32), kind: MouseEventKind, id: u64) -> RawEvent {
+        RawEvent::MouseInput {
+            timestamp: Utc.timestamp_millis_opt(millis).single().unwrap(),
+            event_id: id,
+            data: MouseEventData {
+                position: MousePosition { x: pos.0, y: pos.1 },
+                button: None,
+                click_count: None,
+                event_type: Some(kind),
+                wheel_amount: None,
+                wheel_rotation: None,
+                wheel_axis: None,
+            },
+        }
+    }
+
+    fn key_event(millis: i64, id: u64) -> RawEvent {
+        RawEvent::KeyboardInput {
+            timestamp: Utc.timestamp_millis_opt(millis).single().unwrap(),
+            event_id: id,
+            data: KeyboardEventData {
+                key_code: Some(30),
+                key_char: Some('a'),
+                modifiers: vec!["shift".into()],
+            },
+        }
+    }
+
+    #[test]
+    fn string_interner_reuses_and_resets_capacity() {
+        let mut interner = StringInterner::with_cap(2);
+        let id_a1 = interner.intern("Terminal");
+        let id_a2 = interner.intern("Terminal");
+        assert_eq!(id_a1, id_a2, "identical strings should share the same id");
+
+        let id_b = interner.intern("Mail");
+        assert_ne!(id_a1, id_b);
+
+        // Exceed capacity to force reset (IDs restart)
+        let id_c = interner.intern("Calendar");
+        let id_a3 = interner.intern("Terminal");
+        assert_ne!(id_a1, id_a3, "reset should drop previous mapping");
+        assert_eq!(interner.intern("Terminal"), id_a3);
+        assert_eq!(interner.intern("Calendar"), id_c);
+    }
+
+    #[test]
+    fn scroll_compressor_groups_by_direction_and_gap() {
+        let mut compressor = ScrollCompressor::new();
+        let events = vec![
+            scroll_event(0, 3, 1, WheelAxis::Vertical, 1),
+            scroll_event(200, 2, 1, WheelAxis::Vertical, 2),
+            // Gap over 500ms forces a new sequence
+            scroll_event(800, 5, -1, WheelAxis::Vertical, 3),
+            // Horizontal wheel yields a third sequence
+            scroll_event(900, 4, 1, WheelAxis::Horizontal, 4),
+        ];
+
+        assert!(compressor.can_compress(&events));
+        let mut sequences = compressor.compress(events);
+        sequences.sort_by_key(|seq| seq.start_time);
+
+        assert_eq!(sequences.len(), 3);
+        assert_eq!(sequences[0].scroll_count, 2);
+        assert_eq!(sequences[0].total_amount, 5);
+        assert_eq!(sequences[0].direction, ScrollDirection::VerticalUp);
+        assert_eq!(
+            sequences[1].direction,
+            ScrollDirection::VerticalDown,
+            "negative rotation maps to downward scroll",
+        );
+        assert_eq!(sequences[1].raw_event_ids, vec![3]);
+        assert_eq!(sequences[2].direction, ScrollDirection::HorizontalRight);
+    }
+
+    #[test]
+    fn mouse_trajectory_splits_on_gaps_and_kind_switches() {
+        let mut compressor = MouseTrajectoryCompressor::new();
+        let events = vec![
+            mouse_event(0, (0, 0), MouseEventKind::Moved, 1),
+            mouse_event(50, (10, 0), MouseEventKind::Moved, 2),
+            mouse_event(100, (20, 0), MouseEventKind::Moved, 3),
+            // Gap > max_gap_ms closes the first trajectory
+            mouse_event(400, (30, 0), MouseEventKind::Dragged, 4),
+            mouse_event(430, (40, 0), MouseEventKind::Dragged, 5),
+            mouse_event(460, (50, 0), MouseEventKind::Dragged, 6),
+        ];
+
+        let mut trajectories = compressor.compress(events);
+        trajectories.sort_by_key(|traj| traj.start_time);
+
+        assert_eq!(trajectories.len(), 2);
+        let first = &trajectories[0];
+        assert_eq!(first.raw_event_ids, vec![1, 2, 3]);
+        assert_eq!(first.event_type, MouseTrajectoryType::Movement);
+        assert!(first.total_distance > 0.0);
+        assert!(first.max_velocity > 0.0);
+
+        let second = &trajectories[1];
+        assert_eq!(second.event_type, MouseTrajectoryType::Drag);
+        assert_eq!(second.raw_event_ids, vec![4, 5, 6]);
+        assert!(
+            second.simplified_path.len() >= 2,
+            "Douglas-Peucker keeps endpoints for summary path",
+        );
+    }
+
+    #[test]
+    fn keyboard_activity_groups_bursts_and_calculates_density() {
+        let mut compressor = KeyboardActivityCompressor::with_gap_ms(1_000);
+        let events = vec![
+            key_event(0, 1),
+            key_event(200, 2),
+            key_event(400, 3),
+            // Large pause creates a new burst
+            key_event(2_000, 4),
+        ];
+
+        let mut bursts = compressor.compress(events);
+        bursts.sort_by_key(|burst| burst.start_time);
+
+        assert_eq!(bursts.len(), 2);
+        assert_eq!(bursts[0].raw_event_ids, vec![1, 2, 3]);
+        assert!(bursts[0].keys_per_minute > 0.0);
+        assert!(bursts[0].density_per_sec > 0.0);
+        assert_eq!(bursts[1].raw_event_ids, vec![4]);
+        assert_eq!(bursts[1].keystrokes, 1);
+    }
+}

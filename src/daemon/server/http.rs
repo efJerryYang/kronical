@@ -88,3 +88,91 @@ pub fn spawn_http_server(
     rx.recv().ok();
     Ok(handle)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::daemon::events::WindowFocusInfo;
+    use crate::daemon::records::ActivityState;
+    use crate::daemon::snapshot::{
+        ConfigSummary, Counts as SnapshotCounts, SnapshotBus, StorageInfo,
+    };
+    use axum::Json;
+    use axum::extract::State;
+    use axum::response::IntoResponse;
+    use chrono::{TimeZone, Utc};
+    use std::sync::Arc;
+
+    fn sample_focus() -> WindowFocusInfo {
+        WindowFocusInfo {
+            pid: 9001,
+            process_start_time: 777,
+            app_name: Arc::new("Terminal".to_string()),
+            window_title: Arc::new("build".to_string()),
+            window_id: 41,
+            window_instance_start: Utc.with_ymd_and_hms(2024, 5, 1, 7, 0, 0).unwrap(),
+            window_position: None,
+            window_size: Some((1440, 900)),
+        }
+    }
+
+    fn publish_sample(bus: &SnapshotBus, title_suffix: &str) {
+        let focus = sample_focus();
+        let mut focus = focus;
+        focus.window_title = Arc::new(format!("build-{title_suffix}"));
+        bus.publish_basic(
+            ActivityState::Active,
+            Some(focus),
+            None,
+            SnapshotCounts {
+                signals_seen: 1,
+                hints_seen: 2,
+                records_emitted: 3,
+            },
+            500,
+            "tick".into(),
+            None,
+            StorageInfo {
+                backlog_count: 0,
+                last_flush_at: None,
+            },
+            ConfigSummary::default(),
+            vec!["healthy".into()],
+            Vec::new(),
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_handler_returns_latest_state() {
+        let bus = Arc::new(SnapshotBus::new());
+        publish_sample(&bus, "initial");
+
+        let Json(payload) = snapshot_handler(State(Arc::clone(&bus))).await;
+        assert_eq!(payload.activity_state, ActivityState::Active);
+        let focus = payload.focus.expect("focus exists");
+        assert_eq!(*focus.window_title, "build-initial");
+        assert_eq!(payload.counts.records_emitted, 3);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn stream_handler_emits_initial_and_follow_up_events() {
+        let bus = Arc::new(SnapshotBus::new());
+        publish_sample(&bus, "initial");
+
+        let sse = stream_handler(State(Arc::clone(&bus))).await;
+        let response = sse.into_response();
+        let headers = response.headers();
+        assert_eq!(
+            headers.get("content-type").map(|v| v.to_str().unwrap()),
+            Some("text/event-stream"),
+        );
+        assert_eq!(
+            headers.get("cache-control").map(|v| v.to_str().unwrap()),
+            Some("no-cache"),
+        );
+
+        publish_sample(&bus, "next");
+        let current_focus = bus.snapshot().focus.clone().expect("bus focus");
+        assert_eq!(*current_focus.window_title, "build-next");
+    }
+}
