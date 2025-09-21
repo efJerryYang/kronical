@@ -62,6 +62,7 @@ kronical-common = { path = "crates/common" }
 kronical-core = { path = "crates/core" }
 kronical-rpc = { path = "crates/rpc" }
 kronical-storage = { path = "crates/storage" }
+hotpath = { version = "0.2", optional = true }
 
 # gRPC + HTTP API
 tonic = { version = "0.14", features = ["transport"] }
@@ -87,6 +88,14 @@ tempfile = "3.0"
 [lib]
 name = "kronical"
 path = "src/lib.rs"
+
+[features]
+default = []
+hotpath = ["dep:hotpath", "hotpath/hotpath"]
+hotpath-alloc-bytes-total = ["hotpath", "hotpath/hotpath-alloc-bytes-total"]
+hotpath-alloc-bytes-max = ["hotpath", "hotpath/hotpath-alloc-bytes-max"]
+hotpath-alloc-count-total = ["hotpath", "hotpath/hotpath-alloc-count-total"]
+hotpath-alloc-count-max = ["hotpath", "hotpath/hotpath-alloc-count-max"]
 
 [build-dependencies]
 bindgen = "0.72"
