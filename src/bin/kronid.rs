@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use kronical::daemon::coordinator::EventCoordinator;
+use kronical::daemon::snapshot::SnapshotBus;
 use kronical::storage::StorageBackend;
 use kronical::storage::duckdb::DuckDbStorage;
 use kronical::storage::sqlite3::SqliteStorage;
@@ -7,6 +8,7 @@ use kronical::util::config::AppConfig;
 use kronical::util::config::DatabaseBackendConfig;
 use log::{error, info};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
@@ -181,9 +183,15 @@ fn main() {
 
     info!("Starting Kronical daemon (kronid)");
 
+    let snapshot_bus = Arc::new(SnapshotBus::new());
+
     let data_store: Box<dyn StorageBackend> = match config.db_backend {
         DatabaseBackendConfig::Duckdb => {
-            match DuckDbStorage::new_with_limit(&data_file, config.duckdb_memory_limit_mb_main) {
+            match DuckDbStorage::new_with_limit(
+                &data_file,
+                config.duckdb_memory_limit_mb_main,
+                Arc::clone(&snapshot_bus),
+            ) {
                 Ok(s) => Box::new(s),
                 Err(e) => {
                     error!("Failed to initialize DuckDB store: {}", e);
@@ -191,7 +199,10 @@ fn main() {
                 }
             }
         }
-        DatabaseBackendConfig::Sqlite3 => match SqliteStorage::new(&data_file) {
+        DatabaseBackendConfig::Sqlite3 => match SqliteStorage::new(
+            &data_file,
+            Arc::clone(&snapshot_bus),
+        ) {
             Ok(s) => Box::new(s),
             Err(e) => {
                 error!("Failed to initialize SQLite store: {}", e);
@@ -221,7 +232,11 @@ fn main() {
     );
 
     info!("Kronical daemon will run on MAIN THREAD (required by macOS hooks)");
-    let result = coordinator.start_main_thread(data_store, config.workspace_dir.clone());
+    let result = coordinator.start_main_thread(
+        data_store,
+        config.workspace_dir.clone(),
+        Arc::clone(&snapshot_bus),
+    );
 
     cleanup_pid_file(&pid_file);
 

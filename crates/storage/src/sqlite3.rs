@@ -1,26 +1,33 @@
-use crate::daemon::events::RawEvent;
-use crate::daemon::events::model::{
-    EventEnvelope, EventKind, EventPayload, EventSource, HintKind, SignalKind,
-};
-use crate::daemon::records::ActivityRecord;
-use crate::storage::{StorageBackend, StorageCommand, dec_backlog, inc_backlog, set_last_flush};
+use crate::{StorageBackend, StorageCommand, dec_backlog, inc_backlog, set_last_flush};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
-use duckdb::{Connection, params};
+use rusqlite::{Connection, params};
 use serde_json;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::thread;
 
-pub struct DuckDbStorage {
+use kronical_core::compression::CompactEvent;
+use kronical_core::events::RawEvent;
+use kronical_core::events::model::{
+    EventEnvelope, EventKind, EventPayload, EventSource, HintKind, SignalKind,
+};
+use kronical_core::records::{ActivityRecord, ActivityState};
+use kronical_core::snapshot;
+
+// Uses shared StorageCommand from crate::storage
+
+pub struct SqliteStorage {
     db_path: PathBuf,
     sender: mpsc::Sender<StorageCommand>,
     writer_thread: Option<thread::JoinHandle<()>>,
-    memory_limit_mb: Option<u64>,
 }
 
-impl DuckDbStorage {
-    pub fn new<P: AsRef<Path>>(db_path: P) -> Result<Self> {
+impl SqliteStorage {
+    pub fn new<P: AsRef<Path>>(
+        db_path: P,
+        snapshot_bus: Arc<snapshot::SnapshotBus>,
+    ) -> Result<Self> {
         let db_path = db_path.as_ref().to_path_buf();
 
         if let Some(parent) = db_path.parent() {
@@ -34,140 +41,93 @@ impl DuckDbStorage {
         let (sender, receiver) = mpsc::channel();
 
         let db_path_clone = db_path.clone();
+        let bus_for_writer = Arc::clone(&snapshot_bus);
         let writer_thread = thread::spawn(move || {
-            Self::background_writer(db_path_clone, receiver);
+            Self::background_writer(db_path_clone, receiver, bus_for_writer);
         });
 
         Ok(Self {
             db_path,
             sender,
             writer_thread: Some(writer_thread),
-            memory_limit_mb: None,
-        })
-    }
-
-    pub fn new_with_limit<P: AsRef<Path>>(db_path: P, limit_mb: u64) -> Result<Self> {
-        let db_path = db_path.as_ref().to_path_buf();
-
-        if let Some(parent) = db_path.parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("Failed to create directory: {:?}", parent))?;
-        }
-
-        let conn = Connection::open(&db_path)?;
-        // Apply memory limit for this connection.
-        let _ = conn.execute_batch(&format!(
-            "PRAGMA memory_limit='{}MB'; PRAGMA threads=2;",
-            limit_mb
-        ));
-        Self::init_db(&conn)?;
-
-        let (sender, receiver) = mpsc::channel();
-
-        let db_path_clone = db_path.clone();
-        let writer_thread = thread::spawn(move || {
-            let conn =
-                Connection::open(&db_path_clone).expect("Failed to open DB in writer thread");
-            // Apply memory limit for the writer connection as well.
-            let _ = conn.execute_batch(&format!(
-                "PRAGMA memory_limit='{}MB'; PRAGMA threads=2;",
-                limit_mb
-            ));
-            // Hand off to a helper that assumes an initialized connection
-            Self::background_writer_with_conn(conn, receiver);
-        });
-
-        Ok(Self {
-            db_path,
-            sender,
-            writer_thread: Some(writer_thread),
-            memory_limit_mb: Some(limit_mb),
         })
     }
 
     fn init_db(conn: &Connection) -> Result<()> {
+        conn.pragma_update(None, "journal_mode", "WAL")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")?;
+        conn.pragma_update(None, "cache_size", -4000)?;
+
         conn.execute_batch(
-            r"CREATE TABLE IF NOT EXISTS raw_events (
-                id BIGINT,
-                timestamp TIMESTAMPTZ NOT NULL,
+            "CREATE TABLE IF NOT EXISTS raw_events (
+                id INTEGER PRIMARY KEY,
+                timestamp TEXT NOT NULL,
                 event_type TEXT NOT NULL,
                 data TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_raw_events_timestamp ON raw_events(timestamp);
             CREATE TABLE IF NOT EXISTS raw_envelopes (
-                id BIGINT,
-                event_id BIGINT,
-                timestamp TIMESTAMPTZ NOT NULL,
+                id INTEGER PRIMARY KEY,
+                event_id INTEGER,
+                timestamp TEXT NOT NULL,
                 source TEXT NOT NULL,
                 kind TEXT NOT NULL,
                 payload TEXT,
-                derived BOOLEAN NOT NULL,
-                polling BOOLEAN NOT NULL,
-                sensitive BOOLEAN NOT NULL
+                derived INTEGER NOT NULL,
+                polling INTEGER NOT NULL,
+                sensitive INTEGER NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_raw_envelopes_timestamp ON raw_envelopes(timestamp);
             CREATE TABLE IF NOT EXISTS activity_records (
-                id BIGINT,
-                start_time TIMESTAMPTZ NOT NULL,
-                end_time TIMESTAMPTZ,
+                id INTEGER PRIMARY KEY,
+                start_time TEXT NOT NULL,
+                end_time TEXT,
                 state TEXT NOT NULL,
                 focus_info TEXT
             );
             CREATE TABLE IF NOT EXISTS compact_events (
-                start_time TIMESTAMPTZ NOT NULL,
-                end_time TIMESTAMPTZ NOT NULL,
+                start_time TEXT NOT NULL,
+                end_time TEXT NOT NULL,
                 kind TEXT NOT NULL,
                 payload TEXT,
                 raw_event_ids TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_compact_events_start_time ON compact_events(start_time);
-            CREATE INDEX IF NOT EXISTS idx_activity_records_start_time ON activity_records(start_time);
-            ",
+            CREATE INDEX IF NOT EXISTS idx_activity_records_start_time ON activity_records(start_time);"
         )?;
         Ok(())
     }
 
-    fn background_writer(db_path: PathBuf, receiver: mpsc::Receiver<StorageCommand>) {
-        let conn = Connection::open(&db_path).expect("Failed to open DB in writer thread");
-        Self::background_writer_with_conn(conn, receiver)
-    }
+    fn background_writer(
+        db_path: PathBuf,
+        receiver: mpsc::Receiver<StorageCommand>,
+        snapshot_bus: Arc<snapshot::SnapshotBus>,
+    ) {
+        let mut conn = Connection::open(&db_path).expect("Failed to open DB in writer thread");
+        let mut tx = conn.transaction().expect("Failed to start transaction");
+        let mut count = 0;
 
-    fn background_writer_with_conn(conn: Connection, receiver: mpsc::Receiver<StorageCommand>) {
-        let mut count: usize = 0;
-        conn.execute_batch("BEGIN TRANSACTION;")
-            .expect("Failed to start transaction");
-
-        loop {
-            let result = match receiver.recv() {
-                Ok(StorageCommand::RawEvent(event)) => {
+        for command in receiver.iter() {
+            let result = match command {
+                StorageCommand::RawEvent(event) => {
                     let data = serde_json::to_string(&event).unwrap();
-                    let mut stmt = conn
-                        .prepare(
-                            "INSERT INTO raw_events (timestamp, event_type, data) VALUES (?, ?, ?)",
-                        )
-                        .expect("prepare failed");
-                    stmt.execute(params![
-                        event.timestamp().clone(),
-                        event.event_type().to_string(),
-                        data
-                    ])
+                    tx.execute(
+                        "INSERT INTO raw_events (timestamp, event_type, data) VALUES (?, ?, ?)",
+                        params![
+                            event.timestamp().to_rfc3339(),
+                            event.event_type().to_string(),
+                            data
+                        ],
+                    )
                 }
-                Ok(StorageCommand::Record(record)) => {
+                StorageCommand::Record(record) => {
                     let focus_info_json = record
                         .focus_info
                         .as_ref()
                         .map(|fi| serde_json::to_string(fi).unwrap());
-                    let mut stmt = conn
-                        .prepare("INSERT INTO activity_records (start_time, end_time, state, focus_info) VALUES (?, ?, ?, ?)")
-                        .expect("prepare failed");
-                    stmt.execute(params![
-                        record.start_time,
-                        record.end_time,
-                        format!("{:?}", record.state),
-                        focus_info_json
-                    ])
+                    tx.execute("INSERT INTO activity_records (start_time, end_time, state, focus_info) VALUES (?, ?, ?, ?)", params![record.start_time.to_rfc3339(), record.end_time.map(|t| t.to_rfc3339()), format!("{:?}", record.state), focus_info_json])
                 }
-                Ok(StorageCommand::Envelope(env)) => {
+                StorageCommand::Envelope(env) => {
                     let source = match env.source {
                         EventSource::Hook => "hook",
                         EventSource::Derived => "derived",
@@ -206,108 +166,92 @@ impl DuckDbStorage {
                         }
                         EventPayload::None => None,
                     };
-                    let mut stmt = conn
-                        .prepare("INSERT INTO raw_envelopes (event_id, timestamp, source, kind, payload, derived, polling, sensitive) VALUES (?, ?, ?, ?, ?, ?, ?, ?)")
-                        .expect("prepare failed");
-                    stmt.execute(params![
-                        env.id as i64,
-                        env.timestamp,
-                        source,
-                        kind,
-                        payload_json,
-                        env.derived,
-                        env.polling,
-                        env.sensitive,
-                    ])
+                    tx.execute(
+                        "INSERT INTO raw_envelopes (event_id, timestamp, source, kind, payload, derived, polling, sensitive) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                        params![
+                            env.id as i64,
+                            env.timestamp.to_rfc3339(),
+                            source,
+                            kind,
+                            payload_json,
+                            if env.derived { 1 } else { 0 },
+                            if env.polling { 1 } else { 0 },
+                            if env.sensitive { 1 } else { 0 },
+                        ],
+                    )
                 }
-                Ok(StorageCommand::CompactEvents(events)) => {
+                StorageCommand::CompactEvents(events) => {
+                    let mut last_res: rusqlite::Result<usize> = Ok(0);
                     for ce in events.into_iter() {
-                        use crate::daemon::compressor::CompactEvent as CE;
-                        match ce {
-                            CE::Scroll(s) => {
-                                let _ = conn.execute(
-                                    "INSERT INTO compact_events (start_time, end_time, kind, payload, raw_event_ids) VALUES (?, ?, ?, ?, ?)",
-                                    params![
-                                        s.start_time,
-                                        s.end_time,
-                                        "compact:scroll",
-                                        serde_json::to_string(&s).ok(),
-                                        serde_json::to_string(&s.raw_event_ids).unwrap_or("[]".to_string()),
-                                    ],
-                                );
-                            }
-                            CE::MouseTrajectory(t) => {
-                                let _ = conn.execute(
-                                    "INSERT INTO compact_events (start_time, end_time, kind, payload, raw_event_ids) VALUES (?, ?, ?, ?, ?)",
-                                    params![
-                                        t.start_time,
-                                        t.end_time,
-                                        "compact:mouse_traj",
-                                        serde_json::to_string(&t).ok(),
-                                        serde_json::to_string(&t.raw_event_ids).unwrap_or("[]".to_string()),
-                                    ],
-                                );
-                            }
-                            CE::Keyboard(k) => {
-                                let _ = conn.execute(
-                                    "INSERT INTO compact_events (start_time, end_time, kind, payload, raw_event_ids) VALUES (?, ?, ?, ?, ?)",
-                                    params![
-                                        k.start_time,
-                                        k.end_time,
-                                        "compact:keyboard",
-                                        serde_json::to_string(&k).ok(),
-                                        serde_json::to_string(&k.raw_event_ids).unwrap_or("[]".to_string()),
-                                    ],
-                                );
-                            }
-                            CE::Focus(f) => {
-                                let _ = conn.execute(
-                                    "INSERT INTO compact_events (start_time, end_time, kind, payload, raw_event_ids) VALUES (?, ?, ?, ?, ?)",
-                                    params![
-                                        f.timestamp,
-                                        f.timestamp,
-                                        "compact:focus",
-                                        serde_json::to_string(&f).ok(),
-                                        serde_json::to_string(&vec![f.event_id]).unwrap_or("[]".to_string()),
-                                    ],
-                                );
-                            }
+                        let (start_time, end_time, kind_s, payload_js, raw_ids_js) = match &ce {
+                            CompactEvent::Scroll(s) => (
+                                s.start_time.to_rfc3339(),
+                                s.end_time.to_rfc3339(),
+                                "compact:scroll".to_string(),
+                                serde_json::to_string(&s).ok(),
+                                serde_json::to_string(&s.raw_event_ids).unwrap_or("[]".to_string()),
+                            ),
+                            CompactEvent::MouseTrajectory(t) => (
+                                t.start_time.to_rfc3339(),
+                                t.end_time.to_rfc3339(),
+                                "compact:mouse_traj".to_string(),
+                                serde_json::to_string(&t).ok(),
+                                serde_json::to_string(&t.raw_event_ids).unwrap_or("[]".to_string()),
+                            ),
+                            CompactEvent::Keyboard(k) => (
+                                k.start_time.to_rfc3339(),
+                                k.end_time.to_rfc3339(),
+                                "compact:keyboard".to_string(),
+                                serde_json::to_string(&k).ok(),
+                                serde_json::to_string(&k.raw_event_ids).unwrap_or("[]".to_string()),
+                            ),
+                            CompactEvent::Focus(f) => (
+                                f.timestamp.to_rfc3339(),
+                                f.timestamp.to_rfc3339(),
+                                "compact:focus".to_string(),
+                                serde_json::to_string(&f).ok(),
+                                serde_json::to_string(&vec![f.event_id])
+                                    .unwrap_or("[]".to_string()),
+                            ),
+                        };
+                        last_res = tx.execute(
+                            "INSERT INTO compact_events (start_time, end_time, kind, payload, raw_event_ids) VALUES (?, ?, ?, ?, ?)",
+                            params![start_time, end_time, kind_s, payload_js, raw_ids_js],
+                        );
+                        if last_res.is_err() {
+                            break;
                         }
                     }
-                    Ok(1)
+                    last_res
                 }
-                Ok(StorageCommand::Shutdown) => break,
-                Err(_) => break,
+                StorageCommand::Shutdown => break,
             };
 
             if let Err(e) = result {
-                eprintln!("Failed to write to DuckDB: {}", e);
-                // If a statement fails inside a transaction, DuckDB aborts the transaction.
-                // Roll back and start a new transaction to clear the aborted state.
-                let _ = conn.execute_batch("ROLLBACK; BEGIN TRANSACTION;");
-                crate::daemon::snapshot::push_health(format!("duckdb write error: {}", e));
+                eprintln!("Failed to write to DB: {}", e);
+                snapshot_bus.push_health(format!("db write error: {}", e));
             }
 
             count += 1;
             if count % 100 == 0 {
-                if let Err(e) = conn.execute_batch("COMMIT; BEGIN TRANSACTION;") {
-                    eprintln!("Failed to commit DuckDB transaction: {}", e);
-                    crate::daemon::snapshot::push_health(format!("duckdb commit error: {}", e));
+                if let Err(e) = tx.commit() {
+                    eprintln!("Failed to commit transaction: {}", e);
+                    snapshot_bus.push_health(format!("db commit error: {}", e));
                 }
                 set_last_flush(Utc::now());
+                tx = conn.transaction().expect("Failed to start new transaction");
             }
             dec_backlog();
         }
-
-        if let Err(e) = conn.execute_batch("COMMIT;") {
-            eprintln!("Final DuckDB commit error: {}", e);
-            crate::daemon::snapshot::push_health(format!("duckdb final commit error: {}", e));
+        if let Err(e) = tx.commit() {
+            eprintln!("Final commit error: {}", e);
+            snapshot_bus.push_health(format!("db final commit error: {}", e));
         }
         set_last_flush(Utc::now());
     }
 }
 
-impl StorageBackend for DuckDbStorage {
+impl StorageBackend for SqliteStorage {
     fn add_events(&mut self, events: Vec<RawEvent>) -> Result<()> {
         for event in events {
             self.sender
@@ -328,10 +272,7 @@ impl StorageBackend for DuckDbStorage {
         Ok(())
     }
 
-    fn add_compact_events(
-        &mut self,
-        events: Vec<crate::daemon::compressor::CompactEvent>,
-    ) -> Result<()> {
+    fn add_compact_events(&mut self, events: Vec<CompactEvent>) -> Result<()> {
         if events.is_empty() {
             return Ok(());
         }
@@ -354,35 +295,45 @@ impl StorageBackend for DuckDbStorage {
 
     fn fetch_records_since(&mut self, since: DateTime<Utc>) -> Result<Vec<ActivityRecord>> {
         let conn = Connection::open(&self.db_path)?;
-        if let Some(mb) = self.memory_limit_mb {
-            let _ = conn.execute_batch(&format!(
-                "PRAGMA memory_limit='{}MB'; PRAGMA threads=2;",
-                mb
-            ));
-        }
+        // Include records that have not ended or ended after 'since'.
         let mut stmt = conn.prepare(
             "SELECT id, start_time, end_time, state, focus_info
              FROM activity_records
-             WHERE (end_time IS NULL OR end_time >= ?)
+             WHERE (end_time IS NULL OR end_time >= ?1)
              ORDER BY start_time ASC",
         )?;
 
-        let mut rows = stmt.query([since])?;
+        let mut rows = stmt.query([since.to_rfc3339()])?;
         let mut out: Vec<ActivityRecord> = Vec::new();
 
         while let Some(row) = rows.next()? {
-            let id: Option<i64> = row.get(0)?;
-            let start_time: DateTime<Utc> = row.get(1)?;
-            let end_time: Option<DateTime<Utc>> = row.get(2)?;
+            let id: i64 = row.get(0)?;
+            let start_s: String = row.get(1)?;
+            let end_s: Option<String> = row.get(2)?;
             let state_s: String = row.get(3)?;
             let focus_json: Option<String> = row.get(4)?;
 
+            let start_time = DateTime::parse_from_rfc3339(&start_s)
+                .map(|dt| dt.with_timezone(&Utc))
+                .context("Invalid start_time in DB")?;
+            let end_time = match end_s {
+                Some(s) => Some(
+                    DateTime::parse_from_rfc3339(&s)
+                        .map(|dt| dt.with_timezone(&Utc))
+                        .context("Invalid end_time in DB")?,
+                ),
+                None => None,
+            };
+
             let state = match state_s.as_str() {
-                "Active" => crate::daemon::records::ActivityState::Active,
-                "Passive" => crate::daemon::records::ActivityState::Passive,
-                "Inactive" => crate::daemon::records::ActivityState::Inactive,
-                "Locked" => crate::daemon::records::ActivityState::Locked,
-                _ => crate::daemon::records::ActivityState::Inactive,
+                "Active" => ActivityState::Active,
+                "Passive" => ActivityState::Passive,
+                "Inactive" => ActivityState::Inactive,
+                "Locked" => ActivityState::Locked,
+                other => {
+                    eprintln!("Unknown state in DB: {}", other);
+                    ActivityState::Inactive
+                }
             };
 
             let focus_info = match focus_json {
@@ -391,7 +342,7 @@ impl StorageBackend for DuckDbStorage {
             };
 
             out.push(ActivityRecord {
-                record_id: id.unwrap_or_default() as u64,
+                record_id: id as u64,
                 start_time,
                 end_time,
                 state,
@@ -410,35 +361,33 @@ impl StorageBackend for DuckDbStorage {
         until: DateTime<Utc>,
     ) -> Result<Vec<EventEnvelope>> {
         let conn = Connection::open(&self.db_path)?;
-        if let Some(mb) = self.memory_limit_mb {
-            let _ = conn.execute_batch(&format!(
-                "PRAGMA memory_limit='{}MB'; PRAGMA threads=2;",
-                mb
-            ));
-        }
         let mut stmt = conn.prepare(
             "SELECT event_id, timestamp, source, kind, payload, derived, polling, sensitive
              FROM raw_envelopes
-             WHERE timestamp >= ? AND timestamp <= ?
+             WHERE timestamp >= ?1 AND timestamp <= ?2
              ORDER BY timestamp ASC",
         )?;
-        let mut rows = stmt.query(params![since, until])?;
+        let mut rows = stmt.query([since.to_rfc3339(), until.to_rfc3339()])?;
         let mut out: Vec<EventEnvelope> = Vec::new();
         while let Some(row) = rows.next()? {
             let event_id: Option<i64> = row.get(0)?;
-            let timestamp: DateTime<Utc> = row.get(1)?;
+            let ts_s: String = row.get(1)?;
             let source_s: String = row.get(2)?;
             let kind_s: String = row.get(3)?;
             let payload_s: Option<String> = row.get(4)?;
-            let derived_b: bool = row.get(5)?;
-            let polling_b: bool = row.get(6)?;
-            let sensitive_b: bool = row.get(7)?;
+            let derived_i: i64 = row.get(5)?;
+            let polling_i: i64 = row.get(6)?;
+            let sensitive_i: i64 = row.get(7)?;
 
+            let timestamp = DateTime::parse_from_rfc3339(&ts_s).map(|dt| dt.with_timezone(&Utc))?;
             let source = match source_s.as_str() {
                 "hook" => EventSource::Hook,
                 "derived" => EventSource::Derived,
                 "polling" => EventSource::Polling,
-                _ => EventSource::Hook,
+                other => {
+                    eprintln!("Unknown envelope source: {}", other);
+                    EventSource::Hook
+                }
             };
             let kind = if kind_s.starts_with("signal:") {
                 let k = &kind_s[7..];
@@ -477,9 +426,11 @@ impl StorageBackend for DuckDbStorage {
                     .map(EventPayload::Mouse)
                     .unwrap_or(EventPayload::None),
                 (EventKind::Signal(_), Some(js)) | (EventKind::Hint(_), Some(js)) => {
+                    // Focus, Lock or Title tuples
                     if kind_s.contains("lock") {
                         EventPayload::Lock { reason: js }
                     } else if kind_s.contains("title") {
+                        // stored as tuple (window_id, title)
                         match serde_json::from_str::<(u32, String)>(&js) {
                             Ok((wid, title)) => EventPayload::Title {
                                 window_id: wid,
@@ -490,13 +441,12 @@ impl StorageBackend for DuckDbStorage {
                     } else if kind_s.contains("state_changed") {
                         match serde_json::from_str::<(String, String)>(&js) {
                             Ok((from_s, to_s)) => {
-                                use crate::daemon::records::ActivityState as S;
                                 let parse = |s: &str| match s {
-                                    "Active" => S::Active,
-                                    "Passive" => S::Passive,
-                                    "Inactive" => S::Inactive,
-                                    "Locked" => S::Locked,
-                                    _ => S::Inactive,
+                                    "Active" => ActivityState::Active,
+                                    "Passive" => ActivityState::Passive,
+                                    "Inactive" => ActivityState::Inactive,
+                                    "Locked" => ActivityState::Locked,
+                                    _ => ActivityState::Inactive,
                                 };
                                 EventPayload::State {
                                     from: parse(&from_s),
@@ -520,16 +470,16 @@ impl StorageBackend for DuckDbStorage {
                 source,
                 kind,
                 payload,
-                derived: derived_b,
-                polling: polling_b,
-                sensitive: sensitive_b,
+                derived: derived_i != 0,
+                polling: polling_i != 0,
+                sensitive: sensitive_i != 0,
             });
         }
         Ok(out)
     }
 }
 
-impl Drop for DuckDbStorage {
+impl Drop for SqliteStorage {
     fn drop(&mut self) {
         let _ = self.sender.send(StorageCommand::Shutdown);
         if let Some(thread) = self.writer_thread.take() {

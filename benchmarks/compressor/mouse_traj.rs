@@ -2,8 +2,8 @@
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use clap::{ArgAction, Parser, ValueEnum};
-use kronical::daemon::compressor::CompactMouseTrajectory;
 use kronical::daemon::events::{MouseEventData, MouseEventKind, MousePosition};
+use kronical_core::compression::CompactMouseTrajectory;
 use rusqlite as sqlite;
 use serde::Deserialize;
 use std::cmp::Ordering;

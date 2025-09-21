@@ -1,6 +1,7 @@
 use anyhow::Result;
 use log::info;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 /// Join handles for running API transports.
 pub struct ApiHandles {
@@ -10,10 +11,20 @@ pub struct ApiHandles {
 
 /// Spawn both gRPC and HTTP/SSE API servers over Unix Domain Sockets.
 /// Returns join handles for both servers when successful.
-pub fn spawn_all(grpc_uds: PathBuf, http_uds: PathBuf) -> Result<ApiHandles> {
-    let grpc = crate::daemon::server::grpc::spawn_server(grpc_uds)?;
+pub fn spawn_all(
+    grpc_uds: PathBuf,
+    http_uds: PathBuf,
+    snapshot_bus: Arc<crate::daemon::snapshot::SnapshotBus>,
+) -> Result<ApiHandles> {
+    let grpc = crate::daemon::server::grpc::spawn_server(
+        grpc_uds,
+        Arc::clone(&snapshot_bus),
+    )?;
     info!("Kroni gRPC API server started");
-    let http = crate::daemon::server::http::spawn_http_server(http_uds)?;
+    let http = crate::daemon::server::http::spawn_http_server(
+        http_uds,
+        Arc::clone(&snapshot_bus),
+    )?;
     info!("HTTP admin/SSE server started");
     Ok(ApiHandles {
         grpc: Some(grpc),

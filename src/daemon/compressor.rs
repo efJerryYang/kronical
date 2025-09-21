@@ -1,12 +1,14 @@
 use crate::daemon::events::{MousePosition, RawEvent, WheelAxis};
 use anyhow::Result;
 use chrono::{DateTime, Utc};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-pub type StringId = u16;
+use kronical_core::compression::{
+    self, CompactEvent, CompactFocusEvent, CompactKeyboardActivity, CompactMouseTrajectory,
+    CompactScrollSequence, MouseTrajectoryType, ScrollDirection, StringId,
+};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct StringInterner {
     strings: Vec<String>,
     lookup: HashMap<String, StringId>,
@@ -51,26 +53,6 @@ pub trait EventCompressor {
     fn name(&self) -> &'static str;
     fn can_compress(&self, events: &[Self::Input]) -> bool;
     fn compress(&mut self, events: Vec<Self::Input>) -> Vec<Self::Output>;
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompactScrollSequence {
-    pub start_time: DateTime<Utc>,
-    pub end_time: DateTime<Utc>,
-    pub direction: ScrollDirection,
-    pub total_amount: i32,
-    pub total_rotation: i32,
-    pub scroll_count: u32,
-    pub position: MousePosition,
-    pub raw_event_ids: Vec<u64>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub enum ScrollDirection {
-    VerticalUp,
-    VerticalDown,
-    HorizontalLeft,
-    HorizontalRight,
 }
 
 pub struct ScrollCompressor {
@@ -121,22 +103,7 @@ impl ScrollCompressor {
     }
 
     fn determine_direction(&self, signed_amount: i32, axis: WheelAxis) -> ScrollDirection {
-        match axis {
-            WheelAxis::Vertical => {
-                if signed_amount > 0 {
-                    ScrollDirection::VerticalUp
-                } else {
-                    ScrollDirection::VerticalDown
-                }
-            }
-            WheelAxis::Horizontal => {
-                if signed_amount > 0 {
-                    ScrollDirection::HorizontalRight
-                } else {
-                    ScrollDirection::HorizontalLeft
-                }
-            }
-        }
+        compression::infer_scroll_direction(signed_amount, axis)
     }
 }
 
@@ -201,25 +168,6 @@ impl EventCompressor for ScrollCompressor {
     fn name(&self) -> &'static str {
         "ScrollCompressor"
     }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompactMouseTrajectory {
-    pub start_time: DateTime<Utc>,
-    pub end_time: DateTime<Utc>,
-    pub event_type: MouseTrajectoryType,
-    pub start_position: MousePosition,
-    pub end_position: MousePosition,
-    pub simplified_path: Vec<MousePosition>,
-    pub total_distance: f32,
-    pub max_velocity: f32,
-    pub raw_event_ids: Vec<u64>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub enum MouseTrajectoryType {
-    Movement,
-    Drag,
 }
 
 pub struct MouseTrajectoryCompressor {
@@ -434,16 +382,6 @@ impl MouseTrajectoryCompressor {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompactKeyboardActivity {
-    pub start_time: DateTime<Utc>,
-    pub end_time: DateTime<Utc>,
-    pub keystrokes: u32,
-    pub keys_per_minute: f32,
-    pub density_per_sec: f32,
-    pub raw_event_ids: Vec<u64>,
-}
-
 pub struct KeyboardActivityCompressor {
     max_gap_ms: i64,
 }
@@ -547,16 +485,6 @@ impl EventCompressor for KeyboardActivityCompressor {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CompactFocusEvent {
-    pub timestamp: DateTime<Utc>,
-    pub app_name_id: StringId,
-    pub window_title_id: StringId,
-    pub pid: i32,
-    pub window_position: Option<MousePosition>,
-    pub event_id: u64,
-}
-
 pub struct FocusEventProcessor {
     string_interner: StringInterner,
 }
@@ -619,28 +547,6 @@ impl EventCompressor for FocusEventProcessor {
 
     fn name(&self) -> &'static str {
         "FocusEventProcessor"
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum CompactEvent {
-    Scroll(CompactScrollSequence),
-    MouseTrajectory(CompactMouseTrajectory),
-    Keyboard(CompactKeyboardActivity),
-    Focus(CompactFocusEvent),
-}
-
-impl CompactEvent {
-    pub fn memory_size(&self) -> usize {
-        match self {
-            CompactEvent::Scroll(_) => std::mem::size_of::<CompactScrollSequence>(),
-            CompactEvent::MouseTrajectory(t) => {
-                std::mem::size_of::<CompactMouseTrajectory>()
-                    + (t.simplified_path.len() * std::mem::size_of::<MousePosition>())
-            }
-            CompactEvent::Keyboard(_) => std::mem::size_of::<CompactKeyboardActivity>(),
-            CompactEvent::Focus(_) => std::mem::size_of::<CompactFocusEvent>(),
-        }
     }
 }
 

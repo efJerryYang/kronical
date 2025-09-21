@@ -61,6 +61,7 @@ duckdb = { version = "1.3.2", features = [
 kronical-common = { path = "crates/common" }
 kronical-core = { path = "crates/core" }
 kronical-rpc = { path = "crates/rpc" }
+kronical-storage = { path = "crates/storage" }
 
 # gRPC + HTTP API
 tonic = { version = "0.14", features = ["transport"] }
@@ -95,6 +96,7 @@ members = [
     "crates/common",
     "crates/core",
     "crates/rpc",
+    "crates/storage",
 ]
 
 [[bin]]

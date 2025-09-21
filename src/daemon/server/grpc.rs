@@ -15,7 +15,7 @@ use once_cell::sync::OnceCell;
 use prost_types::Timestamp;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::mpsc::Sender;
+use std::sync::{Arc, mpsc::Sender};
 use tokio::net::UnixListener;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::WatchStream;
@@ -39,8 +39,16 @@ pub fn set_system_tracker_control_tx(tx: Sender<crate::daemon::tracker::ControlM
     let _ = SYSTEM_TRACKER_CONTROL_TX.set(tx);
 }
 
-#[derive(Clone, Default)]
-pub struct KroniSvc {}
+#[derive(Clone)]
+pub struct KroniSvc {
+    snapshot_bus: Arc<snapshot::SnapshotBus>,
+}
+
+impl KroniSvc {
+    pub fn new(snapshot_bus: Arc<snapshot::SnapshotBus>) -> Self {
+        Self { snapshot_bus }
+    }
+}
 
 #[tonic::async_trait]
 impl Kroni for KroniSvc {
@@ -48,7 +56,7 @@ impl Kroni for KroniSvc {
         &self,
         _req: Request<SnapshotRequest>,
     ) -> Result<Response<SnapshotReply>, Status> {
-        let s = snapshot::get_current();
+        let s = self.snapshot_bus.snapshot();
         Ok(Response::new(to_pb(&s)))
     }
 
@@ -59,7 +67,7 @@ impl Kroni for KroniSvc {
         _req: Request<WatchRequest>,
     ) -> Result<Response<Self::WatchStream>, Status> {
         // Stream updates via the snapshot watch channel
-        let rx = snapshot::watch_snapshot();
+        let rx = self.snapshot_bus.watch_snapshot();
         let stream = WatchStream::new(rx).map(|arc| Ok(to_pb(&arc)));
         Ok(Response::new(Box::pin(stream)))
     }
@@ -316,12 +324,16 @@ pub fn to_pb(s: &snapshot::Snapshot) -> SnapshotReply {
     }
 }
 
-pub fn spawn_server(uds_path: PathBuf) -> Result<std::thread::JoinHandle<()>> {
+pub fn spawn_server(
+    uds_path: PathBuf,
+    snapshot_bus: Arc<snapshot::SnapshotBus>,
+) -> Result<std::thread::JoinHandle<()>> {
     if uds_path.exists() {
         warn!("Removing stale UDS: {:?}", uds_path);
         let _ = std::fs::remove_file(&uds_path);
     }
     let (tx, rx) = std::sync::mpsc::channel();
+    let bus_for_thread = Arc::clone(&snapshot_bus);
     let handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -337,7 +349,7 @@ pub fn spawn_server(uds_path: PathBuf) -> Result<std::thread::JoinHandle<()>> {
                 std::fs::set_permissions(&uds_path, perms).expect("chmod");
             }
             let incoming = tokio_stream::wrappers::UnixListenerStream::new(uds);
-            let svc = KroniSvc::default();
+            let svc = KroniSvc::new(bus_for_thread);
             tx.send(()).ok();
             info!("kroni API listening on {:?}", uds_path);
             Server::builder()

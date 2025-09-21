@@ -2007,6 +2007,7 @@ dependencies = [
  "kronical-common",
  "kronical-core",
  "kronical-rpc",
+ "kronical-storage",
  "libc",
  "log",
  "once_cell",
@@ -2062,6 +2063,23 @@ dependencies = [
  "tonic",
  "tonic-prost",
  "tonic-prost-build",
+]
+
+[[package]]
+name = "kronical-storage"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "chrono",
+ "duckdb",
+ "kronical-core",
+ "log",
+ "once_cell",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
 ]
 
 [[package]]
