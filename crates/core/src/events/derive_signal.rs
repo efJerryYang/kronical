@@ -80,8 +80,8 @@ impl LockDeriver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{KeyboardEventData, MousePosition, WindowFocusInfo};
     use crate::events::model::HintKind;
+    use crate::events::{KeyboardEventData, MousePosition, WindowFocusInfo};
     use chrono::{TimeZone, Utc};
     use std::sync::Arc;
 

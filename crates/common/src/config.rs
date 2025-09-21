@@ -231,11 +231,7 @@ mod tests {
             let workspace_dir = dir.path().join(".kronical");
             std::fs::create_dir_all(&workspace_dir).expect("create workspace");
             let config_path = workspace_dir.join("config.toml");
-            std::fs::write(
-                &config_path,
-                "db_backend = \"duckdb\"\n",
-            )
-            .expect("write config");
+            std::fs::write(&config_path, "db_backend = \"duckdb\"\n").expect("write config");
 
             let cfg = AppConfig::load().expect("load config");
             assert_eq!(cfg.workspace_dir, workspace_dir);

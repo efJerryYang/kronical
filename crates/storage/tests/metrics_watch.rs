@@ -1,10 +1,5 @@
 use chrono::{TimeZone, Utc};
-use kronical_storage::{
-    dec_backlog,
-    inc_backlog,
-    set_last_flush,
-    storage_metrics_watch,
-};
+use kronical_storage::{dec_backlog, inc_backlog, set_last_flush, storage_metrics_watch};
 use std::sync::{Mutex, OnceLock};
 
 fn with_metrics_lock<T>(f: impl FnOnce() -> T) -> T {

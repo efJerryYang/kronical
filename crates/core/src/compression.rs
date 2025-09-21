@@ -175,7 +175,10 @@ mod tests {
             raw_event_ids: vec![10, 11],
         };
         let event = CompactEvent::Scroll(scroll.clone());
-        assert_eq!(event.memory_size(), std::mem::size_of::<CompactScrollSequence>());
+        assert_eq!(
+            event.memory_size(),
+            std::mem::size_of::<CompactScrollSequence>()
+        );
     }
 
     #[test]

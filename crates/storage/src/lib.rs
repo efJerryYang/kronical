@@ -100,12 +100,39 @@ pub mod system_metrics;
 
 #[cfg(test)]
 mod tests {
+    use super::duckdb::DuckDbStorage;
+    use super::sqlite3::SqliteStorage;
     use super::*;
-    use chrono::TimeZone;
+    use ::duckdb::Connection as DuckDbConnection;
+    use chrono::{Duration, TimeZone, Utc as ChronoUtc};
     use once_cell::sync::Lazy;
-    use std::sync::Mutex;
+    use rusqlite::Connection as SqliteConnection;
+    use std::sync::{Arc, Mutex};
+    use std::{thread, time::Duration as StdDuration};
+
+    use kronical_core::compression::{
+        CompactEvent, CompactKeyboardActivity, CompactScrollSequence, ScrollDirection,
+    };
+    use kronical_core::events::model::{
+        EventEnvelope, EventKind, EventPayload, EventSource, HintKind, SignalKind,
+    };
+    use kronical_core::events::{KeyboardEventData, MousePosition, RawEvent, WindowFocusInfo};
+    use kronical_core::records::{ActivityRecord, ActivityState};
+    use kronical_core::snapshot;
+    use tempfile::tempdir;
 
     static TEST_GUARD: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+    #[derive(Clone)]
+    struct SampleData {
+        base_ts: chrono::DateTime<chrono::Utc>,
+        focus_info: WindowFocusInfo,
+        raw_event: RawEvent,
+        keyboard_env: EventEnvelope,
+        state_env: EventEnvelope,
+        record: ActivityRecord,
+        compact_events: Vec<CompactEvent>,
+    }
 
     fn with_clean_state<F: FnOnce(watch::Receiver<StorageMetrics>)>(f: F) {
         let _lock = TEST_GUARD.lock().expect("storage test mutex poisoned");
@@ -117,6 +144,117 @@ mod tests {
         STORAGE_BACKLOG.store(0, Ordering::Relaxed);
         LAST_FLUSH_AT_EPOCH.store(0, Ordering::Relaxed);
         publish_metrics();
+    }
+
+    fn wait_until(mut predicate: impl FnMut() -> bool) -> bool {
+        for _ in 0..200 {
+            if predicate() {
+                return true;
+            }
+            thread::sleep(StdDuration::from_millis(10));
+        }
+        false
+    }
+
+    fn build_sample_data() -> SampleData {
+        let base_ts = ChronoUtc.with_ymd_and_hms(2024, 6, 1, 12, 0, 0).unwrap();
+        let focus_info = WindowFocusInfo {
+            pid: 42,
+            process_start_time: 123_456,
+            app_name: Arc::new("Chronicle".to_string()),
+            window_title: Arc::new("Coverage".to_string()),
+            window_id: 777,
+            window_instance_start: base_ts,
+            window_position: Some(MousePosition { x: 10, y: 20 }),
+            window_size: Some((1280, 720)),
+        };
+
+        let raw_event = RawEvent::KeyboardInput {
+            timestamp: base_ts,
+            event_id: 1,
+            data: KeyboardEventData {
+                key_code: Some(13),
+                key_char: Some('\n'),
+                modifiers: vec!["cmd".into()],
+            },
+        };
+
+        let keyboard_env = EventEnvelope {
+            id: 10,
+            timestamp: base_ts + Duration::seconds(1),
+            source: EventSource::Hook,
+            kind: EventKind::Signal(SignalKind::KeyboardInput),
+            payload: EventPayload::Keyboard(KeyboardEventData {
+                key_code: Some(42),
+                key_char: Some('*'),
+                modifiers: vec!["shift".into()],
+            }),
+            derived: false,
+            polling: false,
+            sensitive: false,
+        };
+
+        let state_env = EventEnvelope {
+            id: 11,
+            timestamp: base_ts + Duration::seconds(2),
+            source: EventSource::Derived,
+            kind: EventKind::Hint(HintKind::StateChanged),
+            payload: EventPayload::State {
+                from: ActivityState::Inactive,
+                to: ActivityState::Active,
+            },
+            derived: true,
+            polling: false,
+            sensitive: false,
+        };
+
+        let record = ActivityRecord {
+            record_id: 5,
+            start_time: base_ts,
+            end_time: Some(base_ts + Duration::seconds(5)),
+            state: ActivityState::Active,
+            focus_info: Some(focus_info.clone()),
+            event_count: 3,
+            triggering_events: vec![1, 2, 3],
+        };
+
+        let scroll = CompactEvent::Scroll(CompactScrollSequence {
+            start_time: base_ts,
+            end_time: base_ts + Duration::seconds(1),
+            direction: ScrollDirection::VerticalDown,
+            total_amount: -10,
+            total_rotation: -10,
+            scroll_count: 2,
+            position: MousePosition { x: 0, y: 0 },
+            raw_event_ids: vec![1],
+        });
+
+        let keyboard_compact = CompactEvent::Keyboard(CompactKeyboardActivity {
+            start_time: base_ts,
+            end_time: base_ts + Duration::seconds(1),
+            keystrokes: 4,
+            keys_per_minute: 240.0,
+            density_per_sec: 4.0,
+            raw_event_ids: vec![1],
+        });
+
+        SampleData {
+            base_ts,
+            focus_info,
+            raw_event,
+            keyboard_env,
+            state_env,
+            record,
+            compact_events: vec![scroll, keyboard_compact],
+        }
+    }
+
+    fn enqueue_sample_data<B: StorageBackend>(storage: &mut B, sample: &SampleData) -> Result<()> {
+        storage.add_events(vec![sample.raw_event.clone()])?;
+        storage.add_envelopes(vec![sample.keyboard_env.clone(), sample.state_env.clone()])?;
+        storage.add_records(vec![sample.record.clone()])?;
+        storage.add_compact_events(sample.compact_events.clone())?;
+        Ok(())
     }
 
     #[test]
@@ -162,6 +300,204 @@ mod tests {
             dec_backlog();
             assert_eq!(rx1.borrow().backlog_count, 0);
             assert_eq!(rx2.borrow().backlog_count, 0);
+        });
+    }
+
+    #[test]
+    fn duckdb_storage_persists_and_fetches_data() {
+        with_clean_state(|rx| {
+            let dir = tempdir().expect("tempdir");
+            let db_path = dir.path().join("store.duckdb");
+            let bus = Arc::new(snapshot::SnapshotBus::new());
+            let sample = build_sample_data();
+
+            let mut storage = DuckDbStorage::new(&db_path, Arc::clone(&bus)).expect("duckdb init");
+
+            assert_eq!(rx.borrow().backlog_count, 0);
+            storage
+                .add_compact_events(Vec::new())
+                .expect("empty compact events do not enqueue");
+            assert_eq!(rx.borrow().backlog_count, 0);
+
+            enqueue_sample_data(&mut storage, &sample).expect("sample data enqueued");
+
+            assert!(
+                wait_until(|| rx.borrow().backlog_count == 0),
+                "writer drained backlog"
+            );
+
+            drop(storage); // ensure commit + shutdown
+
+            assert!(wait_until(|| rx.borrow().last_flush_at.is_some()));
+            assert!(bus.current_health().is_empty());
+
+            let conn = DuckDbConnection::open(&db_path).expect("open duckdb");
+            let raw_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM raw_events", [], |row| row.get(0))
+                .expect("raw_events count");
+            assert_eq!(raw_count, 1);
+
+            let env_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM raw_envelopes", [], |row| row.get(0))
+                .expect("raw_envelopes count");
+            assert_eq!(env_count, 2);
+
+            let record_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM activity_records", [], |row| {
+                    row.get(0)
+                })
+                .expect("activity_records count");
+            assert_eq!(record_count, 1);
+
+            let compact_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM compact_events", [], |row| row.get(0))
+                .expect("compact_events count");
+            assert_eq!(compact_count, 2);
+
+            drop(conn);
+
+            let mut reader =
+                DuckDbStorage::new_with_limit(&db_path, 32, Arc::new(snapshot::SnapshotBus::new()))
+                    .expect("duckdb reader");
+
+            let since = sample.base_ts - Duration::seconds(10);
+            let records = reader
+                .fetch_records_since(since)
+                .expect("record fetch succeeds");
+            assert_eq!(records.len(), 1);
+            let fetched = &records[0];
+            assert_eq!(fetched.state, sample.record.state);
+            assert!(fetched.end_time.is_some());
+            let fetched_focus = fetched.focus_info.as_ref().expect("focus info fetched");
+            assert_eq!(fetched_focus.window_id, sample.focus_info.window_id);
+            assert_eq!(&*fetched_focus.app_name, &*sample.focus_info.app_name);
+            assert_eq!(fetched.event_count, 0);
+            assert!(fetched.triggering_events.is_empty());
+
+            let envelopes = reader
+                .fetch_envelopes_between(since, sample.base_ts + Duration::seconds(10))
+                .expect("envelope fetch succeeds");
+            assert_eq!(envelopes.len(), 2);
+
+            let mut saw_keyboard = false;
+            let mut saw_state = false;
+            for env in envelopes {
+                match env.kind {
+                    EventKind::Signal(SignalKind::KeyboardInput) => {
+                        if let EventPayload::Keyboard(data) = env.payload {
+                            assert_eq!(data.key_code, Some(42));
+                            saw_keyboard = true;
+                        }
+                    }
+                    EventKind::Hint(HintKind::StateChanged) => {
+                        if let EventPayload::State { from, to } = env.payload {
+                            assert_eq!(from, ActivityState::Inactive);
+                            assert_eq!(to, ActivityState::Active);
+                            saw_state = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            assert!(saw_keyboard && saw_state);
+
+            drop(reader);
+        });
+    }
+
+    #[test]
+    fn sqlite_storage_persists_and_fetches_data() {
+        with_clean_state(|rx| {
+            let dir = tempdir().expect("tempdir");
+            let db_path = dir.path().join("store.sqlite3");
+            let bus = Arc::new(snapshot::SnapshotBus::new());
+            let sample = build_sample_data();
+
+            let mut storage = SqliteStorage::new(&db_path, Arc::clone(&bus)).expect("sqlite init");
+            assert_eq!(rx.borrow().backlog_count, 0);
+            storage
+                .add_compact_events(Vec::new())
+                .expect("empty compact events do not enqueue");
+            assert_eq!(rx.borrow().backlog_count, 0);
+            enqueue_sample_data(&mut storage, &sample).expect("sample data enqueued");
+
+            assert!(wait_until(|| rx.borrow().backlog_count == 0));
+
+            drop(storage);
+
+            assert!(wait_until(|| rx.borrow().last_flush_at.is_some()));
+            assert!(bus.current_health().is_empty());
+
+            let conn = SqliteConnection::open(&db_path).expect("open sqlite");
+            let raw_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM raw_events", [], |row| row.get(0))
+                .expect("raw_events count");
+            assert_eq!(raw_count, 1);
+
+            let env_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM raw_envelopes", [], |row| row.get(0))
+                .expect("raw_envelopes count");
+            assert_eq!(env_count, 2);
+
+            let record_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM activity_records", [], |row| {
+                    row.get(0)
+                })
+                .expect("activity_records count");
+            assert_eq!(record_count, 1);
+
+            let compact_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM compact_events", [], |row| row.get(0))
+                .expect("compact_events count");
+            assert_eq!(compact_count, 2);
+
+            drop(conn);
+
+            let mut reader = SqliteStorage::new(&db_path, Arc::new(snapshot::SnapshotBus::new()))
+                .expect("sqlite reader");
+
+            let since = sample.base_ts - Duration::seconds(10);
+            let records = reader
+                .fetch_records_since(since)
+                .expect("record fetch succeeds");
+            assert_eq!(records.len(), 1);
+            let fetched = &records[0];
+            assert_eq!(fetched.state, sample.record.state);
+            assert!(fetched.end_time.is_some());
+            let fetched_focus = fetched.focus_info.as_ref().expect("focus info fetched");
+            assert_eq!(fetched_focus.window_id, sample.focus_info.window_id);
+            assert_eq!(&*fetched_focus.app_name, &*sample.focus_info.app_name);
+            assert_eq!(fetched.event_count, 0);
+            assert!(fetched.triggering_events.is_empty());
+
+            let envelopes = reader
+                .fetch_envelopes_between(since, sample.base_ts + Duration::seconds(10))
+                .expect("envelope fetch succeeds");
+            assert_eq!(envelopes.len(), 2);
+
+            let mut saw_keyboard = false;
+            let mut saw_state = false;
+            for env in envelopes {
+                match env.kind {
+                    EventKind::Signal(SignalKind::KeyboardInput) => {
+                        if let EventPayload::Keyboard(data) = env.payload {
+                            assert_eq!(data.key_code, Some(42));
+                            saw_keyboard = true;
+                        }
+                    }
+                    EventKind::Hint(HintKind::StateChanged) => {
+                        if let EventPayload::State { from, to } = env.payload {
+                            assert_eq!(from, ActivityState::Inactive);
+                            assert_eq!(to, ActivityState::Active);
+                            saw_state = true;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            assert!(saw_keyboard && saw_state);
+
+            drop(reader);
         });
     }
 }

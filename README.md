@@ -1,154 +1,129 @@
 # Kronical
 
-Activity tracking daemon (kronid) with dual-stream pattern, channel‑based workers, and explicit state transitions. The workspace is structured so service code can stabilise while Kronii (planned UI agent) consumes the same APIs without depending on daemon internals.
+Kronical is a local activity-tracking service. The daemon (`kronid`) observes
+system hooks, derives higher-level signals, and writes activity records that
+other clients (current CLI, future Kronii UI agent) can consume over HTTP/gRPC.
+
+This repository focuses on the service side: hook ingestion, signal-driven
+state machine, compression, and storage backends. The UI layer is being built
+separately and links to the public crates exposed here.
+
+## Architecture Snapshot
+
+- **Coordinator (`src/daemon/coordinator.rs`)** – runs on the macOS main thread
+  and owns global hook handlers. It converts raw inputs into `KronicalEvent`
+  messages and pushes them into the pipeline channels.
+- **Pipeline (`src/daemon/pipeline.rs`)** – workers communicate exclusively via
+  `std::sync::mpsc` channels (ingest → derive → record → persist). This keeps
+  the signal-driven state machine deterministic without shared locks.
+- **Core crate (`crates/core/`)** – domain types and logic: event envelopes,
+  signal/hint derivation, record aggregation, compression, and snapshot bus.
+- **Common crate (`crates/common/`)** – shared helpers (config loader, path
+  utilities, LRU + interner).
+- **Storage crate (`crates/storage/`)** – storage facade plus DuckDB/SQLite
+  writer threads that drain persistence commands and publish health metrics via
+  the snapshot bus.
+- **Binaries (`src/bin/`)** – `kronid` wires everything together; `kronictl`
+  offers CLI access for lifecycle and data inspection.
+
+When onboarding, start with the coordinator to understand how hooks are
+normalized. From there follow the channel hand-offs into `crates/core::events`
+for derivation, `crates/core::records` for aggregation, and the storage crate to
+see how data lands on disk.
 
 ## Repository Layout
 
-- `crates/common/`: shared utilities (config loading, paths, LRU/ interner helpers) used by every service component.
-- `crates/core/`: domain logic—event envelopes, signal/hint derivation, record aggregation, compression, and snapshot bus.
-- `crates/storage/`: thin storage facade plus backend threads for DuckDB and SQLite; integration tests live in `crates/storage/tests` to exercise the public metrics APIs.
-- `src/daemon/`: runtime wiring (coordinator, pipeline, compressors, API surfaces, trackers). Channels ferry work between threads—no shared locks on hot paths.
-- `src/bin/`: binaries (`kronid`, `kronictl`); keep daemon-specific wiring here so future clients link only the crates above.
+- `crates/common/` – shared utilities.
+- `crates/core/` – domain logic and snapshot bus.
+- `crates/storage/` – storage facade plus integration tests under
+  `crates/storage/tests/`.
+- `src/daemon/` – runtime wiring: coordinator, pipeline, compressors, API
+  surfaces, trackers.
+- `src/bin/` – service binaries (`kronid`, `kronictl`).
+- `docs/` – design notes (including Kronii orchestration TODOs).
 
-When you are orienting yourself, start with `src/daemon/coordinator.rs` for the hook → envelope flow, then follow the channel handoffs into `crates/core::events`, `crates/core::records`, and the storage crate.
-
-## State Machine
-
-- States: `Active`, `Passive`, `Inactive`, `Locked`.
-- Inputs: `KeyboardInput`, `MouseInput`, `AppChanged`, `WindowChanged`, `ActivityPulse`, `LockStart`, `LockEnd`.
-- Parameters: `active_grace_secs` (default 30), `idle_threshold_secs` (default 300).
-
-State transition table (driven by signals and timeouts):
-
-- Any → `Locked` on `LockStart`
-- `Locked` → computed(`Active`/`Passive`/`Inactive`) on `LockEnd` (based on last input time)
-- `Inactive`/`Passive` → `Active` on any input signal (`KeyboardInput`/`MouseInput`/`AppChanged`/`WindowChanged`/`ActivityPulse`)
-- `Active` → `Passive` when no input for `active_grace_secs` (on tick)
-- `Passive` → `Inactive` when no input for `idle_threshold_secs` (on tick)
-
-Follow‑up envelopes generated:
-
-- `StateChanged` hint is derived for every state transition (including timer‑based ticks and lock/unlock boundaries).
-- Focus changes produce: `AppChanged` or `WindowChanged` signal, then `FocusChanged` hint, then an `ActivityPulse` signal.
-- Title changes produce `TitleChanged` hint (polling‑sourced).
-
-Notes:
-
-- While locked, raw keyboard/mouse input envelopes are suppressed from persistence; the lock/unlock signals and hints are still stored.
-- Channels are used for coordination: raw events → envelopes (+derived lock signals) → state/hint derivation → record building → storage.
-
-## Dual Streams Pattern
-
-- Events Stream: raw input/focus envelopes (signals + hints)
-- Records Stream: activity records segmented by hints (`FocusChanged`, `TitleChanged`, `StateChanged`)
-
-## Commands
+## Getting Started
 
 ```bash
-# Daemon control
-kronictl start                    # Start kronid daemon
-kronictl status                   # Check daemon status
-kronictl stop                     # Stop daemon
-kronictl restart                  # Restart daemon
-
-# Monitoring and data access
-kronictl snapshot                 # Get current snapshot
-kronictl snapshot --pretty        # Get formatted snapshot
-kronictl watch                    # Watch for changes
-kronictl watch --pretty           # Watch with pretty output
-kronictl monitor                  # Live TUI (press 'q' to quit)
-
-# System tracking (when enabled in config)
-kronictl tracker status           # Show tracker status
-kronictl tracker show             # Show tracker data
-kronictl tracker show --watch     # Follow tracker updates
+cargo build --release
+./target/release/kronid         # launches the daemon
+./target/release/kronictl help  # CLI overview
 ```
 
-## Testing & Coverage
+`kronid` requires macOS Accessibility + Screen Recording permissions to capture
+input events and window titles. Without them the daemon will exit early or
+return empty focus data.
 
-- Unit tests live alongside the crates; prefer running focused suites (`cargo test -p kronical-core`, `cargo test -p kronical-storage`, etc.) so failures stay scoped. Integration checks that touch multiple crates now live under each crate's `tests/` directory (for example, storage metrics coverage sits in `crates/storage/tests/metrics_watch.rs`).
-- Tests should assert observable behaviour (state transitions, channel hand-offs, storage updates) rather than tautological checks.
-- Run `make coverage` to execute the workspace under `cargo llvm-cov`. The task emits:
-  - `coverage/summary.txt`: plain-text summary also echoed to the terminal.
-  - `coverage/html/`: full HTML report for local inspection.
-- Coverage uploads use the Codecov integration referenced by the badge above; ensure `make coverage` passes before pushing so CI can report accurate deltas.
+### Useful `kronictl` commands
 
-## Permissions (macOS)
+- `kronictl start|stop|status|restart` – daemon lifecycle.
+- `kronictl snapshot [--pretty]` – fetch the latest snapshot via HTTP.
+- `kronictl watch [--pretty]` – follow snapshot updates (SSE).
+- `kronictl monitor` – interactive terminal UI (press `q` to quit).
+- `kronictl tracker show [--watch]` – inspect system-tracker metrics when the
+  tracker is enabled in config.
 
-- **Accessibility**: Required for input hooks and window tracking
-- **Screen Recording**: Required for window titles
+## State Machine & Signals
 
-Without these, kronid will abort at launch or show empty titles.
+The event pipeline produces a deterministic state machine driven by signals:
 
-## Storage
+- States: `Active`, `Passive`, `Inactive`, `Locked`.
+- Signals: keyboard/mouse input, focus/title changes, lock/unlock, periodic
+  pulses.
+- Transitions respect `active_grace_secs` (default 30s) and
+  `idle_threshold_secs` (default 300s) to move between states. While the system
+  is locked we keep emitting lock/unlock signals but suppress raw input writes.
 
-- Backends: DuckDB (default) and SQLite3. Both use the same logical schema.
-- Tables (SQLite3 DDL):
-  - `raw_events(id INTEGER PRIMARY KEY, timestamp TEXT, event_type TEXT, data TEXT)`
-  - `raw_envelopes(id INTEGER PRIMARY KEY, event_id INTEGER, timestamp TEXT, source TEXT, kind TEXT, payload TEXT, derived INTEGER, polling INTEGER, sensitive INTEGER)`
-  - `activity_records(id INTEGER PRIMARY KEY, start_time TEXT, end_time TEXT NULL, state TEXT, focus_info TEXT NULL)`
-  - `compact_events(start_time TEXT, end_time TEXT, kind TEXT, payload TEXT, raw_event_ids TEXT)`
-- Indexes: `idx_raw_events_timestamp` on `raw_events(timestamp)`, `idx_raw_envelopes_timestamp` on `raw_envelopes(timestamp)`, `idx_activity_records_start_time` on `activity_records(start_time)`.
-
-Payload formats (stored as JSON):
-
-- `raw_events.data`: serialized `RawEvent` (`keyboard`, `mouse`, `window_focus_change`). For mouse wheel events, includes `wheel_amount`, `wheel_rotation`, `wheel_axis`.
-- `raw_envelopes.payload`:
-  - `Focus` and other structs: serialized JSON object
-  - `TitleChanged`: JSON tuple `(window_id, title)`
-  - `StateChanged`: JSON tuple `(from_state, to_state)` as strings
-  - `Lock*`: JSON string `reason`
-- `compact_events.payload`: serialized compact event struct (by kind) including summary metrics; `raw_event_ids` stores JSON array of contributing raw `event_id`s for alignment.
+Hints derived from signals (`FocusChanged`, `TitleChanged`, `StateChanged`,
+`ActivityPulse`, …) drive record generation and downstream snapshots.
 
 ## Configuration
 
-Configuration via `~/.kronical/config.toml`:
+User configuration lives at `~/.kronical/config.toml`. Every field can be
+overridden with a `KRONICAL_` environment variable (for example,
+`KRONICAL_TRACKER_ENABLED=true`). Relevant knobs include workspace paths,
+retention, state thresholds, tracker cadence, and cache sizes. See
+`crates/common/src/config.rs` for the full schema.
 
-```toml
-# Data storage location (default: ~/.kronical)
-workspace_dir = "~/.kronical"
+## Storage Backends
 
-# Data retention period in minutes (default: 4320 = 72 hours)
-retention_minutes = 4320
-
-# State transition timeouts
-active_grace_secs = 30              # Active to passive timeout
-idle_threshold_secs = 300           # Passive to inactive timeout
-
-# System metrics tracking
-tracker_enabled = false             # Enable system tracking
-tracker_interval_secs = 1.0         # Collection interval
-tracker_batch_size = 60             # Batch size for storage
-tracker_refresh_secs = 1.0          # UI refresh rate
-
-# Performance tuning
-ephemeral_max_duration_secs = 60    # Max ephemeral window duration
-ephemeral_min_distinct_ids = 3      # Min distinct windows for persistence
-max_windows_per_app = 30            # Max tracked windows per app
-pid_cache_capacity = 1024           # Process ID cache size
-title_cache_capacity = 512          # Window title cache size
-focus_interner_max_strings = 4096   # String interning capacity
-```
-
-Environment variables supported with `KRONICAL_` prefix (e.g., `KRONICAL_TRACKER_ENABLED=true`).
+DuckDB is the default backend; SQLite remains available for lightweight setups.
+Each backend runs in its own thread, draining persistence commands, committing
+in batches, and reporting backlog metrics via the snapshot bus. The logical
+schema is shared across engines (`raw_events`, `raw_envelopes`,
+`activity_records`, `compact_events`). Integration tests under
+`crates/storage/tests/` validate command execution, health-reporting, and data
+round trips.
 
 ## Compression
 
-- Current status: compressed events are persisted to `compact_events` with alignment to source raw events.
-- Engine: combines specialized compressors for scroll, mouse trajectories, keyboard, and focus.
-- Outputs:
-  - `Scroll`: CompactScrollSequence with `start/end`, direction, `total_amount`, `total_rotation`, `scroll_count`, position, and `raw_event_ids`.
-  - `MouseTrajectory`: CompactMouseTrajectory for `Moved/Dragged` with `simplified_path` (Douglas–Peucker), `total_distance`, `max_velocity`, and `raw_event_ids`.
-  - `Keyboard`: CompactKeyboardActivity aggregates bursts separated by a gap (default 30s). Stores `start/end`, `keystrokes`, `keys_per_minute`, `density_per_sec`, and `raw_event_ids`.
-  - `Focus`: CompactFocusEvent with interned `app_name_id`, `window_title_id`, `pid`, optional position, single `event_id` (also stored in `raw_event_ids`).
+`crates/core::compression` converts persisted raw events into compact summary
+records. The engine maintains alignment by recording contributing raw event IDs
+alongside structured payloads for scroll bursts, mouse trajectories, keyboard
+activity, and focus transitions.
 
-Compare original vs compressed using DB data:
+## Development Workflow
 
-- The `raw_events` table contains full `RawEvent` JSON. You can load a time window, deserialize into `RawEvent`, and pass through the `CompressionEngine` to reconstruct compact sequences for analysis.
-- Example (pseudo‑flow):
-  - Query: `SELECT data FROM raw_events WHERE timestamp BETWEEN ? AND ? ORDER BY timestamp`.
-  - Deserialize rows to `RawEvent` and call `CompressionEngine::compress_events(raws)`.
-  - Inspect returned `(raws, compact_events)` to compare sequences.
-  - Or, directly query `compact_events` and join to `raw_events` via `raw_event_ids` membership for alignment.
+- Prefer crate-scoped test runs (`cargo test -p kronical-core`,
+  `cargo test -p kronical-storage`, …) to keep failures focused.
+- Tests must exercise observable behaviour—state transitions, channel hand-offs,
+  storage writes—rather than tautological assertions.
+- `make coverage` runs `cargo llvm-cov` with colorised output, writes
+  `coverage/summary.txt`, and generates the HTML report under
+  `coverage/html/`.
+- Use `FEATURE_FLAGS="--features hotpath"` during `make` invocations to enable
+  optional profiling hooks, keeping runs single-threaded when necessary.
 
-If you want, we can add a small `kronictl` subcommand to dump a side‑by‑side comparison for a time range.
+## Permissions Checklist (macOS)
+
+- Accessibility – required for global input hooks.
+- Screen Recording – required for window title capture.
+
+Grant both permissions to `kronid` (or the terminal hosting it) before starting
+the daemon.
+
+## Support & Next Steps
+
+Active work targets the service pipeline and storage coverage. Kronii (the UI
+agent) will depend on the crates surfaced here once the API stabilises. Track
+ongoing refactor plans in `docs/todo`.
