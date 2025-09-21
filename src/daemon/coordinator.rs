@@ -214,6 +214,16 @@ impl EventCoordinator {
         tracker_db_backend: crate::util::config::DatabaseBackendConfig,
         duckdb_memory_limit_mb_tracker: u64,
     ) -> Self {
+        let threads = ThreadRegistry::with_slots([
+            "api-grpc",
+            "api-http",
+            "system-tracker",
+            "pipeline-data",
+            "pipeline-storage",
+            "pipeline-hints",
+            "focus-worker",
+        ]);
+
         Self {
             retention_minutes,
             active_grace_secs,
@@ -232,7 +242,7 @@ impl EventCoordinator {
             tracker_batch_size,
             tracker_db_backend,
             duckdb_memory_limit_mb_tracker,
-            threads: ThreadRegistry::new(),
+            threads,
         }
     }
 

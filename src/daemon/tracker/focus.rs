@@ -74,6 +74,7 @@ pub trait FocusChangeCallback {
 #[derive(Clone)]
 pub struct FocusEventWrapper {
     tx: mpsc::Sender<FocusMsg>,
+    #[allow(dead_code)]
     poll_ms: Arc<AtomicU64>,
     should_stop: Arc<AtomicBool>,
     worker_handle: Arc<Mutex<Option<ThreadHandle>>>,
