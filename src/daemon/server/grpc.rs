@@ -50,6 +50,12 @@ impl KroniSvc {
     }
 }
 
+impl Default for KroniSvc {
+    fn default() -> Self {
+        Self::new(Arc::new(snapshot::SnapshotBus::new()))
+    }
+}
+
 #[tonic::async_trait]
 impl Kroni for KroniSvc {
     async fn snapshot(
