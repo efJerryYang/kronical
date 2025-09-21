@@ -303,7 +303,10 @@ pub fn aggregate_activities_since(
         let mut by_title: HashMap<String, Vec<(u32, WindowActivity)>> = HashMap::new();
         for (id, w) in agg.windows.iter() {
             let title_key = normalize_title(&w.window_title);
-            by_title.entry(title_key).or_default().push((*id, w.clone()));
+            by_title
+                .entry(title_key)
+                .or_default()
+                .push((*id, w.clone()));
         }
         let threshold = Duration::minutes(60);
         for (title_key, mut items) in by_title.into_iter() {

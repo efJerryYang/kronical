@@ -16,15 +16,9 @@ pub fn spawn_all(
     http_uds: PathBuf,
     snapshot_bus: Arc<crate::daemon::snapshot::SnapshotBus>,
 ) -> Result<ApiHandles> {
-    let grpc = crate::daemon::server::grpc::spawn_server(
-        grpc_uds,
-        Arc::clone(&snapshot_bus),
-    )?;
+    let grpc = crate::daemon::server::grpc::spawn_server(grpc_uds, Arc::clone(&snapshot_bus))?;
     info!("Kroni gRPC API server started");
-    let http = crate::daemon::server::http::spawn_http_server(
-        http_uds,
-        Arc::clone(&snapshot_bus),
-    )?;
+    let http = crate::daemon::server::http::spawn_http_server(http_uds, Arc::clone(&snapshot_bus))?;
     info!("HTTP admin/SSE server started");
     Ok(ApiHandles {
         grpc: Some(grpc),

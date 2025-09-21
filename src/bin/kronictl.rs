@@ -69,7 +69,9 @@ fn group_label_for_display(window_id: &str, window_title: &str) -> String {
     };
 
     let mut label = if let Some(key) = canonical {
-        strip_group_prefix(window_title, key).unwrap_or(window_title).to_string()
+        strip_group_prefix(window_title, key)
+            .unwrap_or(window_title)
+            .to_string()
     } else {
         window_title.to_string()
     };

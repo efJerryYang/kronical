@@ -1,6 +1,6 @@
 use crate::daemon::events::MouseEventKind;
 use crate::daemon::events::WindowFocusInfo;
-use crate::daemon::tracker::DuckDbSystemTracker;
+use crate::daemon::tracker::SystemTracker;
 use crate::daemon::tracker::{FocusCacheCaps, FocusChangeCallback, FocusEventWrapper};
 use crate::storage::StorageBackend;
 use anyhow::Result;
@@ -244,11 +244,8 @@ impl EventCoordinator {
         // Start API servers (gRPC + HTTP/SSE) via unified API facade.
         let uds_grpc = crate::util::paths::grpc_uds(&workspace_dir);
         let uds_http = crate::util::paths::http_uds(&workspace_dir);
-        if let Err(e) = crate::daemon::api::spawn_all(
-            uds_grpc,
-            uds_http,
-            Arc::clone(&snapshot_bus),
-        ) {
+        if let Err(e) = crate::daemon::api::spawn_all(uds_grpc, uds_http, Arc::clone(&snapshot_bus))
+        {
             error!("Failed to start API servers: {}", e);
         }
 
@@ -258,7 +255,7 @@ impl EventCoordinator {
                 &workspace_dir,
                 &self.tracker_db_backend,
             );
-            let mut tracker = DuckDbSystemTracker::new(
+            let mut tracker = SystemTracker::new(
                 current_pid,
                 self.tracker_interval_secs,
                 self.tracker_batch_size,
@@ -267,10 +264,10 @@ impl EventCoordinator {
                 self.duckdb_memory_limit_mb_tracker,
             );
             if let Err(e) = tracker.start() {
-                error!("Failed to start DuckDB system tracker: {}", e);
+                error!("Failed to start system tracker: {}", e);
             } else {
                 info!(
-                    "DuckDB system tracker started successfully for PID {}",
+                    "System tracker started successfully for PID {}",
                     current_pid
                 );
 

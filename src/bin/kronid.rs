@@ -199,16 +199,15 @@ fn main() {
                 }
             }
         }
-        DatabaseBackendConfig::Sqlite3 => match SqliteStorage::new(
-            &data_file,
-            Arc::clone(&snapshot_bus),
-        ) {
-            Ok(s) => Box::new(s),
-            Err(e) => {
-                error!("Failed to initialize SQLite store: {}", e);
-                std::process::exit(1);
+        DatabaseBackendConfig::Sqlite3 => {
+            match SqliteStorage::new(&data_file, Arc::clone(&snapshot_bus)) {
+                Ok(s) => Box::new(s),
+                Err(e) => {
+                    error!("Failed to initialize SQLite store: {}", e);
+                    std::process::exit(1);
+                }
             }
-        },
+        }
     };
 
     let coordinator = EventCoordinator::new(

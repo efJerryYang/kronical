@@ -1,6 +1,6 @@
 use chrono::Utc;
 use kronical::daemon::server::grpc::set_system_tracker_db_path;
-use kronical::daemon::tracker::DuckDbSystemTracker;
+use kronical::daemon::tracker::SystemTracker;
 use kronical::kroni_api::kroni::v1::SystemMetricsRequest;
 use kronical::kroni_api::kroni::v1::kroni_server::Kroni;
 use prost_types::Timestamp;
@@ -19,7 +19,7 @@ async fn metrics_increase_across_consecutive_requests_after_flush() {
 
     // Start tracker with short interval and large batch to require flush
     let pid = std::process::id();
-    let mut tracker = DuckDbSystemTracker::new(
+    let mut tracker = SystemTracker::new(
         pid,
         0.25,
         100,

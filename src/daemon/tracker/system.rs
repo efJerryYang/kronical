@@ -34,7 +34,7 @@ pub struct MetricsQueryReq {
 
 use std::thread;
 
-pub struct DuckDbSystemTracker {
+pub struct SystemTracker {
     pid: u32,
     interval: Duration,
     batch_size: usize,
@@ -54,7 +54,7 @@ pub enum ControlMsg {
     Flush(mpsc::Sender<()>),
 }
 
-impl DuckDbSystemTracker {
+impl SystemTracker {
     pub fn new(
         pid: u32,
         interval_secs: f64,
@@ -77,12 +77,12 @@ impl DuckDbSystemTracker {
 
     pub fn start(&mut self) -> Result<()> {
         if self.started.swap(true, Ordering::SeqCst) {
-            return Err(anyhow::anyhow!("DuckDB system tracker is already running"));
+            return Err(anyhow::anyhow!("System tracker is already running"));
         }
 
         info!(
-            "Starting DuckDB system tracker for PID {} with interval {:?}",
-            self.pid, self.interval
+            "Starting system tracker for PID {} with interval {:?} (backend: {:?})",
+            self.pid, self.interval, self.backend
         );
 
         let pid = self.pid;
@@ -96,7 +96,7 @@ impl DuckDbSystemTracker {
         // Expose control channel to APIs (e.g., gRPC) so they can request a flush.
         crate::daemon::api::set_system_tracker_control_tx(control_tx.clone());
 
-        // Create the DuckDB store instance once within this thread.
+        // Create the metrics store instance once within this thread.
         // Also set up a query channel so the gRPC server can ask this
         // thread to execute reads on the same in-process instance.
         let (query_tx, query_rx) = mpsc::channel::<MetricsQueryReq>();
@@ -137,7 +137,7 @@ impl DuckDbSystemTracker {
                         if let Err(e) = store.insert_metrics_batch(buffer, pid) {
                             tracing::error!("Failed to flush metrics batch: {}", e);
                         } else {
-                            tracing::debug!("Flushed {} metrics to DuckDB", buffer.len());
+                            tracing::debug!("Flushed {} metrics to metrics store", buffer.len());
                             buffer.clear();
                         }
                     }
@@ -200,7 +200,7 @@ impl DuckDbSystemTracker {
                                 tracing::error!("Failed to insert metrics batch: {}", e);
                             } else {
                                 tracing::debug!(
-                                    "Inserted {} metrics to DuckDB",
+                                    "Inserted {} metrics to metrics store",
                                     metrics_buffer.len()
                                 );
                                 metrics_buffer.clear();
@@ -279,7 +279,10 @@ impl DuckDbSystemTracker {
                 if let Err(e) = store.insert_metrics_batch(&metrics_buffer, pid) {
                     tracing::error!("Failed to flush final metrics batch: {}", e);
                 } else {
-                    tracing::debug!("Flushed final {} metrics to DuckDB", metrics_buffer.len());
+                    tracing::debug!(
+                        "Flushed final {} metrics to metrics store",
+                        metrics_buffer.len()
+                    );
                 }
             }
         });
@@ -289,12 +292,12 @@ impl DuckDbSystemTracker {
 
     pub fn stop(&mut self) -> Result<()> {
         if !self.started.swap(false, Ordering::SeqCst) {
-            return Err(anyhow::anyhow!("DuckDB system tracker is not running"));
+            return Err(anyhow::anyhow!("System tracker is not running"));
         }
         if let Some(tx) = &self.control_tx {
             let _ = tx.send(ControlMsg::Stop);
         }
-        info!("DuckDB system tracker stop requested");
+        info!("System tracker stop requested");
         Ok(())
     }
 
@@ -402,7 +405,7 @@ mod tests {
         let temp_dir = tempdir()?;
         let db_path = temp_dir.path().join("tracker_test.duckdb");
 
-        let mut tracker = DuckDbSystemTracker::new(
+        let mut tracker = SystemTracker::new(
             1234,
             1.0,
             10,
