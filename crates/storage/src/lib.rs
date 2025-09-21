@@ -97,3 +97,71 @@ pub enum StorageCommand {
 pub mod duckdb;
 pub mod sqlite3;
 pub mod system_metrics;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::TimeZone;
+    use once_cell::sync::Lazy;
+    use std::sync::Mutex;
+
+    static TEST_GUARD: Lazy<Mutex<()>> = Lazy::new(|| Mutex::new(()));
+
+    fn with_clean_state<F: FnOnce(watch::Receiver<StorageMetrics>)>(f: F) {
+        let _lock = TEST_GUARD.lock().expect("storage test mutex poisoned");
+        STORAGE_BACKLOG.store(0, Ordering::Relaxed);
+        LAST_FLUSH_AT_EPOCH.store(0, Ordering::Relaxed);
+        publish_metrics();
+        let rx = storage_metrics_watch();
+        f(rx);
+        STORAGE_BACKLOG.store(0, Ordering::Relaxed);
+        LAST_FLUSH_AT_EPOCH.store(0, Ordering::Relaxed);
+        publish_metrics();
+    }
+
+    #[test]
+    fn metrics_watch_tracks_backlog_changes() {
+        with_clean_state(|rx| {
+            assert_eq!(rx.borrow().backlog_count, 0);
+
+            inc_backlog();
+            assert_eq!(rx.borrow().backlog_count, 1);
+
+            inc_backlog();
+            assert_eq!(rx.borrow().backlog_count, 2);
+
+            dec_backlog();
+            assert_eq!(rx.borrow().backlog_count, 1);
+        });
+    }
+
+    #[test]
+    fn metrics_watch_updates_last_flush_timestamp() {
+        with_clean_state(|rx| {
+            assert!(rx.borrow().last_flush_at.is_none());
+
+            let timestamp = Utc.with_ymd_and_hms(2024, 5, 1, 12, 30, 45).unwrap();
+            set_last_flush(timestamp);
+            assert_eq!(rx.borrow().last_flush_at, Some(timestamp));
+
+            LAST_FLUSH_AT_EPOCH.store(0, Ordering::Relaxed);
+            publish_metrics();
+            assert!(rx.borrow().last_flush_at.is_none());
+        });
+    }
+
+    #[test]
+    fn storage_metrics_watch_clones_receive_updates() {
+        with_clean_state(|rx1| {
+            let rx2 = storage_metrics_watch();
+
+            inc_backlog();
+            assert_eq!(rx1.borrow().backlog_count, 1);
+            assert_eq!(rx2.borrow().backlog_count, 1);
+
+            dec_backlog();
+            assert_eq!(rx1.borrow().backlog_count, 0);
+            assert_eq!(rx2.borrow().backlog_count, 0);
+        });
+    }
+}

@@ -62,8 +62,11 @@ coverage:
 	$(Q)mkdir -p coverage
 	$(ANNOUNCE) "cargo llvm-cov --workspace $(FEATURE_FLAGS) --remap-path-prefix --fail-under-lines 0 --lcov --output-path coverage/lcov.info"
 	$(Q)cargo llvm-cov --workspace $(FEATURE_FLAGS) --remap-path-prefix --fail-under-lines 0 --lcov --output-path coverage/lcov.info
-	$(ANNOUNCE) "cargo llvm-cov report $(FEATURE_FLAGS) --remap-path-prefix --summary-only --show-missing-lines"
-	$(Q)cargo llvm-cov report $(FEATURE_FLAGS) --remap-path-prefix --summary-only --show-missing-lines | tee coverage/summary.txt
+	$(ANNOUNCE) "cargo llvm-cov report $(FEATURE_FLAGS) --remap-path-prefix --summary-only --show-missing-lines --color always"
+	$(Q)cargo llvm-cov report $(FEATURE_FLAGS) --remap-path-prefix --summary-only --show-missing-lines --color always | tee coverage/summary.ansi
+	$(ANNOUNCE) "strip ANSI sequences into coverage/summary.txt"
+	$(Q)perl -pe 's/\e\[[0-9;]*[A-Za-z]//g' coverage/summary.ansi > coverage/summary.txt
+	$(Q)rm coverage/summary.ansi
 	$(ANNOUNCE) "cargo llvm-cov report $(FEATURE_FLAGS) --remap-path-prefix --html --output-dir coverage"
 	$(Q)cargo llvm-cov report $(FEATURE_FLAGS) --remap-path-prefix --html --output-dir coverage
 
