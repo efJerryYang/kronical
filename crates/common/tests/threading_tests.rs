@@ -144,3 +144,62 @@ fn panicked_thread_records_status() -> TestResult {
 
     Ok(())
 }
+
+#[test]
+fn reserve_slots_deduplicates_entries() -> TestResult {
+    let registry = ThreadRegistry::with_slots(["alpha", "beta"]);
+    // Attempt to reserve duplicates and a new slot.
+    registry.reserve_slots(["alpha", "gamma", "gamma"]);
+
+    let snapshot = registry.snapshot();
+    assert_eq!(
+        snapshot.len(),
+        3,
+        "registry should only contain unique slots"
+    );
+    let alpha_count = snapshot.iter().filter(|s| s.name == "alpha").count();
+    assert_eq!(alpha_count, 1, "duplicate reserve should be ignored");
+
+    Ok(())
+}
+
+#[test]
+fn active_thread_names_reflect_running_threads() -> TestResult {
+    let registry = ThreadRegistry::new();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (stop_tx, stop_rx) = mpsc::channel();
+    let handle = registry.spawn("active", move || {
+        ready_tx.send(()).ok();
+        let _ = stop_rx.recv();
+    })?;
+
+    wait_ready(&ready_rx);
+    let active = registry.active_thread_names();
+    assert_eq!(active, vec!["active".to_string()]);
+
+    stop_tx.send(()).ok();
+    handle.join().expect("join active");
+
+    assert!(registry.active_thread_names().is_empty());
+
+    Ok(())
+}
+
+#[test]
+fn thread_handle_name_exposes_label() -> TestResult {
+    let registry = ThreadRegistry::new();
+    let (ready_tx, ready_rx) = mpsc::channel();
+    let (stop_tx, stop_rx) = mpsc::channel();
+    let handle = registry.spawn("named", move || {
+        ready_tx.send(()).ok();
+        let _ = stop_rx.recv();
+    })?;
+
+    wait_ready(&ready_rx);
+    assert_eq!(handle.name(), "named");
+
+    stop_tx.send(()).ok();
+    handle.join().expect("join named");
+
+    Ok(())
+}

@@ -149,7 +149,7 @@ fn show_logs(log_dir: &Path, args: &ShowArgs) -> Result<()> {
         }
         writeln!(
             stdout,
-            "===== [{}|-{}] {} =====",
+            "===== [{}|{}] {} =====",
             entry.index,
             neg_index(entry.index, entries.len()),
             entry.path.display()
@@ -440,6 +440,8 @@ fn human_size(size: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Write;
+
     use super::{normalize_index, parse_selection, split_range, trim_wrapping_parens};
 
     #[test]
@@ -494,5 +496,56 @@ mod tests {
         assert!(parse_selection("5", 3).is_err());
         assert!(parse_selection("-7", 3).is_err());
         assert!(parse_selection("2-7", 4).is_err());
+    }
+
+    #[test]
+    fn human_size_formats_units() {
+        assert_eq!(super::human_size(0), "0B");
+        assert_eq!(super::human_size(512), "512B");
+        assert_eq!(super::human_size(2048), "2.0K");
+        assert_eq!(super::human_size(5 * 1024 * 1024), "5.0M");
+        assert_eq!(super::human_size(3 * 1024 * 1024 * 1024), "3.0G");
+    }
+
+    #[test]
+    fn run_less_honors_path_env() {
+        use std::env;
+        use std::time::SystemTime;
+        use tempfile::tempdir;
+
+        let tmp = tempdir().expect("tempdir");
+        let bin_dir = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin_dir).expect("bin dir");
+        let less_path = bin_dir.join("less");
+        let mut script = std::fs::File::create(&less_path).expect("create script");
+        writeln!(script, "#!/bin/sh\nexit 0").expect("write script");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mut perms = std::fs::metadata(&less_path)
+                .expect("metadata")
+                .permissions();
+            perms.set_mode(0o755);
+            std::fs::set_permissions(&less_path, perms).expect("permissions");
+        }
+
+        let log_path = tmp.path().join("log.txt");
+        std::fs::write(&log_path, "contents").expect("log content");
+        let entry = super::LogEntry {
+            index: 0,
+            path: log_path,
+            modified: SystemTime::now(),
+            size: 8,
+        };
+
+        let saved_path = env::var("PATH").ok();
+        unsafe { env::set_var("PATH", &bin_dir) };
+        let result = super::run_less(&[entry]);
+        if let Some(saved) = saved_path {
+            unsafe { env::set_var("PATH", saved) };
+        } else {
+            unsafe { env::remove_var("PATH") };
+        }
+        assert!(result.is_ok());
     }
 }
