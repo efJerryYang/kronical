@@ -645,8 +645,7 @@ fn build_app_tree(
                 0
             };
             let title = format!(
-                "{} (short-lived) ×{} avg {}",
-                g.title_key,
+                "(short-lived) ×{} avg {}",
                 g.distinct_ids.len(),
                 pretty_format_duration(avg)
             );
@@ -667,8 +666,7 @@ fn build_app_tree(
                 0
             };
             let title = format!(
-                "{} (temporal locality) ×{} avg {} max {}",
-                g.title_key,
+                "(temporal locality) ×{} avg {} max {}",
                 g.occurrence_count,
                 pretty_format_duration(avg),
                 pretty_format_duration(g.max_duration_seconds),
