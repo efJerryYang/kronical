@@ -15,17 +15,41 @@ use once_cell::sync::OnceCell;
 use prost_types::Timestamp;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::mpsc::Sender;
+use std::sync::{Arc, mpsc::Sender};
 use tokio::net::UnixListener;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::WatchStream;
 use tonic::{Request, Response, Status, transport::Server};
+
+#[cfg(test)]
+use once_cell::sync::Lazy;
+#[cfg(test)]
+use std::sync::Mutex;
+use std::time::Duration;
+#[cfg(test)]
+use tokio::sync::Notify;
 
 static SYSTEM_TRACKER_DB_PATH: OnceCell<PathBuf> = OnceCell::new();
 static SYSTEM_TRACKER_QUERY_TX: OnceCell<Sender<crate::daemon::tracker::MetricsQueryReq>> =
     OnceCell::new();
 static SYSTEM_TRACKER_CONTROL_TX: OnceCell<Sender<crate::daemon::tracker::ControlMsg>> =
     OnceCell::new();
+
+#[cfg(test)]
+static GRPC_TEST_SHUTDOWN: Lazy<Mutex<Option<Arc<Notify>>>> = Lazy::new(|| Mutex::new(None));
+
+#[cfg(test)]
+pub(crate) fn install_grpc_shutdown_notify(handle: Arc<Notify>) {
+    let mut guard = GRPC_TEST_SHUTDOWN.lock().unwrap();
+    *guard = Some(handle);
+}
+
+#[cfg(test)]
+pub(crate) fn trigger_grpc_shutdown() {
+    if let Some(handle) = GRPC_TEST_SHUTDOWN.lock().unwrap().take() {
+        handle.notify_waiters();
+    }
+}
 
 pub fn set_system_tracker_db_path(db_path: PathBuf) {
     let _ = SYSTEM_TRACKER_DB_PATH.set(db_path);
@@ -39,8 +63,22 @@ pub fn set_system_tracker_control_tx(tx: Sender<crate::daemon::tracker::ControlM
     let _ = SYSTEM_TRACKER_CONTROL_TX.set(tx);
 }
 
-#[derive(Clone, Default)]
-pub struct KroniSvc {}
+#[derive(Clone)]
+pub struct KroniSvc {
+    snapshot_bus: Arc<snapshot::SnapshotBus>,
+}
+
+impl KroniSvc {
+    pub fn new(snapshot_bus: Arc<snapshot::SnapshotBus>) -> Self {
+        Self { snapshot_bus }
+    }
+}
+
+impl Default for KroniSvc {
+    fn default() -> Self {
+        Self::new(Arc::new(snapshot::SnapshotBus::new()))
+    }
+}
 
 #[tonic::async_trait]
 impl Kroni for KroniSvc {
@@ -48,7 +86,7 @@ impl Kroni for KroniSvc {
         &self,
         _req: Request<SnapshotRequest>,
     ) -> Result<Response<SnapshotReply>, Status> {
-        let s = snapshot::get_current();
+        let s = self.snapshot_bus.snapshot();
         Ok(Response::new(to_pb(&s)))
     }
 
@@ -59,7 +97,7 @@ impl Kroni for KroniSvc {
         _req: Request<WatchRequest>,
     ) -> Result<Response<Self::WatchStream>, Status> {
         // Stream updates via the snapshot watch channel
-        let rx = snapshot::watch_snapshot();
+        let rx = self.snapshot_bus.watch_snapshot();
         let stream = WatchStream::new(rx).map(|arc| Ok(to_pb(&arc)));
         Ok(Response::new(Box::pin(stream)))
     }
@@ -316,12 +354,23 @@ pub fn to_pb(s: &snapshot::Snapshot) -> SnapshotReply {
     }
 }
 
-pub fn spawn_server(uds_path: PathBuf) -> Result<std::thread::JoinHandle<()>> {
+pub fn spawn_server(
+    uds_path: PathBuf,
+    snapshot_bus: Arc<snapshot::SnapshotBus>,
+) -> Result<std::thread::JoinHandle<()>> {
     if uds_path.exists() {
         warn!("Removing stale UDS: {:?}", uds_path);
         let _ = std::fs::remove_file(&uds_path);
     }
     let (tx, rx) = std::sync::mpsc::channel();
+    let bus_for_thread = Arc::clone(&snapshot_bus);
+    #[cfg(test)]
+    let shutdown_notify = Arc::new(Notify::new());
+    #[cfg(test)]
+    install_grpc_shutdown_notify(Arc::clone(&shutdown_notify));
+    #[cfg(test)]
+    let shutdown_notify_for_thread = Arc::clone(&shutdown_notify);
+
     let handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -337,18 +386,314 @@ pub fn spawn_server(uds_path: PathBuf) -> Result<std::thread::JoinHandle<()>> {
                 std::fs::set_permissions(&uds_path, perms).expect("chmod");
             }
             let incoming = tokio_stream::wrappers::UnixListenerStream::new(uds);
-            let svc = KroniSvc::default();
+            let svc = KroniSvc::new(bus_for_thread);
             tx.send(()).ok();
             info!("kroni API listening on {:?}", uds_path);
-            Server::builder()
-                .add_service(KroniServer::new(svc))
-                .serve_with_incoming(incoming)
-                .await
-                .expect("serve");
+            #[cfg(test)]
+            {
+                let shutdown = shutdown_notify_for_thread;
+                Server::builder()
+                    .add_service(KroniServer::new(svc))
+                    .serve_with_incoming_shutdown(incoming, async move {
+                        shutdown.notified().await;
+                    })
+                    .await
+                    .expect("serve");
+            }
+            #[cfg(not(test))]
+            {
+                Server::builder()
+                    .add_service(KroniServer::new(svc))
+                    .serve_with_incoming(incoming)
+                    .await
+                    .expect("serve");
+            }
         });
     });
-    rx.recv().ok();
-    Ok(handle)
+    match rx.recv_timeout(Duration::from_millis(500)) {
+        Ok(()) => Ok(handle),
+        Err(_) => {
+            let panic_msg = match handle.join() {
+                Ok(_) => None,
+                Err(payload) => match payload.downcast::<String>() {
+                    Ok(msg) => Some(*msg),
+                    Err(payload) => match payload.downcast::<&'static str>() {
+                        Ok(msg) => Some((*msg).to_string()),
+                        Err(_) => None,
+                    },
+                },
+            };
+            let detail = panic_msg.map(|msg| format!(": {msg}")).unwrap_or_default();
+            Err(anyhow::anyhow!(
+                "gRPC server failed to signal readiness within 500ms{detail}"
+            ))
+        }
+    }
 }
 
 // Note: gRPC integration tests live under tests/ to avoid OnceCell contention.
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::daemon::events::WindowFocusInfo;
+    use crate::daemon::records::ActivityState;
+    use crate::daemon::snapshot::{
+        ConfigSummary, Counts as SnapshotCounts, Snapshot, SnapshotApp, SnapshotWindow,
+        StorageInfo, Transition as SnapshotTransition,
+    };
+    use crate::kroni_api::kroni::v1::{SnapshotRequest, WatchRequest};
+    use chrono::{Duration, TimeZone, Utc};
+    use prost_types::Timestamp;
+    use std::path::PathBuf;
+    use std::sync::Arc;
+    use tokio_stream::StreamExt;
+    use tonic::Request;
+
+    fn sample_focus() -> WindowFocusInfo {
+        WindowFocusInfo {
+            pid: 4242,
+            process_start_time: 99,
+            app_name: Arc::new("Terminal".to_string()),
+            window_title: Arc::new("Build log".to_string()),
+            window_id: 7,
+            window_instance_start: Utc.with_ymd_and_hms(2024, 5, 1, 12, 30, 0).unwrap(),
+            window_position: None,
+            window_size: Some((1440, 900)),
+        }
+    }
+
+    fn test_socket_path(prefix: &str) -> PathBuf {
+        let mut base = std::env::current_dir().expect("cwd");
+        base.push("target/test-sockets");
+        std::fs::create_dir_all(&base).expect("mkdir test sockets");
+        let unique = format!(
+            "{}-{}-{}.sock",
+            prefix,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        base.join(unique)
+    }
+
+    #[test]
+    fn ts_to_utc_rejects_out_of_range_nanos() {
+        let ts = Timestamp {
+            seconds: 1,
+            nanos: 1_500_000_000,
+        };
+        assert!(ts_to_utc(&ts).is_err());
+    }
+
+    #[test]
+    fn snapshot_conversion_preserves_focus_and_counts() {
+        let mut snapshot = Snapshot::empty();
+        snapshot.seq = 42;
+        snapshot.mono_ns = 9_876_543;
+        snapshot.activity_state = ActivityState::Active;
+        snapshot.focus = Some(sample_focus());
+        snapshot.last_transition = Some(SnapshotTransition {
+            from: ActivityState::Inactive,
+            to: ActivityState::Active,
+            at: Utc.with_ymd_and_hms(2024, 5, 1, 12, 29, 0).unwrap(),
+            by_signal: Some("keyboard".to_string()),
+        });
+        snapshot.counts = SnapshotCounts {
+            signals_seen: 12,
+            hints_seen: 8,
+            records_emitted: 3,
+        };
+        snapshot.cadence_ms = 750;
+        snapshot.cadence_reason = "focus-change".to_string();
+        snapshot.next_timeout = Some(Utc::now() + Duration::seconds(30));
+        snapshot.storage = StorageInfo {
+            backlog_count: 4,
+            last_flush_at: Some(Utc::now()),
+        };
+        snapshot.config = ConfigSummary {
+            active_grace_secs: 5,
+            idle_threshold_secs: 300,
+            retention_minutes: 60,
+            ephemeral_max_duration_secs: 90,
+            ephemeral_min_distinct_ids: 3,
+            ephemeral_app_max_duration_secs: 120,
+            ephemeral_app_min_distinct_procs: 2,
+        };
+        snapshot.health = vec!["ok".into(), "pipeline".into()];
+        snapshot.aggregated_apps = vec![SnapshotApp {
+            app_name: "Terminal".into(),
+            pid: 4242,
+            process_start_time: 99,
+            windows: vec![SnapshotWindow {
+                window_id: "7".into(),
+                window_title: "Build log".into(),
+                first_seen: Utc.with_ymd_and_hms(2024, 5, 1, 12, 0, 0).unwrap(),
+                last_seen: Utc.with_ymd_and_hms(2024, 5, 1, 12, 30, 0).unwrap(),
+                duration_seconds: 1_200,
+                is_group: false,
+            }],
+            total_duration_secs: 1_200,
+            total_duration_pretty: "20m".into(),
+        }];
+
+        let reply = to_pb(&snapshot);
+
+        assert_eq!(reply.seq, 42);
+        assert_eq!(reply.activity_state, PbState::Active as i32);
+        let focus = reply.focus.expect("focus converted");
+        assert_eq!(focus.app, "Terminal");
+        assert_eq!(focus.window_id, "7");
+        assert!(focus.since.is_some());
+
+        let transition = reply.last_transition.expect("transition converted");
+        assert_eq!(transition.from, PbState::Inactive as i32);
+        assert_eq!(transition.to, PbState::Active as i32);
+        assert!(transition.at.is_some());
+
+        let counts = reply.counts.expect("counts");
+        assert_eq!(counts.signals_seen, 12);
+        assert_eq!(counts.records_emitted, 3);
+
+        let storage = reply.storage.expect("storage");
+        assert_eq!(storage.backlog_count, 4);
+        assert!(storage.last_flush.is_some());
+
+        let config = reply.config.expect("config");
+        assert_eq!(config.idle_threshold_secs, 300);
+        assert_eq!(config.ephemeral_min_distinct_ids, 3);
+
+        assert_eq!(reply.health, vec!["ok", "pipeline"]);
+        assert_eq!(reply.aggregated_apps.len(), 1);
+        let window = &reply.aggregated_apps[0].windows[0];
+        assert_eq!(window.window_id, "7");
+        assert_eq!(window.duration_seconds, 1_200);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn snapshot_call_returns_latest_state() {
+        let bus = Arc::new(snapshot::SnapshotBus::new());
+        bus.publish_basic(
+            ActivityState::Active,
+            Some(sample_focus()),
+            None,
+            SnapshotCounts {
+                signals_seen: 4,
+                hints_seen: 2,
+                records_emitted: 1,
+            },
+            500,
+            "tick".into(),
+            None,
+            StorageInfo {
+                backlog_count: 3,
+                last_flush_at: None,
+            },
+            ConfigSummary::default(),
+            vec!["healthy".into()],
+            Vec::new(),
+        );
+
+        let svc = KroniSvc::new(Arc::clone(&bus));
+        let reply = svc
+            .snapshot(Request::new(SnapshotRequest {
+                sections: Vec::new(),
+                detail: "summary".into(),
+            }))
+            .await
+            .expect("snapshot call succeeds")
+            .into_inner();
+
+        assert_eq!(reply.activity_state, PbState::Active as i32);
+        assert_eq!(reply.counts.unwrap().signals_seen, 4);
+        assert_eq!(reply.storage.unwrap().backlog_count, 3);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn watch_stream_emits_updates() {
+        let bus = Arc::new(snapshot::SnapshotBus::new());
+        let svc = KroniSvc::new(Arc::clone(&bus));
+
+        let mut stream = svc
+            .watch(Request::new(WatchRequest {
+                sections: Vec::new(),
+                detail: "summary".into(),
+            }))
+            .await
+            .expect("watch call succeeds")
+            .into_inner();
+
+        let first = stream.next().await.expect("first item").expect("ok");
+        assert_eq!(first.activity_state, PbState::Inactive as i32);
+
+        bus.publish_basic(
+            ActivityState::Active,
+            Some(sample_focus()),
+            None,
+            SnapshotCounts::default(),
+            250,
+            "hook".into(),
+            None,
+            StorageInfo {
+                backlog_count: 1,
+                last_flush_at: None,
+            },
+            ConfigSummary::default(),
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let second = stream.next().await.expect("second item").expect("ok");
+        assert_eq!(second.activity_state, PbState::Active as i32);
+        assert_eq!(second.focus.unwrap().title, "Build log");
+    }
+
+    #[test]
+    #[ignore = "requires UDS permissions"]
+    fn spawn_server_serves_snapshot_and_shuts_down() {
+        let uds_path = test_socket_path("grpc");
+
+        let bus = Arc::new(snapshot::SnapshotBus::new());
+        bus.publish_basic(
+            ActivityState::Active,
+            Some(sample_focus()),
+            None,
+            SnapshotCounts {
+                signals_seen: 5,
+                hints_seen: 4,
+                records_emitted: 3,
+            },
+            320,
+            "unit-test".into(),
+            None,
+            StorageInfo {
+                backlog_count: 0,
+                last_flush_at: None,
+            },
+            ConfigSummary::default(),
+            vec!["ok".into()],
+            Vec::new(),
+        );
+
+        let handle = match super::spawn_server(uds_path.clone(), Arc::clone(&bus)) {
+            Ok(handle) => handle,
+            Err(e) => {
+                let msg = e.to_string();
+                assert!(
+                    msg.contains("Operation not permitted")
+                        || msg.contains("failed to signal readiness"),
+                    "unexpected spawn error: {}",
+                    msg
+                );
+                let _ = std::fs::remove_file(&uds_path);
+                return;
+            }
+        };
+
+        super::trigger_grpc_shutdown();
+        handle.join().expect("join thread");
+        let _ = std::fs::remove_file(&uds_path);
+    }
+}

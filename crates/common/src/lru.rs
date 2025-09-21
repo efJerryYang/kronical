@@ -65,3 +65,43 @@ impl<K: Eq + Hash + Clone, V: Clone> LruCache<K, V> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{thread, time::Duration};
+
+    #[test]
+    fn evicts_least_recently_used_entry() {
+        let mut cache = LruCache::with_capacity(2);
+        let key_a = "a".to_string();
+        let key_b = "b".to_string();
+        let key_c = "c".to_string();
+
+        cache.put(key_a.clone(), 1);
+        cache.put(key_b.clone(), 2);
+
+        // Refresh key_a so key_b becomes the oldest entry.
+        assert_eq!(cache.get_cloned(&key_a), Some(1));
+
+        cache.put(key_c.clone(), 3);
+
+        assert_eq!(cache.get_cloned(&key_b), None);
+        assert_eq!(cache.get_cloned(&key_a), Some(1));
+        assert_eq!(cache.get_cloned(&key_c), Some(3));
+    }
+
+    #[test]
+    fn ttl_expiration_removes_stale_entries() {
+        let mut cache = LruCache::with_capacity_and_ttl(4, Duration::from_millis(20));
+        let key = "ttl-key".to_string();
+
+        cache.put(key.clone(), 5);
+        assert_eq!(cache.get_cloned(&key), Some(5));
+
+        thread::sleep(Duration::from_millis(30));
+
+        assert_eq!(cache.get_cloned(&key), None);
+        assert_eq!(cache.len(), 0);
+    }
+}

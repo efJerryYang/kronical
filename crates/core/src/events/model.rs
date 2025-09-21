@@ -223,3 +223,120 @@ impl StateEngine for DefaultStateEngine {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{Duration, TimeZone, Utc};
+
+    #[test]
+    fn default_split_policy_detects_title_and_window_changes() {
+        let ts = Utc.with_ymd_and_hms(2024, 4, 22, 12, 0, 0).unwrap();
+        let app_changed = EventEnvelope {
+            id: 1,
+            timestamp: ts,
+            source: EventSource::Hook,
+            kind: EventKind::Signal(SignalKind::AppChanged),
+            payload: EventPayload::None,
+            derived: false,
+            polling: false,
+            sensitive: false,
+        };
+        let title_changed = EventEnvelope {
+            id: 2,
+            timestamp: ts,
+            source: EventSource::Derived,
+            kind: EventKind::Hint(HintKind::TitleChanged),
+            payload: EventPayload::Title {
+                window_id: 10,
+                title: "new".into(),
+            },
+            derived: true,
+            polling: false,
+            sensitive: false,
+        };
+
+        let policy = DefaultSplitPolicy;
+        assert_eq!(
+            policy.split_reason(&app_changed),
+            Some(SplitReason::AppWindowChanged)
+        );
+        assert_eq!(
+            policy.split_reason(&title_changed),
+            Some(SplitReason::TitleChanged)
+        );
+    }
+
+    #[test]
+    fn state_engine_transitions_between_activity_levels() {
+        let start = Utc.with_ymd_and_hms(2024, 4, 22, 12, 30, 0).unwrap();
+        let mut engine = DefaultStateEngine::new(start, 30, 120);
+
+        let signal = EventEnvelope {
+            id: 5,
+            timestamp: start,
+            source: EventSource::Hook,
+            kind: EventKind::Signal(SignalKind::KeyboardInput),
+            payload: EventPayload::None,
+            derived: false,
+            polling: false,
+            sensitive: false,
+        };
+
+        let tr = engine
+            .on_signal(&signal, start)
+            .expect("first signal should promote to active");
+        assert_eq!(tr.from, ActivityState::Inactive);
+        assert_eq!(tr.to, ActivityState::Active);
+
+        let tick_time = start + Duration::seconds(90);
+        let tr_passive = engine
+            .on_tick(tick_time)
+            .expect("should degrade to passive");
+        assert_eq!(tr_passive.from, ActivityState::Active);
+        assert_eq!(tr_passive.to, ActivityState::Passive);
+
+        let tr_inactive = engine
+            .on_tick(start + Duration::seconds(300))
+            .expect("should degrade to inactive");
+        assert_eq!(tr_inactive.from, ActivityState::Passive);
+        assert_eq!(tr_inactive.to, ActivityState::Inactive);
+
+        // Lock signal forces immediate transition.
+        let lock_start = EventEnvelope {
+            id: 6,
+            timestamp: start + Duration::seconds(301),
+            source: EventSource::Hook,
+            kind: EventKind::Signal(SignalKind::LockStart),
+            payload: EventPayload::None,
+            derived: false,
+            polling: false,
+            sensitive: false,
+        };
+
+        let tr_locked = engine
+            .on_signal(&lock_start, lock_start.timestamp)
+            .expect("lock start should emit transition");
+        assert_eq!(tr_locked.to, ActivityState::Inactive);
+        assert!(
+            engine
+                .on_tick(lock_start.timestamp + Duration::seconds(10))
+                .is_none()
+        );
+
+        let lock_end = EventEnvelope {
+            id: 7,
+            timestamp: lock_start.timestamp + Duration::seconds(20),
+            source: EventSource::Hook,
+            kind: EventKind::Signal(SignalKind::LockEnd),
+            payload: EventPayload::None,
+            derived: false,
+            polling: false,
+            sensitive: false,
+        };
+        let tr_unlock = engine
+            .on_signal(&lock_end, lock_end.timestamp)
+            .expect("lock end restores activity");
+        assert_eq!(tr_unlock.from, ActivityState::Inactive);
+    }
+}

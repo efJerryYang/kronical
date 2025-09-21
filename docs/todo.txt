@@ -1,0 +1,225 @@
+Context
+- Goal: Orchestrate kronii (LLM-facing agent) to consume daemon snapshots and optional plugins for richer context, with strict privacy and security. 
+- Focus: Clear state transition tables, plugin system (including ScreenCapture), redaction pipeline, multi-LLM roles, scheduling, and security to keep screenshots private.
+
+Inputs and goals (summary)
+- Base input source: daemon snapshot (activity_state, focus app/window, last_transition, etc.).
+- Optional plugin inputs: per-app integrations that provide extra context (browser tab, IDE file, meeting info, etc.).
+- Sensitive info filter: mandatory local redaction before any LLM call.
+- Multi-LLM roles: Router, Extractor(s), Synthesizer, Planner, Notifier.
+- Adaptive frequency: Planner suggests next wakeup; daemon enforces ceilings, cooldowns.
+- Plugin visibility to LLM: For each App: snapshot summary; plugin installed/enabled flags.
+
+============================================================
+Daemon state machine (original, normalized)
+============================================================
+
+States
+- Active
+- Passive
+- Inactive
+- Locked
+
+Inputs/Signals
+- KeyboardInput, MouseInput, AppChanged, WindowChanged, ActivityPulse, LockStart, LockEnd
+
+Params
+- active_grace_secs: default 30
+- idle_threshold_secs: default 300
+
+State transition table (daemon)
+| From                | Trigger                          | Guard/Condition                               | To        | Actions on transition                                                                 |
+|---------------------|----------------------------------|-----------------------------------------------|-----------|----------------------------------------------------------------------------------------|
+| Any                 | LockStart                        | —                                             | Locked    | Emit StateChanged; persist lock signals; suppress raw key/mouse persistence while locked. |
+| Locked              | LockEnd                          | Determine post-unlock natural state           | Active/Passive/Inactive | Emit StateChanged; resume event persistence.                                 |
+| Inactive/Passive    | Keyboard/Mouse/App/Window/Pulse  | —                                             | Active    | Emit StateChanged; persist envelope; may derive further hints.                          |
+| Active              | Tick                             | no input for active_grace_secs                | Passive   | Emit StateChanged.                                                                     |
+| Passive             | Tick                             | no input for idle_threshold_secs              | Inactive  | Emit StateChanged.                                                                     |
+
+Derived actions (daemon)
+- Any state change -> emit StateChanged hint (with from/to/at).
+- Focus change (App or Window) -> emit FocusChanged; may add an ActivityPulse.
+- Title change -> periodic TitleChanged hint.
+- While Locked -> suppress raw input persistence; lock/unlock signals still recorded.
+- Pipeline mental model -> raw event -> envelope (with lock-boundary signals) -> derivations (state/hints) -> record build -> storage.
+
+============================================================
+kronii orchestration model (multi-source, plugins, redaction, multi-LLM)
+============================================================
+
+Pipeline stages
+1) Intake: receive triggers, coalesce near-duplicates.
+2) Base Snapshot: fetch latest snapshot.
+3) Router decision: choose ContextPolicy and Prompt family.
+4) Plugin Snapshot Gathering (optional): pull summaries/full data for selected plugins.
+5) Sensitive Filter: redact Base+Plugin context; green/amber/red + audit.
+6) LLM execution: Extractor(s) -> Synthesizer -> Planner -> Notifier.
+7) Act: notify or silent record; write audit.
+8) Schedule: apply next-wakeup and cooldown with ceilings.
+
+kronii states (orchestration)
+- Idle: waiting for triggers.
+- Collecting: gathering Base and candidate Plugin context.
+- Redacting: sensitive info filter and audit.
+- Routing: select context strategy and prompt family.
+- Extracting: run one or more Extractors.
+- Synthesizing: merge extracted fragments.
+- Planning: decide whether to notify and when to wake next.
+- Acting: surface suggestion/reminder or stay silent.
+- Cooling: cooldown window that rate-limits re-entry.
+- Deferred: deferred due to lock/red risk/low value.
+- AwaitingCapture: waiting for ScreenCapture plugin job result (if requested).
+
+Triggers
+- From daemon: StateChanged, FocusChanged, TitleChanged, ActivityPulse, LockStart, LockEnd
+- From plugins: PluginEvent(app_id, kind)
+- Tick(min_interval) as safety net
+
+Prompt families (selected by Router)
+- observe (fast gate): decide if worth processing
+- extract: pull key facts from current focus/context
+- synthesize: merge into suggestion/actionable
+- plan: choose next wakeup, triggers, and cooldown
+- notify: produce user-facing message (or no-op)
+
+Policies and registries (simplified)
+- PluginRegistry: app_id, installed, enabled, capabilities{{snapshot, events, summarize, redact_hint}}, risk_score
+- ContextPolicy: BaseOnly | PluginLite(apps=...) | PluginFull(apps=...) | Defer
+- RedactionPolicy: rules (PII/secrets/entropy/URL-tokens) + plugin hints + user policy -> level green/amber/red, masked/removed fields, audit
+
+============================================================
+kronii state transition table (with ScreenCapture integration)
+============================================================
+
+| From            | Trigger                                                    | Guard/Condition                                              | To               | Actions on transition                                                                                                  |
+|-----------------|------------------------------------------------------------|--------------------------------------------------------------|------------------|-------------------------------------------------------------------------------------------------------------------------|
+| Idle            | StateChanged/FocusChanged/TitleChanged/ActivityPulse/PluginEvent/Tick | Not in global cooldown, not locked                          | Collecting       | Fetch snapshot; open new batch; coalesce near events.                                                                   |
+| Idle            | LockStart                                                  | —                                                            | Deferred         | Record lock reason; only resume on LockEnd or long Tick; no plugin pulls.                                              |
+| Deferred        | LockEnd or Tick                                            | —                                                            | Collecting       | Continue intake (do not backfill high-frequency events).                                                                |
+| Collecting      | Internal                                                   | Router minimal fields ready                                  | Routing          | Summarize Base and plugin meta (installed/enabled).                                                                     |
+| Routing         | Internal                                                   | Router chooses BaseOnly                                      | Redacting        | Skip plugin pulls.                                                                                                      |
+| Routing         | Internal                                                   | Router chooses PluginLite/Full and needs screenshot          | AwaitingCapture  | Create CaptureRequest{{pid, app, start, win, bypass, burst, ttl, priority}}; enqueue; store job_id and deadline.       |
+| Routing         | Internal                                                   | Router chooses PluginLite/Full and no screenshot             | Collecting       | Pull other plugin summaries/full; then return to Routing or proceed to Redacting per policy.                            |
+| AwaitingCapture | CaptureStatus = persisted                                  | Within ttl_ms                                                | Redacting        | Attach primary_screenshot_id (redacted) to context; continue unified redaction audit.                                   |
+| AwaitingCapture | CaptureStatus = expired/rejected/failed OR timeout         | —                                                            | Redacting        | Log reason; degrade to BaseOnly/other plugin data.                                                                      |
+| Redacting       | Internal                                                   | Risk = red                                                   | Deferred         | Abort this round; short backoff; audit record.                                                                          |
+| Redacting       | Internal                                                   | Risk = amber/green                                           | Extracting       | Budget context (Base first, then plugin content by priority, include screenshot ID reference); start extractors.       |
+| Extracting      | Internal                                                   | All extractors done or timed out                             | Synthesizing     | Merge fragments; resolve conflicts; assign confidence/cost labels.                                                      |
+| Synthesizing    | Internal                                                   | —                                                            | Planning         | Produce candidate actions with rationale and context hash for deduplication.                                            |
+| Planning        | Internal                                                   | Low confidence/low value                                     | Cooling          | Set longer cooldown; no user-facing output; record silently.                                                            |
+| Planning        | Internal                                                   | High confidence/high value                                   | Acting           | Emit notification/suggestion; include source summary and snooze/disable entry points.                                   |
+| Acting          | Internal                                                   | Output completed                                             | Cooling          | Audit: plugins used, redaction, LLM cost, next schedule params.                                                         |
+| Cooling         | Tick or new high-priority trigger                          | Reaches min interval or receives high-priority event         | Idle             | End cooldown; accept new round.                                                                                         |
+| Routing         | Internal                                                   | Router decides Defer                                         | Deferred         | Reason: focus thrash, locked, low value, or privacy; set short backoff and exit.                                        |
+
+Additional guards
+- During AwaitingCapture, a new high-priority trigger (e.g., FocusChanged to a different app) can cancel or downgrade the current capture job depending on Planner policy.
+- Global and per-app rate limits checked before entering Routing and before issuing CaptureRequest.
+
+============================================================
+ScreenCapture plugin (design as a plugin)
+============================================================
+
+Rationale
+- Expensive and privacy-sensitive; LLM may proactively request it. Needs async queue, worker, and strict redaction. 
+- Treat as optional plugin chosen by Router when text signal is insufficient or Extractor confidence is low.
+
+gRPC surface (shape, not code)
+- RequestScreenCapture(CaptureRequest) -> CaptureJobId
+- WatchCapture(CaptureJobId) -> stream CaptureStatus   (or)   GetCaptureResult(CaptureJobId) for polling
+
+CaptureRequest fields (required + recommended)
+- process_id: u32
+- app_name: string
+- app_start_time: i64 (epoch ms)
+- window_id: u64
+- bypass: BypassPolicy
+- burst_count: 2..3 (default 3)
+- burst_interval_ms: 250..400 (default 300)
+- priority: low|normal|high (default normal)
+- ttl_ms: 30000
+- requester: "kronii" (for audit/quotas)
+
+CaptureResult (and status progression)
+- job_id
+- status: queued|waiting|capturing|scoring|redacting|persisted|expired|rejected|failed
+- screenshot_ids: [raw ids, internal]
+- primary_screenshot_id: the chosen redacted frame for external use
+- meta: pid, app_name, window_id, started_at, finished_at, reason
+
+BypassPolicy (tolerance levels)
+- Strict: pid + app_start_time + window_id must match; otherwise wait until match or expire.
+- WindowRelaxed: allow window_id to change within same pid/app_start_time.
+- AppRelaxed: allow pid restart if app_name matches and start_time is close (graceful restart).
+- FocusNext: capture the next foreground window on the next focus switch (best-effort).
+
+Queue and async loop
+- Priority queues; dedupe/merge by requester within short windows.
+- Matcher watches current foreground and daemon signals to decide readiness.
+- Worker performs burst capture (2-3 frames with interval).
+- Scoring: text_density (OCR), delta SSIM, edge_density, ui_semantics_hint, blur, risk_penalty.
+- Select top-scoring frame as primary; others as fallbacks (not exposed by default).
+- Redaction: rule-based + plugin-provided sensitive regions + user policy; if excessive redaction required -> reject.
+- Persistence: encrypt raw; encrypt redacted; expose only redacted via guarded stream. No filesystem paths are ever returned.
+- Rate limiting: global and per-app; active input periods add backoff. Cancellable by ttl or caller.
+
+Integration paths
+- Routing pre-step: Router may request capture before extractors if text is weak (e.g., video meeting or code review diff image).
+- Extractor fallback: on low confidence after first pass, can request one capture if cooldown allows, then re-run synthesize.
+
+============================================================
+Security model for screenshots (avoid access by other processes)
+============================================================
+
+Storage and encryption
+- Storage dir per-user with 0700 perms (platform equivalents). 
+- Each image uses a per-object content encryption key (CEK); CEK wrapped by a master key stored via OS keystore:
+  - macOS: Keychain ACL restricted to daemon
+  - Windows: DPAPI bound to current user
+  - Linux: libsecret/gnome-keyring preferred; fallback to in-memory with optional sealing
+- Original images never leave the daemon; only redacted copies may be streamed out. 
+- Retrieval API: GetScreenshot(id, single_use_token) returns a byte stream of the redacted image. Tokens are short TTL and single-use.
+
+IPC and system identity
+- Unix/macOS: UDS at /run/user/$UID/kroni.sock with 0600; verify peer uid/pid via SO_PEERCRED/getpeereid; optionally verify code signature (macOS) or /proc/$pid/exe (Linux) whitelist.
+- Windows: Named Pipe with DACL restricted to current user SID; verify client pid via GetNamedPipeClientProcessId and check image signature/path whitelist.
+
+Application-level handshake
+- kronii: registered public key; challenge-response at connection; daemon validates and issues short-lived session for requesting one-time tokens.
+- kronictl: human-in-the-loop proof (see below) plus challenge-response; very short session (e.g., 2 minutes), read-only scope.
+
+Human-in-the-loop for kronictl
+- Prefer WebAuthn/FIDO2 local assertion (Touch ID / Windows Hello supported devices). 
+- Alternatively use OS-native dialogs: macOS LocalAuthentication, Windows Hello/CredUI, Linux polkit.
+- TTY binding: require isatty; report tty device and session id; daemon cross-checks pid and session/tty. Not a strong guarantee but reduces headless misuse.
+- Short interaction token: after success, allow a brief window for multiple reads; expiration forces re-auth.
+
+Authorization and least privilege
+- Capability bits: READ_REDACTED, LIST_META, REQUEST_CAPTURE, READ_RAW_ENCRYPTED (disabled by default).
+- kronii: READ_REDACTED (+ optionally REQUEST_CAPTURE). No directory listing; only by ID with valid token.
+- kronictl: READ_REDACTED, LIST_META. REQUEST_CAPTURE typically disallowed.
+- Rate limits and quotas: global and per-app. Automatic circuit-breaker on abuse.
+
+Auditing and retention
+- Audit every access: time, client pid/exec/type, op, screenshot_id, result, redaction_level, reason.
+- Retention policy: encrypted originals N days (default 1 or disabled), redacted copies M days (default 7). Key rotation supported with wrapped CEKs.
+- No filesystem paths are ever exposed externally.
+
+============================================================
+Trigger-to-prompt mapping (examples)
+============================================================
+- StateChanged Active->Passive: observe; possibly Defer if repeated within 5 minutes.
+- FocusChanged to IDE/Browser/Meetings: extract artifact (file/url/agenda); synthesize related tasks.
+- TitleChanged high-frequency: Router may Defer.
+- LockEnd: extract unfinished context; synthesize resume suggestion.
+- PluginEvent(meeting_joined): extract attendees/agenda; synthesize key points and note template.
+
+============================================================
+Scheduling and rate control (summary)
+============================================================
+- Planner outputs: next_wakeup, min_cooldown, trigger_filters.
+- Daemon enforces global ceiling and per-app limits.
+- Cooling state prevents storms; high-priority triggers can preempt when justified.
+- AwaitingCapture includes deadline handling, cancellation on focus changes, and downgrade paths.
+
+End of document.

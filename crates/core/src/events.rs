@@ -110,3 +110,101 @@ pub mod derive_signal;
 pub mod hints;
 pub mod model;
 pub mod signals;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::model::{EventEnvelope, EventKind, EventPayload, EventSource, HintKind};
+    use crate::events::signals::SignalKind;
+    use chrono::{TimeZone, Utc};
+    use std::sync::Arc;
+
+    #[test]
+    fn raw_event_helpers_return_expected_metadata() {
+        let ts = Utc.with_ymd_and_hms(2024, 4, 22, 8, 0, 0).unwrap();
+        let keyboard = RawEvent::KeyboardInput {
+            timestamp: ts,
+            event_id: 10,
+            data: KeyboardEventData {
+                key_code: Some(42),
+                key_char: Some('k'),
+                modifiers: vec!["shift".into()],
+            },
+        };
+        assert_eq!(keyboard.timestamp(), ts);
+        assert_eq!(keyboard.event_id(), 10);
+        assert_eq!(keyboard.event_type(), "keyboard");
+
+        let mouse = RawEvent::MouseInput {
+            timestamp: ts,
+            event_id: 11,
+            data: MouseEventData {
+                position: MousePosition { x: 1, y: 2 },
+                button: Some("left".into()),
+                click_count: Some(1),
+                event_type: Some(MouseEventKind::Clicked),
+                wheel_amount: None,
+                wheel_rotation: None,
+                wheel_axis: None,
+            },
+        };
+        assert_eq!(mouse.timestamp(), ts);
+        assert_eq!(mouse.event_id(), 11);
+        assert_eq!(mouse.event_type(), "mouse");
+
+        let focus = RawEvent::WindowFocusChange {
+            timestamp: ts,
+            event_id: 12,
+            focus_info: WindowFocusInfo {
+                pid: 1,
+                process_start_time: 2,
+                app_name: Arc::new("Terminal".into()),
+                window_title: Arc::new("shell".into()),
+                window_id: 3,
+                window_instance_start: ts,
+                window_position: None,
+                window_size: None,
+            },
+        };
+        assert_eq!(focus.timestamp(), ts);
+        assert_eq!(focus.event_id(), 12);
+        assert_eq!(focus.event_type(), "window_focus_change");
+    }
+
+    #[test]
+    fn envelope_helpers_distinguish_signal_and_hint() {
+        let ts = Utc.with_ymd_and_hms(2024, 4, 22, 9, 0, 0).unwrap();
+        let signal = EventEnvelope {
+            id: 1,
+            timestamp: ts,
+            source: EventSource::Hook,
+            kind: EventKind::Signal(SignalKind::KeyboardInput),
+            payload: EventPayload::Keyboard(KeyboardEventData {
+                key_code: Some(1),
+                key_char: None,
+                modifiers: vec![],
+            }),
+            derived: false,
+            polling: false,
+            sensitive: false,
+        };
+        assert!(signal.is_signal());
+        assert!(!signal.is_hint());
+
+        let hint = EventEnvelope {
+            id: 2,
+            timestamp: ts,
+            source: EventSource::Derived,
+            kind: EventKind::Hint(HintKind::TitleChanged),
+            payload: EventPayload::Title {
+                window_id: 9,
+                title: "new title".into(),
+            },
+            derived: true,
+            polling: false,
+            sensitive: false,
+        };
+        assert!(hint.is_hint());
+        assert!(!hint.is_signal());
+    }
+}

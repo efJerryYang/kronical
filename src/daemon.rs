@@ -1,5 +1,6 @@
 pub mod compressor;
 pub mod coordinator;
+pub mod pipeline;
 // Re-export core modules to maintain stable paths
 pub use kronical_core::events;
 pub use kronical_core::records;

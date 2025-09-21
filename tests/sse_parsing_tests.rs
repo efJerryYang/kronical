@@ -12,6 +12,7 @@ fn parses_single_sse_event_into_snapshot() {
         activity_state: kronical::daemon::records::ActivityState::Inactive,
         focus: None,
         last_transition: None,
+        transitions_recent: vec![],
         counts: Default::default(),
         cadence_ms: 0,
         cadence_reason: String::new(),

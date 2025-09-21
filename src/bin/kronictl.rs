@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use chrono::{Local, Utc};
+use chrono::Utc;
 use clap::{Parser, Subcommand};
 use crossterm::{
     event as crossterm_event, execute,
@@ -57,6 +57,41 @@ fn pretty_duration(seconds: u64) -> String {
         result.push_str(&format!("{}s", secs));
     }
     result
+}
+
+fn group_label_for_display(window_id: &str, window_title: &str) -> String {
+    let canonical = if let Some(rest) = window_id.strip_prefix("group:") {
+        Some(rest)
+    } else if let Some(rest) = window_id.strip_prefix("group-temporal:") {
+        Some(rest.split(':').next().unwrap_or(rest))
+    } else {
+        None
+    };
+
+    let mut label = if let Some(key) = canonical {
+        strip_group_prefix(window_title, key)
+            .unwrap_or(window_title)
+            .to_string()
+    } else {
+        window_title.to_string()
+    };
+
+    label = label.trim_start().to_string();
+    if label.is_empty() {
+        label = window_title.to_string();
+    }
+    label
+}
+
+fn strip_group_prefix<'a>(title: &'a str, canonical: &str) -> Option<&'a str> {
+    let prefix = canonical.trim();
+    if prefix.is_empty() {
+        return None;
+    }
+    if let Some(rest) = title.strip_prefix(prefix) {
+        return Some(rest.trim_start());
+    }
+    None
 }
 
 #[derive(Parser)]
@@ -474,10 +509,16 @@ fn run_monitor_loop<B: Backend>(terminal: &mut Terminal<B>, data_file: PathBuf) 
                                                     + 1; // single space between id and title
 
                                                 // Base title (plus group tag if any)
-                                                let mut base_title = win.window_title.clone();
-                                                if win.is_group {
-                                                    base_title.push_str(" [group]");
-                                                }
+                                                let base_title = if win.is_group {
+                                                    let mut label = group_label_for_display(
+                                                        win.window_id.as_str(),
+                                                        win.window_title.as_str(),
+                                                    );
+                                                    label.push_str(" [group]");
+                                                    label
+                                                } else {
+                                                    win.window_title.clone()
+                                                };
                                                 let mut title_display = base_title.clone();
                                                 // Truncate if needed by display width, accounting for ellipsis width 1
                                                 let total_needed = left_fixed
@@ -665,7 +706,7 @@ fn run_monitor_loop<B: Backend>(terminal: &mut Terminal<B>, data_file: PathBuf) 
                                                         .to_string(),
                                                     Style::default().fg(Color::Gray),
                                                 ),
-                                                if let Some(sig) = &tr.by_signal {
+                                                if tr.by_signal.is_some() {
                                                     Span::raw("  ")
                                                 } else {
                                                     Span::raw("")

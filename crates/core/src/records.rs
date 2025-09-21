@@ -1,6 +1,6 @@
 use crate::events::WindowFocusInfo;
 use crate::events::model::{EventEnvelope, EventKind, EventPayload, HintKind};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
@@ -43,6 +43,7 @@ pub struct AggregatedActivity {
     pub process_start_time: u64,
     pub windows: HashMap<u32, WindowActivity>,
     pub ephemeral_groups: HashMap<String, EphemeralGroup>,
+    pub temporal_groups: Vec<TemporalGroup>,
     pub total_duration_seconds: u64,
     pub first_seen: DateTime<Utc>,
     pub last_seen: DateTime<Utc>,
@@ -56,6 +57,18 @@ pub struct EphemeralGroup {
     pub total_duration_seconds: u64,
     pub first_seen: DateTime<Utc>,
     pub last_seen: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone)]
+pub struct TemporalGroup {
+    pub title_key: String,
+    pub distinct_ids: HashSet<u32>,
+    pub occurrence_count: u32,
+    pub total_duration_seconds: u64,
+    pub max_duration_seconds: u64,
+    pub first_seen: DateTime<Utc>,
+    pub last_seen: DateTime<Utc>,
+    pub anchor_last_seen: DateTime<Utc>,
 }
 
 pub struct RecordBuilder {
@@ -208,6 +221,7 @@ pub fn aggregate_activities_since(
                     process_start_time: focus_info.process_start_time,
                     windows: HashMap::new(),
                     ephemeral_groups: HashMap::new(),
+                    temporal_groups: Vec::new(),
                     total_duration_seconds: 0,
                     first_seen: rec_start,
                     last_seen: rec_end,
@@ -283,6 +297,59 @@ pub fn aggregate_activities_since(
             }
         }
 
+        // Secondary pass: temporal locality groups for windows with similar recent activity.
+        let mut temporal_clusters: Vec<TemporalGroup> = Vec::new();
+        let mut grouped_ids: HashSet<u32> = HashSet::new();
+        let mut by_title: HashMap<String, Vec<(u32, WindowActivity)>> = HashMap::new();
+        for (id, w) in agg.windows.iter() {
+            let title_key = normalize_title(&w.window_title);
+            by_title
+                .entry(title_key)
+                .or_default()
+                .push((*id, w.clone()));
+        }
+        let threshold = Duration::minutes(60);
+        for (title_key, mut items) in by_title.into_iter() {
+            if items.len() < 2 {
+                continue;
+            }
+            items.sort_by(|a, b| b.1.last_seen.cmp(&a.1.last_seen));
+            let mut current: Vec<(u32, WindowActivity)> = Vec::new();
+            let mut prev_last_seen: Option<DateTime<Utc>> = None;
+            for (win_id, win) in items.into_iter() {
+                if current.is_empty() {
+                    prev_last_seen = Some(win.last_seen);
+                    current.push((win_id, win));
+                    continue;
+                }
+                let prev = prev_last_seen.expect("cluster should have last_seen");
+                let diff = prev.signed_duration_since(win.last_seen);
+                if diff <= threshold {
+                    prev_last_seen = Some(win.last_seen);
+                    current.push((win_id, win));
+                } else {
+                    if current.len() >= 2 {
+                        grouped_ids.extend(current.iter().map(|(wid, _)| *wid));
+                        temporal_clusters.push(build_temporal_group(&title_key, &current));
+                    }
+                    current = vec![(win_id, win)];
+                    prev_last_seen = Some(current[0].1.last_seen);
+                }
+            }
+            if current.len() >= 2 {
+                grouped_ids.extend(current.iter().map(|(wid, _)| *wid));
+                temporal_clusters.push(build_temporal_group(&title_key, &current));
+            }
+        }
+        for id in grouped_ids {
+            agg.windows.remove(&id);
+        }
+        if !temporal_clusters.is_empty() {
+            agg.temporal_groups = temporal_clusters;
+        } else {
+            agg.temporal_groups.clear();
+        }
+
         // LRU trim: keep most recent windows by last_seen
         if max_windows_per_app > 0 && agg.windows.len() > max_windows_per_app {
             let mut win_vec: Vec<(u32, WindowActivity)> =
@@ -304,6 +371,390 @@ pub fn aggregate_activities_since(
     apps
 }
 
+fn build_temporal_group(title_key: &str, windows: &[(u32, WindowActivity)]) -> TemporalGroup {
+    debug_assert!(windows.len() >= 2);
+    let mut distinct_ids: HashSet<u32> = HashSet::new();
+    let mut total: u64 = 0;
+    let mut max_duration: u64 = 0;
+    let mut first_seen = windows[0].1.first_seen;
+    let mut last_seen = windows[0].1.last_seen;
+    for (win_id, win) in windows.iter() {
+        distinct_ids.insert(*win_id);
+        total = total.saturating_add(win.duration_seconds);
+        max_duration = max_duration.max(win.duration_seconds);
+        if win.first_seen < first_seen {
+            first_seen = win.first_seen;
+        }
+        if win.last_seen > last_seen {
+            last_seen = win.last_seen;
+        }
+    }
+
+    let occurrence = distinct_ids.len() as u32;
+
+    TemporalGroup {
+        title_key: title_key.to_string(),
+        distinct_ids,
+        occurrence_count: occurrence,
+        total_duration_seconds: total,
+        max_duration_seconds: max_duration,
+        first_seen,
+        last_seen,
+        anchor_last_seen: last_seen,
+    }
+}
+
 fn normalize_title(s: &str) -> String {
     s.trim().to_lowercase()
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::events::model::EventSource;
+
+    use super::*;
+    use chrono::{Duration, TimeZone, Utc};
+    use std::sync::Arc;
+
+    fn make_focus(
+        pid: i32,
+        process_start: u64,
+        app: &str,
+        window_id: u32,
+        title: &str,
+        at: DateTime<Utc>,
+    ) -> WindowFocusInfo {
+        WindowFocusInfo {
+            pid,
+            process_start_time: process_start,
+            app_name: Arc::new(app.to_string()),
+            window_title: Arc::new(title.to_string()),
+            window_id,
+            window_instance_start: at,
+            window_position: None,
+            window_size: None,
+        }
+    }
+
+    fn focus_hint(id: u64, focus: WindowFocusInfo, ts: DateTime<Utc>) -> EventEnvelope {
+        EventEnvelope {
+            id,
+            timestamp: ts,
+            source: EventSource::Hook,
+            kind: EventKind::Hint(HintKind::FocusChanged),
+            payload: EventPayload::Focus(focus),
+            derived: false,
+            polling: false,
+            sensitive: false,
+        }
+    }
+
+    fn title_hint(id: u64, window_id: u32, title: &str, ts: DateTime<Utc>) -> EventEnvelope {
+        EventEnvelope {
+            id,
+            timestamp: ts,
+            source: EventSource::Polling,
+            kind: EventKind::Hint(HintKind::TitleChanged),
+            payload: EventPayload::Title {
+                window_id,
+                title: title.to_string(),
+            },
+            derived: false,
+            polling: true,
+            sensitive: false,
+        }
+    }
+
+    fn state_hint(
+        id: u64,
+        ts: DateTime<Utc>,
+        from: ActivityState,
+        to: ActivityState,
+    ) -> EventEnvelope {
+        EventEnvelope {
+            id,
+            timestamp: ts,
+            source: EventSource::Derived,
+            kind: EventKind::Hint(HintKind::StateChanged),
+            payload: EventPayload::State { from, to },
+            derived: true,
+            polling: false,
+            sensitive: false,
+        }
+    }
+
+    fn make_record(
+        record_id: u64,
+        focus: WindowFocusInfo,
+        start: DateTime<Utc>,
+        duration_secs: i64,
+    ) -> ActivityRecord {
+        ActivityRecord {
+            record_id,
+            start_time: start,
+            end_time: Some(start + Duration::seconds(duration_secs)),
+            state: ActivityState::Active,
+            focus_info: Some(focus),
+            event_count: 1,
+            triggering_events: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn record_builder_emits_previous_focus_on_switch() {
+        let mut builder = RecordBuilder::new(ActivityState::Inactive);
+        let now = Utc::now();
+        let focus_a = make_focus(42, 1, "Vim", 100, "Alpha", now);
+        let focus_b = make_focus(42, 1, "Vim", 101, "Beta", now + Duration::milliseconds(5));
+
+        assert!(
+            builder
+                .on_hint(&focus_hint(1, focus_a.clone(), now))
+                .is_none()
+        );
+        assert_eq!(
+            builder
+                .current_focus()
+                .expect("focus tracked")
+                .window_title
+                .as_str(),
+            "Alpha"
+        );
+
+        let first_record = builder
+            .on_hint(&focus_hint(
+                2,
+                focus_b.clone(),
+                now + Duration::milliseconds(10),
+            ))
+            .expect("previous focus should close");
+
+        let first_focus = first_record.focus_info.expect("focus info present");
+        assert_eq!(first_focus.window_id, 100);
+        assert_eq!(first_focus.window_title.as_str(), "Alpha");
+        assert!(first_record.end_time.unwrap() >= first_record.start_time);
+
+        assert_eq!(
+            builder
+                .current_focus()
+                .expect("new focus retained")
+                .window_title
+                .as_str(),
+            "Beta"
+        );
+        assert_eq!(builder.current_state(), ActivityState::Inactive);
+
+        let final_record = builder.finalize_all().expect("final record emitted");
+        assert_eq!(
+            final_record.focus_info.unwrap().window_title.as_str(),
+            "Beta"
+        );
+    }
+
+    #[test]
+    fn record_builder_updates_title_for_active_window() {
+        let mut builder = RecordBuilder::new(ActivityState::Inactive);
+        let now = Utc::now();
+        let focus = make_focus(7, 2, "Browser", 200, "Inbox", now);
+
+        builder.on_hint(&focus_hint(1, focus.clone(), now));
+
+        let record = builder
+            .on_hint(&title_hint(
+                2,
+                200,
+                "Inbox – Reply",
+                now + Duration::milliseconds(5),
+            ))
+            .expect("title change closes previous slice");
+
+        assert_eq!(record.focus_info.unwrap().window_title.as_str(), "Inbox");
+        assert_eq!(builder.current_state(), ActivityState::Inactive);
+
+        let updated_focus = builder.current_focus().expect("focus retained");
+        assert_eq!(updated_focus.window_id, 200);
+        assert_eq!(updated_focus.window_title.as_str(), "Inbox – Reply");
+    }
+
+    #[test]
+    fn record_builder_ignores_title_change_for_non_focused_window() {
+        let mut builder = RecordBuilder::new(ActivityState::Inactive);
+        let now = Utc::now();
+        let focus = make_focus(8, 2, "Editor", 210, "plan.rs", now);
+        builder.on_hint(&focus_hint(1, focus.clone(), now));
+
+        // Title change for another window id should be ignored.
+        assert!(
+            builder
+                .on_hint(&title_hint(
+                    2,
+                    999,
+                    "release-notes",
+                    now + Duration::seconds(1)
+                ))
+                .is_none()
+        );
+        assert_eq!(
+            builder
+                .current_focus()
+                .expect("focus intact")
+                .window_title
+                .as_str(),
+            "plan.rs"
+        );
+    }
+
+    #[test]
+    fn record_builder_tracks_state_transitions() {
+        let mut builder = RecordBuilder::new(ActivityState::Inactive);
+        let now = Utc::now();
+        let focus = make_focus(5, 3, "Editor", 300, "Doc", now);
+
+        builder.on_hint(&focus_hint(1, focus, now));
+
+        let to_active = state_hint(
+            2,
+            now + Duration::milliseconds(1),
+            ActivityState::Inactive,
+            ActivityState::Active,
+        );
+        let inactive_slice = builder
+            .on_hint(&to_active)
+            .expect("transition to active finalizes inactive slice");
+        assert_eq!(inactive_slice.state, ActivityState::Inactive);
+        assert_eq!(builder.current_state(), ActivityState::Active);
+
+        let stay_active = state_hint(
+            3,
+            now + Duration::milliseconds(2),
+            ActivityState::Active,
+            ActivityState::Active,
+        );
+        assert!(builder.on_hint(&stay_active).is_none());
+
+        let back_inactive = state_hint(
+            4,
+            now + Duration::milliseconds(3),
+            ActivityState::Active,
+            ActivityState::Inactive,
+        );
+        let active_slice = builder
+            .on_hint(&back_inactive)
+            .expect("transition back closes active slice");
+        assert_eq!(active_slice.state, ActivityState::Active);
+        assert_eq!(builder.current_state(), ActivityState::Inactive);
+    }
+
+    #[test]
+    fn aggregation_groups_ephemeral_and_temporal_windows() {
+        let base = Utc.with_ymd_and_hms(2024, 1, 1, 0, 0, 0).unwrap();
+        let since = base - Duration::seconds(10);
+        let now = base + Duration::seconds(1_000);
+
+        let focus_small_a = make_focus(10, 77, "Slack", 1, "Foo", base);
+        let focus_small_b = make_focus(10, 77, "Slack", 2, "foo ", base + Duration::seconds(40));
+        let focus_meeting_a =
+            make_focus(10, 77, "Slack", 3, "Meeting", base + Duration::seconds(100));
+        let focus_meeting_b =
+            make_focus(10, 77, "Slack", 4, "Meeting", base + Duration::seconds(360));
+        let focus_solo = make_focus(10, 77, "Slack", 5, "Solo", base + Duration::seconds(800));
+
+        let records = vec![
+            make_record(1, focus_small_a.clone(), base, 30),
+            make_record(2, focus_small_b.clone(), base + Duration::seconds(40), 30),
+            make_record(
+                3,
+                focus_meeting_a.clone(),
+                base + Duration::seconds(100),
+                200,
+            ),
+            make_record(
+                4,
+                focus_meeting_b.clone(),
+                base + Duration::seconds(360),
+                150,
+            ),
+            make_record(5, focus_solo.clone(), base + Duration::seconds(800), 100),
+        ];
+
+        let apps = aggregate_activities_since(&records, since, now, 60, 2, 10);
+        assert_eq!(apps.len(), 1);
+        let agg = &apps[0];
+        assert_eq!(agg.pid, 10);
+        assert_eq!(agg.total_duration_seconds, 30 + 30 + 200 + 150 + 100);
+        assert_eq!(agg.first_seen, base);
+        assert_eq!(agg.last_seen, base + Duration::seconds(900));
+
+        let eph = agg
+            .ephemeral_groups
+            .get("foo")
+            .expect("ephemeral group created");
+        assert_eq!(eph.distinct_ids.len(), 2);
+        assert_eq!(eph.occurrence_count, 2);
+        assert_eq!(eph.total_duration_seconds, 60);
+        assert_eq!(eph.first_seen, base);
+        assert_eq!(eph.last_seen, base + Duration::seconds(70));
+
+        assert_eq!(agg.temporal_groups.len(), 1);
+        let temporal = &agg.temporal_groups[0];
+        assert_eq!(temporal.title_key, "meeting");
+        assert_eq!(temporal.distinct_ids.len(), 2);
+        assert_eq!(temporal.total_duration_seconds, 200 + 150);
+        assert_eq!(temporal.max_duration_seconds, 200);
+        assert_eq!(temporal.first_seen, focus_meeting_a.window_instance_start);
+        assert_eq!(
+            temporal.last_seen,
+            focus_meeting_b.window_instance_start + Duration::seconds(150)
+        );
+
+        assert_eq!(agg.windows.len(), 1);
+        let solo = agg.windows.get(&5).expect("solo window retained");
+        assert_eq!(solo.window_title.as_str(), "Solo");
+        assert_eq!(solo.duration_seconds, 100);
+        assert_eq!(solo.record_count, 1);
+    }
+
+    #[test]
+    fn aggregation_trims_windows_by_recent_activity() {
+        let base = Utc.with_ymd_and_hms(2024, 2, 1, 12, 0, 0).unwrap();
+        let since = base - Duration::seconds(1);
+        let now = base + Duration::seconds(1_000);
+
+        let records = vec![
+            make_record(1, make_focus(20, 99, "Editor", 10, "Spec", base), base, 30),
+            make_record(
+                2,
+                make_focus(
+                    20,
+                    99,
+                    "Editor",
+                    11,
+                    "Review",
+                    base + Duration::seconds(200),
+                ),
+                base + Duration::seconds(200),
+                120,
+            ),
+            make_record(
+                3,
+                make_focus(
+                    20,
+                    99,
+                    "Editor",
+                    12,
+                    "Summary",
+                    base + Duration::seconds(600),
+                ),
+                base + Duration::seconds(600),
+                160,
+            ),
+        ];
+
+        let apps = aggregate_activities_since(&records, since, now, 10, 10, 2);
+        let agg = &apps[0];
+        assert_eq!(agg.windows.len(), 2);
+        assert!(agg.windows.get(&10).is_none());
+        assert!(agg.windows.contains_key(&11));
+        assert!(agg.windows.contains_key(&12));
+    }
 }

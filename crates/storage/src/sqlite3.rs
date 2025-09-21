@@ -1,16 +1,19 @@
-use crate::daemon::events::RawEvent;
-use crate::daemon::events::model::{
-    EventEnvelope, EventKind, EventPayload, EventSource, HintKind, SignalKind,
-};
-use crate::daemon::records::ActivityRecord;
-use crate::storage::{StorageBackend, StorageCommand, dec_backlog, inc_backlog, set_last_flush};
+use crate::{StorageBackend, StorageCommand, dec_backlog, inc_backlog, set_last_flush};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use rusqlite::{Connection, params};
 use serde_json;
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::thread;
+
+use kronical_core::compression::CompactEvent;
+use kronical_core::events::RawEvent;
+use kronical_core::events::model::{
+    EventEnvelope, EventKind, EventPayload, EventSource, HintKind, SignalKind,
+};
+use kronical_core::records::{ActivityRecord, ActivityState};
+use kronical_core::snapshot;
 
 // Uses shared StorageCommand from crate::storage
 
@@ -21,7 +24,10 @@ pub struct SqliteStorage {
 }
 
 impl SqliteStorage {
-    pub fn new<P: AsRef<Path>>(db_path: P) -> Result<Self> {
+    pub fn new<P: AsRef<Path>>(
+        db_path: P,
+        snapshot_bus: Arc<snapshot::SnapshotBus>,
+    ) -> Result<Self> {
         let db_path = db_path.as_ref().to_path_buf();
 
         if let Some(parent) = db_path.parent() {
@@ -35,8 +41,9 @@ impl SqliteStorage {
         let (sender, receiver) = mpsc::channel();
 
         let db_path_clone = db_path.clone();
+        let bus_for_writer = Arc::clone(&snapshot_bus);
         let writer_thread = thread::spawn(move || {
-            Self::background_writer(db_path_clone, receiver);
+            Self::background_writer(db_path_clone, receiver, bus_for_writer);
         });
 
         Ok(Self {
@@ -78,12 +85,24 @@ impl SqliteStorage {
                 state TEXT NOT NULL,
                 focus_info TEXT
             );
+            CREATE TABLE IF NOT EXISTS compact_events (
+                start_time TEXT NOT NULL,
+                end_time TEXT NOT NULL,
+                kind TEXT NOT NULL,
+                payload TEXT,
+                raw_event_ids TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_compact_events_start_time ON compact_events(start_time);
             CREATE INDEX IF NOT EXISTS idx_activity_records_start_time ON activity_records(start_time);"
         )?;
         Ok(())
     }
 
-    fn background_writer(db_path: PathBuf, receiver: mpsc::Receiver<StorageCommand>) {
+    fn background_writer(
+        db_path: PathBuf,
+        receiver: mpsc::Receiver<StorageCommand>,
+        snapshot_bus: Arc<snapshot::SnapshotBus>,
+    ) {
         let mut conn = Connection::open(&db_path).expect("Failed to open DB in writer thread");
         let mut tx = conn.transaction().expect("Failed to start transaction");
         let mut count = 0;
@@ -161,19 +180,63 @@ impl SqliteStorage {
                         ],
                     )
                 }
+                StorageCommand::CompactEvents(events) => {
+                    let mut last_res: rusqlite::Result<usize> = Ok(0);
+                    for ce in events.into_iter() {
+                        let (start_time, end_time, kind_s, payload_js, raw_ids_js) = match &ce {
+                            CompactEvent::Scroll(s) => (
+                                s.start_time.to_rfc3339(),
+                                s.end_time.to_rfc3339(),
+                                "compact:scroll".to_string(),
+                                serde_json::to_string(&s).ok(),
+                                serde_json::to_string(&s.raw_event_ids).unwrap_or("[]".to_string()),
+                            ),
+                            CompactEvent::MouseTrajectory(t) => (
+                                t.start_time.to_rfc3339(),
+                                t.end_time.to_rfc3339(),
+                                "compact:mouse_traj".to_string(),
+                                serde_json::to_string(&t).ok(),
+                                serde_json::to_string(&t.raw_event_ids).unwrap_or("[]".to_string()),
+                            ),
+                            CompactEvent::Keyboard(k) => (
+                                k.start_time.to_rfc3339(),
+                                k.end_time.to_rfc3339(),
+                                "compact:keyboard".to_string(),
+                                serde_json::to_string(&k).ok(),
+                                serde_json::to_string(&k.raw_event_ids).unwrap_or("[]".to_string()),
+                            ),
+                            CompactEvent::Focus(f) => (
+                                f.timestamp.to_rfc3339(),
+                                f.timestamp.to_rfc3339(),
+                                "compact:focus".to_string(),
+                                serde_json::to_string(&f).ok(),
+                                serde_json::to_string(&vec![f.event_id])
+                                    .unwrap_or("[]".to_string()),
+                            ),
+                        };
+                        last_res = tx.execute(
+                            "INSERT INTO compact_events (start_time, end_time, kind, payload, raw_event_ids) VALUES (?, ?, ?, ?, ?)",
+                            params![start_time, end_time, kind_s, payload_js, raw_ids_js],
+                        );
+                        if last_res.is_err() {
+                            break;
+                        }
+                    }
+                    last_res
+                }
                 StorageCommand::Shutdown => break,
             };
 
             if let Err(e) = result {
                 eprintln!("Failed to write to DB: {}", e);
-                crate::daemon::snapshot::push_health(format!("db write error: {}", e));
+                snapshot_bus.push_health(format!("db write error: {}", e));
             }
 
             count += 1;
             if count % 100 == 0 {
                 if let Err(e) = tx.commit() {
                     eprintln!("Failed to commit transaction: {}", e);
-                    crate::daemon::snapshot::push_health(format!("db commit error: {}", e));
+                    snapshot_bus.push_health(format!("db commit error: {}", e));
                 }
                 set_last_flush(Utc::now());
                 tx = conn.transaction().expect("Failed to start new transaction");
@@ -182,7 +245,7 @@ impl SqliteStorage {
         }
         if let Err(e) = tx.commit() {
             eprintln!("Final commit error: {}", e);
-            crate::daemon::snapshot::push_health(format!("db final commit error: {}", e));
+            snapshot_bus.push_health(format!("db final commit error: {}", e));
         }
         set_last_flush(Utc::now());
     }
@@ -209,10 +272,14 @@ impl StorageBackend for SqliteStorage {
         Ok(())
     }
 
-    fn add_compact_events(
-        &mut self,
-        _events: Vec<crate::daemon::compressor::CompactEvent>,
-    ) -> Result<()> {
+    fn add_compact_events(&mut self, events: Vec<CompactEvent>) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        self.sender
+            .send(StorageCommand::CompactEvents(events))
+            .context("Failed to send compact events to writer")?;
+        inc_backlog();
         Ok(())
     }
 
@@ -259,13 +326,13 @@ impl StorageBackend for SqliteStorage {
             };
 
             let state = match state_s.as_str() {
-                "Active" => crate::daemon::records::ActivityState::Active,
-                "Passive" => crate::daemon::records::ActivityState::Passive,
-                "Inactive" => crate::daemon::records::ActivityState::Inactive,
-                "Locked" => crate::daemon::records::ActivityState::Locked,
+                "Active" => ActivityState::Active,
+                "Passive" => ActivityState::Passive,
+                "Inactive" => ActivityState::Inactive,
+                "Locked" => ActivityState::Locked,
                 other => {
                     eprintln!("Unknown state in DB: {}", other);
-                    crate::daemon::records::ActivityState::Inactive
+                    ActivityState::Inactive
                 }
             };
 
@@ -374,13 +441,12 @@ impl StorageBackend for SqliteStorage {
                     } else if kind_s.contains("state_changed") {
                         match serde_json::from_str::<(String, String)>(&js) {
                             Ok((from_s, to_s)) => {
-                                use crate::daemon::records::ActivityState as S;
                                 let parse = |s: &str| match s {
-                                    "Active" => S::Active,
-                                    "Passive" => S::Passive,
-                                    "Inactive" => S::Inactive,
-                                    "Locked" => S::Locked,
-                                    _ => S::Inactive,
+                                    "Active" => ActivityState::Active,
+                                    "Passive" => ActivityState::Passive,
+                                    "Inactive" => ActivityState::Inactive,
+                                    "Locked" => ActivityState::Locked,
+                                    _ => ActivityState::Inactive,
                                 };
                                 EventPayload::State {
                                     from: parse(&from_s),
