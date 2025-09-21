@@ -103,3 +103,98 @@ pub fn infer_scroll_direction(amount: i32, axis: WheelAxis) -> ScrollDirection {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use chrono::{TimeZone, Utc};
+
+    fn ts(sec: u32) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2024, 4, 22, 12, 0, sec).unwrap()
+    }
+
+    #[test]
+    fn memory_size_accounts_for_dynamic_path_length() {
+        let trajectory = CompactMouseTrajectory {
+            start_time: ts(0),
+            end_time: ts(1),
+            event_type: MouseTrajectoryType::Movement,
+            start_position: MousePosition { x: 0, y: 0 },
+            end_position: MousePosition { x: 10, y: 10 },
+            simplified_path: vec![MousePosition { x: 2, y: 2 }, MousePosition { x: 5, y: 5 }],
+            total_distance: 14.1,
+            max_velocity: 7.0,
+            raw_event_ids: vec![1, 2, 3],
+        };
+
+        let evt = CompactEvent::MouseTrajectory(trajectory.clone());
+        let base = std::mem::size_of::<CompactMouseTrajectory>();
+        let per_point = std::mem::size_of::<MousePosition>();
+        assert_eq!(
+            evt.memory_size(),
+            base + trajectory.simplified_path.len() * per_point
+        );
+
+        let keyboard = CompactEvent::Keyboard(CompactKeyboardActivity {
+            start_time: ts(0),
+            end_time: ts(5),
+            keystrokes: 10,
+            keys_per_minute: 120.0,
+            density_per_sec: 2.0,
+            raw_event_ids: vec![10, 11],
+        });
+        assert_eq!(
+            keyboard.memory_size(),
+            std::mem::size_of::<CompactKeyboardActivity>()
+        );
+
+        let focus = CompactEvent::Focus(CompactFocusEvent {
+            timestamp: ts(2),
+            app_name_id: 1,
+            window_title_id: 2,
+            pid: 4242,
+            window_position: Some(MousePosition { x: 20, y: 30 }),
+            event_id: 9,
+        });
+        assert_eq!(
+            focus.memory_size(),
+            std::mem::size_of::<CompactFocusEvent>()
+        );
+    }
+
+    #[test]
+    fn scroll_memory_size_matches_struct_size() {
+        let scroll = CompactScrollSequence {
+            start_time: ts(0),
+            end_time: ts(1),
+            direction: ScrollDirection::VerticalDown,
+            total_amount: -5,
+            total_rotation: -5,
+            scroll_count: 3,
+            position: MousePosition { x: 10, y: 20 },
+            raw_event_ids: vec![10, 11],
+        };
+        let event = CompactEvent::Scroll(scroll.clone());
+        assert_eq!(event.memory_size(), std::mem::size_of::<CompactScrollSequence>());
+    }
+
+    #[test]
+    fn infers_scroll_direction_for_axis_and_sign() {
+        assert_eq!(
+            infer_scroll_direction(4, WheelAxis::Vertical),
+            ScrollDirection::VerticalUp
+        );
+        assert_eq!(
+            infer_scroll_direction(-3, WheelAxis::Vertical),
+            ScrollDirection::VerticalDown
+        );
+        assert_eq!(
+            infer_scroll_direction(2, WheelAxis::Horizontal),
+            ScrollDirection::HorizontalRight
+        );
+        assert_eq!(
+            infer_scroll_direction(-1, WheelAxis::Horizontal),
+            ScrollDirection::HorizontalLeft
+        );
+    }
+}

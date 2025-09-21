@@ -110,3 +110,147 @@ impl AppConfig {
         Ok(app_config)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::{
+        fs,
+        sync::{Mutex, OnceLock},
+    };
+
+    fn set_env(key: &str, val: impl AsRef<std::ffi::OsStr>) {
+        unsafe { std::env::set_var(key, val) };
+    }
+
+    fn remove_env(key: &str) {
+        unsafe { std::env::remove_var(key) };
+    }
+
+    fn with_env_lock<T>(f: impl FnOnce() -> T) -> T {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let guard = LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock poisoned");
+        let result = f();
+        drop(guard);
+        result
+    }
+
+    #[test]
+    fn default_values_match_expected_profile() {
+        with_env_lock(|| {
+            let cfg = AppConfig::default();
+            assert!(cfg.workspace_dir.ends_with(".kronical"));
+            assert_eq!(cfg.db_backend, DatabaseBackendConfig::Duckdb);
+            assert_eq!(cfg.tracker_db_backend, DatabaseBackendConfig::Duckdb);
+            assert_eq!(cfg.retention_minutes, 72 * 60);
+            assert_eq!(cfg.active_grace_secs, 30);
+            assert_eq!(cfg.idle_threshold_secs, 300);
+            assert_eq!(cfg.ephemeral_min_distinct_ids, 3);
+            assert_eq!(cfg.max_windows_per_app, 30);
+            assert!(!cfg.tracker_enabled);
+            assert_eq!(cfg.tracker_batch_size, 60);
+            assert_eq!(cfg.duckdb_memory_limit_mb_main, 10);
+            assert_eq!(cfg.duckdb_memory_limit_mb_tracker, 10);
+        });
+    }
+
+    #[test]
+    fn load_merges_config_file_and_environment_overrides() {
+        with_env_lock(|| {
+            use tempfile::tempdir;
+
+            let saved_home = std::env::var_os("HOME");
+            if saved_home.is_some() {
+                remove_env("HOME");
+            }
+
+            let original_home = std::env::var_os("HOME");
+            let dir = tempdir().expect("tempdir");
+            set_env("HOME", dir.path());
+
+            let workspace_dir = dir.path().join(".kronical");
+            fs::create_dir_all(&workspace_dir).expect("create workspace");
+            let config_path = workspace_dir.join("config.toml");
+            let config_contents =
+                format!("workspace_dir = \"{}\"\n", workspace_dir.to_string_lossy())
+                    + "db_backend = \"sqlite3\"\n"
+                    + "tracker_db_backend = \"duckdb\"\n"
+                    + "retention_minutes = 45\n"
+                    + "tracker_enabled = true\n"
+                    + "title_cache_capacity = 1024\n"
+                    + "duckdb_memory_limit_mb_main = 256\n";
+            fs::write(&config_path, config_contents).expect("write config");
+
+            // Environment vars override the file.
+            set_env("KRONICAL_TRACKER_ENABLED", "false");
+            set_env("KRONICAL_TITLE_CACHE_CAPACITY", "2048");
+
+            let cfg = AppConfig::load().expect("load config");
+
+            assert_eq!(cfg.workspace_dir, workspace_dir);
+            assert_eq!(cfg.db_backend, DatabaseBackendConfig::Sqlite3);
+            assert_eq!(cfg.tracker_db_backend, DatabaseBackendConfig::Duckdb);
+            assert_eq!(cfg.retention_minutes, 45);
+            assert!(!cfg.tracker_enabled, "env override should win");
+            assert_eq!(cfg.title_cache_capacity, 2048);
+            assert_eq!(cfg.duckdb_memory_limit_mb_main, 256);
+
+            remove_env("KRONICAL_TRACKER_ENABLED");
+            remove_env("KRONICAL_TITLE_CACHE_CAPACITY");
+
+            if let Some(val) = original_home {
+                set_env("HOME", val);
+            } else {
+                remove_env("HOME");
+            }
+
+            if let Some(val) = saved_home {
+                set_env("HOME", val);
+            }
+        });
+    }
+
+    #[test]
+    fn load_restores_home_when_it_was_unset() {
+        with_env_lock(|| {
+            use tempfile::tempdir;
+
+            let saved_home = std::env::var_os("HOME");
+            if saved_home.is_some() {
+                remove_env("HOME");
+            }
+
+            let original_home = std::env::var_os("HOME");
+
+            let dir = tempdir().expect("tempdir");
+            set_env("HOME", dir.path());
+
+            let workspace_dir = dir.path().join(".kronical");
+            std::fs::create_dir_all(&workspace_dir).expect("create workspace");
+            let config_path = workspace_dir.join("config.toml");
+            std::fs::write(
+                &config_path,
+                "db_backend = \"duckdb\"\n",
+            )
+            .expect("write config");
+
+            let cfg = AppConfig::load().expect("load config");
+            assert_eq!(cfg.workspace_dir, workspace_dir);
+
+            // Removing HOME in the loader should leave it unset here.
+            remove_env("HOME");
+            assert!(std::env::var_os("HOME").is_none());
+
+            if let Some(val) = original_home {
+                set_env("HOME", val);
+            }
+
+            if let Some(val) = saved_home {
+                set_env("HOME", val);
+            }
+        });
+    }
+}

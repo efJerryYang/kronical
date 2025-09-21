@@ -1,6 +1,16 @@
 # Kronical
 
-Activity tracking daemon (kronid) with dual-stream pattern, channel‑based workers, and explicit state transitions.
+Activity tracking daemon (kronid) with dual-stream pattern, channel‑based workers, and explicit state transitions. The workspace is structured so service code can stabilise while Kronii (planned UI agent) consumes the same APIs without depending on daemon internals.
+
+## Repository Layout
+
+- `crates/common/`: shared utilities (config loading, paths, LRU/ interner helpers) used by every service component.
+- `crates/core/`: domain logic—event envelopes, signal/hint derivation, record aggregation, compression, and snapshot bus.
+- `crates/storage/`: thin storage facade plus backend threads for DuckDB and SQLite; integration tests live in `crates/storage/tests` to exercise the public metrics APIs.
+- `src/daemon/`: runtime wiring (coordinator, pipeline, compressors, API surfaces, trackers). Channels ferry work between threads—no shared locks on hot paths.
+- `src/bin/`: binaries (`kronid`, `kronictl`); keep daemon-specific wiring here so future clients link only the crates above.
+
+When you are orienting yourself, start with `src/daemon/coordinator.rs` for the hook → envelope flow, then follow the channel handoffs into `crates/core::events`, `crates/core::records`, and the storage crate.
 
 ## State Machine
 
@@ -53,6 +63,15 @@ kronictl tracker status           # Show tracker status
 kronictl tracker show             # Show tracker data
 kronictl tracker show --watch     # Follow tracker updates
 ```
+
+## Testing & Coverage
+
+- Unit tests live alongside the crates; prefer running focused suites (`cargo test -p kronical-core`, `cargo test -p kronical-storage`, etc.) so failures stay scoped. Integration checks that touch multiple crates now live under each crate's `tests/` directory (for example, storage metrics coverage sits in `crates/storage/tests/metrics_watch.rs`).
+- Tests should assert observable behaviour (state transitions, channel hand-offs, storage updates) rather than tautological checks.
+- Run `make coverage` to execute the workspace under `cargo llvm-cov`. The task emits:
+  - `coverage/summary.txt`: plain-text summary also echoed to the terminal.
+  - `coverage/html/`: full HTML report for local inspection.
+- Coverage uploads use the Codecov integration referenced by the badge above; ensure `make coverage` passes before pushing so CI can report accurate deltas.
 
 ## Permissions (macOS)
 

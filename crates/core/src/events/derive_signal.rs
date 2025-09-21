@@ -51,11 +51,206 @@ impl LockDeriver {
                             self.locked = false;
                         }
                     }
-                    _ => {}
+                    _ => {
+                        // Any other signal clears the loginwindow lock if present.
+                        if self.locked {
+                            out.push(EventEnvelope {
+                                id: e.id,
+                                timestamp: e.timestamp,
+                                source: EventSource::Derived,
+                                kind: EventKind::Signal(SignalKind::LockEnd),
+                                payload: EventPayload::Lock {
+                                    reason: "fallback".to_string(),
+                                },
+                                derived: true,
+                                polling: false,
+                                sensitive: false,
+                            });
+                            self.locked = false;
+                        }
+                    }
                 }
             }
             out.push(e.clone());
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::events::{KeyboardEventData, MousePosition, WindowFocusInfo};
+    use crate::events::model::HintKind;
+    use chrono::{TimeZone, Utc};
+    use std::sync::Arc;
+
+    fn focus_event(id: u64, app: &str, kind: SignalKind) -> EventEnvelope {
+        let ts = Utc
+            .with_ymd_and_hms(2024, 4, 22, 9, 30, id as u32 % 60)
+            .unwrap();
+        let focus = WindowFocusInfo {
+            pid: 1234,
+            process_start_time: 99,
+            app_name: Arc::new(app.to_string()),
+            window_title: Arc::new("Login Screen".to_string()),
+            window_id: 7,
+            window_instance_start: ts,
+            window_position: Some(MousePosition { x: 100, y: 200 }),
+            window_size: Some((800, 600)),
+        };
+        EventEnvelope {
+            id,
+            timestamp: ts,
+            source: EventSource::Hook,
+            kind: EventKind::Signal(kind),
+            payload: EventPayload::Focus(focus),
+            derived: false,
+            polling: false,
+            sensitive: false,
+        }
+    }
+
+    #[test]
+    fn emits_lock_start_when_login_window_focused() {
+        let mut deriver = LockDeriver::new();
+        let login_event = focus_event(1, "LOGINWINDOW", SignalKind::AppChanged);
+
+        let out = deriver.derive(&[login_event.clone()]);
+        assert_eq!(out.len(), 2, "derived lock start plus original event");
+        match &out[0].kind {
+            EventKind::Signal(SignalKind::LockStart) => {
+                assert!(out[0].derived);
+                if let EventPayload::Lock { reason } = &out[0].payload {
+                    assert_eq!(reason, "loginwindow");
+                } else {
+                    panic!("expected lock payload");
+                }
+            }
+            other => panic!("unexpected first kind: {:?}", other),
+        }
+        assert_eq!(out[1].kind, login_event.kind);
+        assert!(!out[1].derived);
+
+        // A subsequent loginwindow focus should not re-emit LockStart while locked.
+        let second = deriver.derive(&[login_event.clone()]);
+        assert_eq!(second.len(), 1);
+        assert_eq!(second[0].kind, login_event.kind);
+        assert!(!second[0].derived);
+    }
+
+    #[test]
+    fn emits_lock_end_when_focus_returns_to_normal_app() {
+        let mut deriver = LockDeriver::new();
+        let login_event = focus_event(5, "loginwindow", SignalKind::WindowChanged);
+        let _ = deriver.derive(&[login_event]);
+
+        let finder_event = focus_event(6, "Finder", SignalKind::WindowChanged);
+        let out = deriver.derive(&[finder_event.clone()]);
+
+        assert_eq!(out.len(), 2);
+        match &out[0].kind {
+            EventKind::Signal(SignalKind::LockEnd) => {
+                if let EventPayload::Lock { reason } = &out[0].payload {
+                    assert_eq!(reason, "unlock");
+                } else {
+                    panic!("expected unlock payload");
+                }
+            }
+            other => panic!("expected lock end, got {:?}", other),
+        }
+        assert_eq!(out[1].kind, finder_event.kind);
+    }
+
+    #[test]
+    fn other_signals_clear_lock_state() {
+        let mut deriver = LockDeriver::new();
+        let login_event = focus_event(7, "loginwindow", SignalKind::AppChanged);
+        let _ = deriver.derive(&[login_event]);
+
+        let keyboard_signal = EventEnvelope {
+            id: 8,
+            timestamp: Utc.with_ymd_and_hms(2024, 4, 22, 9, 31, 0).unwrap(),
+            source: EventSource::Hook,
+            kind: EventKind::Signal(SignalKind::KeyboardInput),
+            payload: EventPayload::Keyboard(KeyboardEventData {
+                key_code: Some(4),
+                key_char: Some('a'),
+                modifiers: vec![],
+            }),
+            derived: false,
+            polling: false,
+            sensitive: false,
+        };
+
+        let out = deriver.derive(&[keyboard_signal.clone()]);
+        assert_eq!(out.len(), 2);
+        match &out[0] {
+            EventEnvelope {
+                kind: EventKind::Signal(SignalKind::LockEnd),
+                payload: EventPayload::Lock { reason },
+                ..
+            } => assert_eq!(reason, "fallback"),
+            other => panic!("expected fallback lock end, got {:?}", other),
+        }
+        assert_eq!(out[1].kind, keyboard_signal.kind);
+
+        // Another non-login event should no longer emit LockEnd since lock is cleared.
+        let follow_up = deriver.derive(&[keyboard_signal.clone()]);
+        assert_eq!(follow_up.len(), 1);
+    }
+
+    #[test]
+    fn app_change_without_focus_payload_does_not_toggle_lock() {
+        let mut deriver = LockDeriver::new();
+        let ts = Utc.with_ymd_and_hms(2024, 4, 22, 9, 45, 0).unwrap();
+        let env = EventEnvelope {
+            id: 99,
+            timestamp: ts,
+            source: EventSource::Hook,
+            kind: EventKind::Signal(SignalKind::AppChanged),
+            payload: EventPayload::None,
+            derived: false,
+            polling: false,
+            sensitive: false,
+        };
+
+        let out = deriver.derive(&[env.clone()]);
+        assert_eq!(out.len(), 1, "should only forward original event");
+        let forwarded = &out[0];
+        assert_eq!(forwarded.id, env.id);
+        assert_eq!(forwarded.kind, env.kind);
+        assert_eq!(forwarded.source, env.source);
+        assert!(matches!(forwarded.payload, EventPayload::None));
+        assert_eq!(forwarded.polling, env.polling);
+        assert_eq!(forwarded.sensitive, env.sensitive);
+        assert!(!forwarded.derived);
+    }
+
+    #[test]
+    fn non_signal_events_pass_through_unmodified() {
+        let mut deriver = LockDeriver::new();
+        let ts = Utc.with_ymd_and_hms(2024, 4, 22, 9, 50, 0).unwrap();
+        let env = EventEnvelope {
+            id: 100,
+            timestamp: ts,
+            source: EventSource::Hook,
+            kind: EventKind::Hint(HintKind::FocusChanged),
+            payload: EventPayload::None,
+            derived: false,
+            polling: false,
+            sensitive: false,
+        };
+
+        let out = deriver.derive(&[env.clone()]);
+        assert_eq!(out.len(), 1);
+        let forwarded = &out[0];
+        assert_eq!(forwarded.id, env.id);
+        assert_eq!(forwarded.kind, env.kind);
+        assert_eq!(forwarded.source, env.source);
+        assert!(matches!(forwarded.payload, EventPayload::None));
+        assert_eq!(forwarded.polling, env.polling);
+        assert_eq!(forwarded.sensitive, env.sensitive);
+        assert!(!forwarded.derived);
     }
 }

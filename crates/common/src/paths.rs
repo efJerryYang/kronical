@@ -36,3 +36,37 @@ pub fn tracker_db_with_backend(
 pub fn tracker_db(workspace_dir: &Path) -> PathBuf {
     tracker_db_with_backend(workspace_dir, &crate::config::DatabaseBackendConfig::Duckdb)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn pid_and_socket_paths_append_expected_names() {
+        let base = Path::new("/tmp/workspace");
+        assert_eq!(pid_file(base), base.join("kronid.pid"));
+        assert_eq!(grpc_uds(base), base.join("kroni.sock"));
+        assert_eq!(http_uds(base), base.join("kroni.http.sock"));
+    }
+
+    #[test]
+    fn tracker_db_resolves_per_backend() {
+        let base = Path::new("/opt/kronical");
+        use crate::config::DatabaseBackendConfig::{Duckdb, Sqlite3};
+        assert_eq!(
+            tracker_db_with_backend(base, &Duckdb),
+            base.join("system-tracker.duckdb")
+        );
+        assert_eq!(
+            tracker_db_with_backend(base, &Sqlite3),
+            base.join("system-tracker.sqlite3")
+        );
+    }
+
+    #[test]
+    fn tracker_db_defaults_to_duckdb_variant() {
+        let base = Path::new("/tmp/kronical");
+        assert_eq!(tracker_db(base), base.join("system-tracker.duckdb"));
+    }
+}
