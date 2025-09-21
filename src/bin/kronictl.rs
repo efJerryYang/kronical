@@ -35,6 +35,9 @@ use tonic::transport::Endpoint;
 
 use tower::service_fn;
 
+#[path = "kronictl/log_cli.rs"]
+mod log_cli;
+
 fn pretty_duration(seconds: u64) -> String {
     if seconds == 0 {
         return "0s".to_string();
@@ -120,6 +123,10 @@ enum Commands {
         pretty: bool,
     },
     Monitor,
+    Log {
+        #[command(subcommand)]
+        action: log_cli::LogCommand,
+    },
     Tracker {
         #[command(subcommand)]
         action: TrackerAction,
@@ -800,6 +807,7 @@ fn main() {
             pretty,
         ),
         Commands::Monitor => monitor_realtime(data_file),
+        Commands::Log { action } => log_cli::execute(action, &config.workspace_dir),
         Commands::Tracker { action } => match action {
             TrackerAction::Show { count, watch } => tracker_show(
                 &config.workspace_dir,

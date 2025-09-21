@@ -81,6 +81,7 @@ hyper-util = { version = "0.1", features = [
 ] }
 shellexpand = "3.1"
 indicatif = "0.18"
+regex = "1.10"
 
 [dev-dependencies]
 tempfile = "3.0"
