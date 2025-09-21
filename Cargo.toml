@@ -85,6 +85,7 @@ regex = "1.10"
 
 [dev-dependencies]
 tempfile = "3.0"
+mockall = "0.13"
 
 [lib]
 name = "kronical"

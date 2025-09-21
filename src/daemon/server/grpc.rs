@@ -22,35 +22,13 @@ use tokio_stream::StreamExt;
 use tokio_stream::wrappers::WatchStream;
 use tonic::{Request, Response, Status, transport::Server};
 
-#[cfg(test)]
-use once_cell::sync::Lazy;
-#[cfg(test)]
-use std::sync::Mutex;
 use std::time::Duration;
-#[cfg(test)]
-use tokio::sync::Notify;
 
 static SYSTEM_TRACKER_DB_PATH: OnceCell<PathBuf> = OnceCell::new();
 static SYSTEM_TRACKER_QUERY_TX: OnceCell<Sender<crate::daemon::tracker::MetricsQueryReq>> =
     OnceCell::new();
 static SYSTEM_TRACKER_CONTROL_TX: OnceCell<Sender<crate::daemon::tracker::ControlMsg>> =
     OnceCell::new();
-
-#[cfg(test)]
-static GRPC_TEST_SHUTDOWN: Lazy<Mutex<Option<Arc<Notify>>>> = Lazy::new(|| Mutex::new(None));
-
-#[cfg(test)]
-pub(crate) fn install_grpc_shutdown_notify(handle: Arc<Notify>) {
-    let mut guard = GRPC_TEST_SHUTDOWN.lock().unwrap();
-    *guard = Some(handle);
-}
-
-#[cfg(test)]
-pub(crate) fn trigger_grpc_shutdown() {
-    if let Some(handle) = GRPC_TEST_SHUTDOWN.lock().unwrap().take() {
-        handle.notify_waiters();
-    }
-}
 
 pub fn set_system_tracker_db_path(db_path: PathBuf) {
     let _ = SYSTEM_TRACKER_DB_PATH.set(db_path);
@@ -366,13 +344,6 @@ pub fn spawn_server(
     }
     let (tx, rx) = std::sync::mpsc::channel();
     let bus_for_thread = Arc::clone(&snapshot_bus);
-    #[cfg(test)]
-    let shutdown_notify = Arc::new(Notify::new());
-    #[cfg(test)]
-    install_grpc_shutdown_notify(Arc::clone(&shutdown_notify));
-    #[cfg(test)]
-    let shutdown_notify_for_thread = Arc::clone(&shutdown_notify);
-
     let handle = threads
         .spawn("grpc-server", move || {
             let rt = tokio::runtime::Builder::new_current_thread()
@@ -392,25 +363,11 @@ pub fn spawn_server(
                 let svc = KroniSvc::new(bus_for_thread);
                 tx.send(()).ok();
                 info!("kroni API listening on {:?}", uds_path);
-                #[cfg(test)]
-                {
-                    let shutdown = shutdown_notify_for_thread;
-                    Server::builder()
-                        .add_service(KroniServer::new(svc))
-                        .serve_with_incoming_shutdown(incoming, async move {
-                            shutdown.notified().await;
-                        })
-                        .await
-                        .expect("serve");
-                }
-                #[cfg(not(test))]
-                {
-                    Server::builder()
-                        .add_service(KroniServer::new(svc))
-                        .serve_with_incoming(incoming)
-                        .await
-                        .expect("serve");
-                }
+                Server::builder()
+                    .add_service(KroniServer::new(svc))
+                    .serve_with_incoming(incoming)
+                    .await
+                    .expect("serve");
             });
         })
         .context("spawn gRPC server thread")?;
@@ -442,7 +399,6 @@ mod tests {
     use super::*;
     use crate::daemon::events::WindowFocusInfo;
     use crate::daemon::records::ActivityState;
-    use crate::daemon::runtime::ThreadRegistry;
     use crate::daemon::snapshot::{
         ConfigSummary, Counts as SnapshotCounts, Snapshot, SnapshotApp, SnapshotWindow,
         StorageInfo, Transition as SnapshotTransition,
@@ -450,7 +406,6 @@ mod tests {
     use crate::kroni_api::kroni::v1::{SnapshotRequest, WatchRequest};
     use chrono::{Duration, TimeZone, Utc};
     use prost_types::Timestamp;
-    use std::path::PathBuf;
     use std::sync::Arc;
     use tokio_stream::StreamExt;
     use tonic::Request;
@@ -466,22 +421,6 @@ mod tests {
             window_position: None,
             window_size: Some((1440, 900)),
         }
-    }
-
-    fn test_socket_path(prefix: &str) -> PathBuf {
-        let mut base = std::env::current_dir().expect("cwd");
-        base.push("target/test-sockets");
-        std::fs::create_dir_all(&base).expect("mkdir test sockets");
-        let unique = format!(
-            "{}-{}-{}.sock",
-            prefix,
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_nanos()
-        );
-        base.join(unique)
     }
 
     #[test]
@@ -653,53 +592,5 @@ mod tests {
         let second = stream.next().await.expect("second item").expect("ok");
         assert_eq!(second.activity_state, PbState::Active as i32);
         assert_eq!(second.focus.unwrap().title, "Build log");
-    }
-
-    #[test]
-    #[ignore = "requires UDS permissions"]
-    fn spawn_server_serves_snapshot_and_shuts_down() {
-        let uds_path = test_socket_path("grpc");
-
-        let bus = Arc::new(snapshot::SnapshotBus::new());
-        bus.publish_basic(
-            ActivityState::Active,
-            Some(sample_focus()),
-            None,
-            SnapshotCounts {
-                signals_seen: 5,
-                hints_seen: 4,
-                records_emitted: 3,
-            },
-            320,
-            "unit-test".into(),
-            None,
-            StorageInfo {
-                backlog_count: 0,
-                last_flush_at: None,
-            },
-            ConfigSummary::default(),
-            vec!["ok".into()],
-            Vec::new(),
-        );
-
-        let handle =
-            match super::spawn_server(uds_path.clone(), Arc::clone(&bus), ThreadRegistry::new()) {
-                Ok(handle) => handle,
-                Err(e) => {
-                    let msg = e.to_string();
-                    assert!(
-                        msg.contains("Operation not permitted")
-                            || msg.contains("failed to signal readiness"),
-                        "unexpected spawn error: {}",
-                        msg
-                    );
-                    let _ = std::fs::remove_file(&uds_path);
-                    return;
-                }
-            };
-
-        super::trigger_grpc_shutdown();
-        handle.join().expect("join thread");
-        let _ = std::fs::remove_file(&uds_path);
     }
 }

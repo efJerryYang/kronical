@@ -4,6 +4,44 @@ use log::info;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+pub(crate) trait ApiServerSpawner {
+    fn spawn_grpc(
+        &self,
+        grpc_uds: PathBuf,
+        snapshot_bus: Arc<crate::daemon::snapshot::SnapshotBus>,
+        threads: ThreadRegistry,
+    ) -> Result<ThreadHandle>;
+
+    fn spawn_http(
+        &self,
+        http_uds: PathBuf,
+        snapshot_bus: Arc<crate::daemon::snapshot::SnapshotBus>,
+        threads: ThreadRegistry,
+    ) -> Result<ThreadHandle>;
+}
+
+struct DefaultApiServerSpawner;
+
+impl ApiServerSpawner for DefaultApiServerSpawner {
+    fn spawn_grpc(
+        &self,
+        grpc_uds: PathBuf,
+        snapshot_bus: Arc<crate::daemon::snapshot::SnapshotBus>,
+        threads: ThreadRegistry,
+    ) -> Result<ThreadHandle> {
+        crate::daemon::server::grpc::spawn_server(grpc_uds, snapshot_bus, threads)
+    }
+
+    fn spawn_http(
+        &self,
+        http_uds: PathBuf,
+        snapshot_bus: Arc<crate::daemon::snapshot::SnapshotBus>,
+        threads: ThreadRegistry,
+    ) -> Result<ThreadHandle> {
+        crate::daemon::server::http::spawn_http_server(http_uds, snapshot_bus, threads)
+    }
+}
+
 /// Join handles for running API transports.
 pub struct ApiHandles {
     pub grpc: Option<ThreadHandle>,
@@ -33,17 +71,25 @@ pub fn spawn_all(
     snapshot_bus: Arc<crate::daemon::snapshot::SnapshotBus>,
     threads: ThreadRegistry,
 ) -> Result<ApiHandles> {
-    let grpc = crate::daemon::server::grpc::spawn_server(
+    spawn_all_with(
+        &DefaultApiServerSpawner,
         grpc_uds,
-        Arc::clone(&snapshot_bus),
-        threads.clone(),
-    )?;
-    info!("Kroni gRPC API server started");
-    let http = crate::daemon::server::http::spawn_http_server(
         http_uds,
-        Arc::clone(&snapshot_bus),
+        snapshot_bus,
         threads,
-    )?;
+    )
+}
+
+fn spawn_all_with<S: ApiServerSpawner + ?Sized>(
+    spawner: &S,
+    grpc_uds: PathBuf,
+    http_uds: PathBuf,
+    snapshot_bus: Arc<crate::daemon::snapshot::SnapshotBus>,
+    threads: ThreadRegistry,
+) -> Result<ApiHandles> {
+    let grpc = spawner.spawn_grpc(grpc_uds, Arc::clone(&snapshot_bus), threads.clone())?;
+    info!("Kroni gRPC API server started");
+    let http = spawner.spawn_http(http_uds, Arc::clone(&snapshot_bus), threads)?;
     info!("HTTP admin/SSE server started");
     Ok(ApiHandles {
         grpc: Some(grpc),
@@ -74,65 +120,117 @@ pub fn set_system_tracker_control_tx(
 mod tests {
     use super::*;
     use crate::daemon::runtime::ThreadRegistry;
-    use crate::daemon::server::grpc::trigger_grpc_shutdown;
-    use crate::daemon::server::http::{reset_http_accept_budget, set_http_accept_budget};
     use crate::daemon::snapshot::SnapshotBus;
+    use mockall::mock;
     use std::path::PathBuf;
     use std::sync::Arc;
 
-    #[test]
-    #[ignore = "requires UDS permissions"]
-    fn spawn_all_returns_joinable_handles() {
-        fn test_socket_path(prefix: &str) -> PathBuf {
-            let mut base = std::env::current_dir().expect("cwd");
-            base.push("target/test-sockets");
-            std::fs::create_dir_all(&base).expect("mkdir test sockets");
-            let unique = format!(
-                "{}-{}-{}.sock",
-                prefix,
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            );
-            base.join(unique)
+    mock! {
+        pub Spawner {}
+        impl ApiServerSpawner for Spawner {
+            fn spawn_grpc(
+                &self,
+                grpc_uds: PathBuf,
+                snapshot_bus: Arc<crate::daemon::snapshot::SnapshotBus>,
+                threads: ThreadRegistry,
+            ) -> Result<ThreadHandle>;
+
+            fn spawn_http(
+                &self,
+                http_uds: PathBuf,
+                snapshot_bus: Arc<crate::daemon::snapshot::SnapshotBus>,
+                threads: ThreadRegistry,
+            ) -> Result<ThreadHandle>;
         }
+    }
 
-        let grpc_path = test_socket_path("grpc");
-        let http_path = test_socket_path("http");
+    #[test]
+    fn spawn_all_with_uses_spawner() {
+        let grpc_path = PathBuf::from("/tmp/grpc.sock");
+        let http_path = PathBuf::from("/tmp/http.sock");
         let bus = Arc::new(SnapshotBus::new());
+        let threads = ThreadRegistry::new();
 
-        set_http_accept_budget(0);
-        let handles = match spawn_all(
-            grpc_path.clone(),
-            http_path.clone(),
-            Arc::clone(&bus),
-            ThreadRegistry::new(),
-        ) {
-            Ok(handles) => handles,
-            Err(e) => {
-                let msg = e.to_string();
-                assert!(
-                    msg.contains("Operation not permitted")
-                        || msg.contains("failed to signal readiness"),
-                    "unexpected spawn error: {}",
-                    msg
-                );
-                reset_http_accept_budget();
-                let _ = std::fs::remove_file(&grpc_path);
-                let _ = std::fs::remove_file(&http_path);
-                return;
-            }
-        };
+        let mut spawner = MockSpawner::new();
+        let grpc_path_clone = grpc_path.clone();
+        spawner
+            .expect_spawn_grpc()
+            .withf(move |p, _, _| p == &grpc_path_clone)
+            .times(1)
+            .returning(|_, _, registry| registry.spawn("mock-grpc", || {}).map_err(Into::into));
 
-        trigger_grpc_shutdown();
+        let http_path_clone = http_path.clone();
+        spawner
+            .expect_spawn_http()
+            .withf(move |p, _, _| p == &http_path_clone)
+            .times(1)
+            .returning(|_, _, registry| registry.spawn("mock-http", || {}).map_err(Into::into));
+
+        let handles = spawn_all_with(&spawner, grpc_path, http_path, Arc::clone(&bus), threads)
+            .expect("spawn succeeds");
 
         handles.join_all();
+    }
 
-        let _ = std::fs::remove_file(&grpc_path);
-        let _ = std::fs::remove_file(&http_path);
+    #[test]
+    fn spawn_all_with_grpc_failure_bubbles_error() {
+        let grpc_path = PathBuf::from("/tmp/grpc.sock");
+        let http_path = PathBuf::from("/tmp/http.sock");
+        let bus = Arc::new(SnapshotBus::new());
+        let threads = ThreadRegistry::new();
 
-        reset_http_accept_budget();
+        let mut spawner = MockSpawner::new();
+        spawner
+            .expect_spawn_grpc()
+            .times(1)
+            .returning(|_, _, _| Err(anyhow::anyhow!("boom")));
+        spawner.expect_spawn_http().times(0);
+
+        let err = match spawn_all_with(&spawner, grpc_path, http_path, bus, threads) {
+            Ok(_) => panic!("expected error"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("boom"));
+    }
+
+    #[test]
+    fn spawn_all_with_http_failure_bubbles_error() {
+        let grpc_path = PathBuf::from("/tmp/grpc.sock");
+        let http_path = PathBuf::from("/tmp/http.sock");
+        let bus = Arc::new(SnapshotBus::new());
+        let threads = ThreadRegistry::new();
+
+        let mut spawner = MockSpawner::new();
+        spawner
+            .expect_spawn_grpc()
+            .times(1)
+            .returning(|_, _, registry| registry.spawn("mock-grpc", || {}).map_err(Into::into));
+        spawner
+            .expect_spawn_http()
+            .times(1)
+            .returning(|_, _, _| Err(anyhow::anyhow!("http failed")));
+
+        let err = match spawn_all_with(&spawner, grpc_path, http_path, bus, threads) {
+            Ok(_) => panic!("expected error"),
+            Err(err) => err,
+        };
+        assert!(err.to_string().contains("http failed"));
+    }
+
+    #[test]
+    fn join_all_waits_for_active_handles() {
+        let threads = ThreadRegistry::new();
+        let grpc_handle = threads
+            .spawn("grpc-thread", || {})
+            .expect("spawn grpc thread");
+        let http_handle = threads
+            .spawn("http-thread", || {})
+            .expect("spawn http thread");
+
+        ApiHandles {
+            grpc: Some(grpc_handle),
+            http: Some(http_handle),
+        }
+        .join_all();
     }
 }

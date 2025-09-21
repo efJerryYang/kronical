@@ -1,15 +1,29 @@
 use std::cmp::Ordering;
+use std::ffi::OsString;
 use std::fs;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, IsTerminal, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Local};
 use clap::{Args, Subcommand};
 use regex::Regex;
+
+trait CommandRunner: Send + Sync {
+    fn run(&self, program: &str, args: &[OsString]) -> io::Result<ExitStatus>;
+}
+
+#[derive(Clone, Copy, Default)]
+struct SystemCommandRunner;
+
+impl CommandRunner for SystemCommandRunner {
+    fn run(&self, program: &str, args: &[OsString]) -> io::Result<ExitStatus> {
+        Command::new(program).args(args).status()
+    }
+}
 
 #[derive(Subcommand, Debug)]
 pub enum LogCommand {
@@ -57,19 +71,44 @@ struct LogEntry {
 }
 
 pub fn execute(action: LogCommand, workspace_dir: &Path) -> Result<()> {
+    let stdout_handle = io::stdout();
+    let stderr_handle = io::stderr();
+    let stdout_is_terminal = stdout_handle.is_terminal();
+    let mut stdout_lock = stdout_handle.lock();
+    let mut stderr_lock = stderr_handle.lock();
+    execute_with_runner(
+        action,
+        workspace_dir,
+        &mut stdout_lock,
+        &mut stderr_lock,
+        &SystemCommandRunner,
+        stdout_is_terminal,
+    )
+}
+
+fn execute_with_runner(
+    action: LogCommand,
+    workspace_dir: &Path,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    runner: &dyn CommandRunner,
+    stdout_is_terminal: bool,
+) -> Result<()> {
     let log_dir = workspace_dir.join("logs");
     match action {
-        LogCommand::List(args) => list_logs(&log_dir, args),
-        LogCommand::Show(args) => show_logs(&log_dir, &args),
-        LogCommand::Filter(args) => filter_logs(&log_dir, &args),
+        LogCommand::List(args) => list_logs(&log_dir, args, stdout),
+        LogCommand::Show(args) => {
+            show_logs(&log_dir, &args, stdout, stderr, runner, stdout_is_terminal)
+        }
+        LogCommand::Filter(args) => filter_logs(&log_dir, &args, stdout, runner),
     }
 }
 
-fn list_logs(log_dir: &Path, args: ListArgs) -> Result<()> {
+fn list_logs(log_dir: &Path, args: ListArgs, stdout: &mut dyn Write) -> Result<()> {
     let mut entries = collect_log_entries(log_dir)?;
 
     if entries.is_empty() {
-        println!("No log files under {}", log_dir.display());
+        writeln!(stdout, "No log files under {}", log_dir.display())?;
         return Ok(());
     }
 
@@ -89,38 +128,47 @@ fn list_logs(log_dir: &Path, args: ListArgs) -> Result<()> {
         let modified: DateTime<Local> = entry.modified.into();
         let label = format!("{:>4}", raw_index);
 
-        println!(
+        writeln!(
+            stdout,
             "{}  {}  {:>7}  {}",
             label,
             modified.format("%Y-%m-%d %H:%M:%S"),
             human_size(entry.size),
             entry.path.display()
-        );
+        )?;
     }
 
     if args.reverse && total > 0 {
         let newest_negative = -1;
         let newest_positive = total - 1;
-        println!(
+        writeln!(
+            stdout,
             "(latest log: index {} or {})",
             newest_positive, newest_negative
-        );
+        )?;
     }
 
     Ok(())
 }
 
-fn show_logs(log_dir: &Path, args: &ShowArgs) -> Result<()> {
+fn show_logs(
+    log_dir: &Path,
+    args: &ShowArgs,
+    stdout: &mut dyn Write,
+    stderr: &mut dyn Write,
+    runner: &dyn CommandRunner,
+    stdout_is_terminal: bool,
+) -> Result<()> {
     let entries = collect_log_entries(log_dir)?;
     if entries.is_empty() {
-        println!("No log files under {}", log_dir.display());
+        writeln!(stdout, "No log files under {}", log_dir.display())?;
         return Ok(());
     }
 
     let selected = parse_selection(&args.selection, entries.len())?;
 
     if selected.is_empty() {
-        println!("No matching log indexes");
+        writeln!(stdout, "No matching log indexes")?;
         return Ok(());
     }
 
@@ -129,12 +177,12 @@ fn show_logs(log_dir: &Path, args: &ShowArgs) -> Result<()> {
         .map(|idx| entries[idx].clone())
         .collect();
 
-    let use_pager = !args.no_pager && io::stdout().is_terminal();
+    let use_pager = !args.no_pager && stdout_is_terminal;
     if use_pager {
-        match run_less(&selected_entries) {
+        match run_less(&selected_entries, runner) {
             Ok(()) => return Ok(()),
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                eprintln!("less not found; printing to stdout instead");
+                writeln!(stderr, "less not found; printing to stdout instead")?;
             }
             Err(e) => {
                 return Err(anyhow!("failed to launch pager: {}", e));
@@ -142,7 +190,6 @@ fn show_logs(log_dir: &Path, args: &ShowArgs) -> Result<()> {
         }
     }
 
-    let mut stdout = io::stdout().lock();
     for (i, entry) in selected_entries.iter().enumerate() {
         if i > 0 {
             writeln!(stdout)?;
@@ -165,7 +212,7 @@ fn show_logs(log_dir: &Path, args: &ShowArgs) -> Result<()> {
             ends_with_newline = last[0] == b'\n';
             file.seek(SeekFrom::Start(0))?;
         }
-        io::copy(&mut file, &mut stdout)?;
+        io::copy(&mut file, stdout)?;
         if !ends_with_newline {
             writeln!(stdout)?;
         }
@@ -174,10 +221,15 @@ fn show_logs(log_dir: &Path, args: &ShowArgs) -> Result<()> {
     Ok(())
 }
 
-fn filter_logs(log_dir: &Path, args: &FilterArgs) -> Result<()> {
+fn filter_logs(
+    log_dir: &Path,
+    args: &FilterArgs,
+    stdout: &mut dyn Write,
+    runner: &dyn CommandRunner,
+) -> Result<()> {
     let mut entries = collect_log_entries(log_dir)?;
     if entries.is_empty() {
-        println!("No log files under {}", log_dir.display());
+        writeln!(stdout, "No log files under {}", log_dir.display())?;
         return Ok(());
     }
 
@@ -188,18 +240,18 @@ fn filter_logs(log_dir: &Path, args: &FilterArgs) -> Result<()> {
     entries.retain(|entry| entry.modified >= cutoff);
 
     if entries.is_empty() {
-        println!("No log files from the last {} hours", args.hours);
+        writeln!(stdout, "No log files from the last {} hours", args.hours)?;
         return Ok(());
     }
 
-    if try_rg(&args.pattern, &entries)? {
+    if try_rg(&args.pattern, &entries, runner)? {
         return Ok(());
     }
-    if try_grep(&args.pattern, &entries)? {
+    if try_grep(&args.pattern, &entries, runner)? {
         return Ok(());
     }
 
-    filter_with_regex(&args.pattern, &entries)
+    filter_with_regex(&args.pattern, &entries, stdout)
 }
 
 fn collect_log_entries(log_dir: &Path) -> Result<Vec<LogEntry>> {
@@ -340,30 +392,32 @@ fn neg_index(index: usize, len: usize) -> isize {
     index as isize - len as isize
 }
 
-fn run_less(entries: &[LogEntry]) -> io::Result<()> {
+fn run_less(entries: &[LogEntry], runner: &dyn CommandRunner) -> io::Result<()> {
     if entries.is_empty() {
         return Ok(());
     }
-    let status = Command::new("less")
-        .arg("-R")
-        .arg("--")
-        .args(entries.iter().map(|entry| entry.path.as_os_str()))
-        .status()?;
+    let mut args = Vec::with_capacity(2 + entries.len());
+    args.push(OsString::from("-R"));
+    args.push(OsString::from("--"));
+    for entry in entries {
+        args.push(entry.path.as_os_str().to_os_string());
+    }
+    let status = runner.run("less", &args)?;
     if status.success() { Ok(()) } else { Ok(()) }
 }
 
-fn try_rg(pattern: &str, entries: &[LogEntry]) -> Result<bool> {
+fn try_rg(pattern: &str, entries: &[LogEntry], runner: &dyn CommandRunner) -> Result<bool> {
     if entries.is_empty() {
         return Ok(true);
     }
-    let mut command = Command::new("rg");
-    command.arg("--color=never");
-    command.arg(pattern);
-    command.arg("--");
+    let mut args = Vec::with_capacity(entries.len() + 3);
+    args.push(OsString::from("--color=never"));
+    args.push(OsString::from(pattern));
+    args.push(OsString::from("--"));
     for entry in entries {
-        command.arg(&entry.path);
+        args.push(entry.path.as_os_str().to_os_string());
     }
-    match command.status() {
+    match runner.run("rg", &args) {
         Ok(status) => {
             if status.success() || status.code() == Some(1) {
                 Ok(true)
@@ -376,18 +430,18 @@ fn try_rg(pattern: &str, entries: &[LogEntry]) -> Result<bool> {
     }
 }
 
-fn try_grep(pattern: &str, entries: &[LogEntry]) -> Result<bool> {
+fn try_grep(pattern: &str, entries: &[LogEntry], runner: &dyn CommandRunner) -> Result<bool> {
     if entries.is_empty() {
         return Ok(true);
     }
-    let mut command = Command::new("grep");
-    command.arg("-E");
-    command.arg(pattern);
-    command.arg("--");
+    let mut args = Vec::with_capacity(entries.len() + 3);
+    args.push(OsString::from("-E"));
+    args.push(OsString::from(pattern));
+    args.push(OsString::from("--"));
     for entry in entries {
-        command.arg(&entry.path);
+        args.push(entry.path.as_os_str().to_os_string());
     }
-    match command.status() {
+    match runner.run("grep", &args) {
         Ok(status) => {
             if status.success() || status.code() == Some(1) {
                 Ok(true)
@@ -400,7 +454,7 @@ fn try_grep(pattern: &str, entries: &[LogEntry]) -> Result<bool> {
     }
 }
 
-fn filter_with_regex(pattern: &str, entries: &[LogEntry]) -> Result<()> {
+fn filter_with_regex(pattern: &str, entries: &[LogEntry], stdout: &mut dyn Write) -> Result<()> {
     let regex = Regex::new(pattern)?;
     let mut found = false;
     for entry in entries {
@@ -409,13 +463,13 @@ fn filter_with_regex(pattern: &str, entries: &[LogEntry]) -> Result<()> {
         for line in BufReader::new(file).lines() {
             let line = line?;
             if regex.is_match(&line) {
-                println!("{}:{}", entry.path.display(), line);
+                writeln!(stdout, "{}:{}", entry.path.display(), line)?;
                 found = true;
             }
         }
     }
     if !found {
-        println!("No matches found");
+        writeln!(stdout, "No matches found")?;
     }
     Ok(())
 }
@@ -440,9 +494,47 @@ fn human_size(size: u64) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::{CommandRunner, FilterArgs, ListArgs, LogCommand, ShowArgs};
+    use mockall::{Sequence, mock};
+    use std::ffi::OsString;
+    use std::fs;
+    use std::io;
     use std::io::Write;
+    use std::path::Path;
+    use std::process::ExitStatus;
+    use tempfile::tempdir;
 
-    use super::{normalize_index, parse_selection, split_range, trim_wrapping_parens};
+    mock! {
+        pub CmdRunner {}
+        impl CommandRunner for CmdRunner {
+            fn run(&self, program: &str, args: &[OsString]) -> io::Result<ExitStatus>;
+        }
+    }
+
+    type MockCommandRunner = MockCmdRunner;
+
+    fn exit_status(code: i32) -> std::process::ExitStatus {
+        #[cfg(unix)]
+        {
+            use std::os::unix::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(code)
+        }
+        #[cfg(windows)]
+        {
+            use std::os::windows::process::ExitStatusExt;
+            std::process::ExitStatus::from_raw(code as u32)
+        }
+    }
+
+    fn write_log(workspace: &Path, name: &str, contents: &str) {
+        let logs = workspace.join("logs");
+        fs::create_dir_all(&logs).expect("create logs directory");
+        fs::write(logs.join(name), contents).expect("write log");
+    }
+
+    use super::{
+        SystemCommandRunner, normalize_index, parse_selection, split_range, trim_wrapping_parens,
+    };
 
     #[test]
     fn trim_parens_strips_outer_pairs() {
@@ -511,7 +603,6 @@ mod tests {
     fn run_less_honors_path_env() {
         use std::env;
         use std::time::SystemTime;
-        use tempfile::tempdir;
 
         let tmp = tempdir().expect("tempdir");
         let bin_dir = tmp.path().join("bin");
@@ -540,12 +631,293 @@ mod tests {
 
         let saved_path = env::var("PATH").ok();
         unsafe { env::set_var("PATH", &bin_dir) };
-        let result = super::run_less(&[entry]);
+        let result = super::run_less(&[entry], &SystemCommandRunner);
         if let Some(saved) = saved_path {
             unsafe { env::set_var("PATH", saved) };
         } else {
             unsafe { env::remove_var("PATH") };
         }
         assert!(result.is_ok());
+    }
+
+    #[test]
+    fn execute_routes_to_list_logs() {
+        let workspace = tempdir().expect("tempdir");
+        write_log(workspace.path(), "kronid-001.log", "hello\n");
+
+        let result = super::execute(
+            LogCommand::List(ListArgs { reverse: false }),
+            workspace.path(),
+        );
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn list_logs_prints_entries_and_reverse() {
+        let workspace = tempdir().expect("tempdir");
+        write_log(workspace.path(), "kronid-001.log", "first\n");
+        write_log(workspace.path(), "kronid-002.log", "second\n");
+
+        let mut output = Vec::new();
+        super::list_logs(
+            &workspace.path().join("logs"),
+            ListArgs { reverse: false },
+            &mut output,
+        )
+        .expect("list forward");
+        let out = String::from_utf8(output).expect("utf8");
+        assert!(out.contains("   0"));
+        assert!(out.contains("   1"));
+
+        let mut reverse_output = Vec::new();
+        super::list_logs(
+            &workspace.path().join("logs"),
+            ListArgs { reverse: true },
+            &mut reverse_output,
+        )
+        .expect("list reverse");
+        let out_rev = String::from_utf8(reverse_output).expect("utf8");
+        assert!(out_rev.contains(" -1"));
+        assert!(out_rev.contains("(latest log: index 1 or -1)"));
+    }
+
+    #[test]
+    fn show_logs_without_pager_prints_selection() {
+        let workspace = tempdir().expect("tempdir");
+        write_log(workspace.path(), "kronid-001.log", "hello\nworld\n");
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut runner = MockCommandRunner::new();
+        runner.expect_run().never();
+
+        super::show_logs(
+            &workspace.path().join("logs"),
+            &ShowArgs {
+                selection: "0".to_string(),
+                no_pager: true,
+            },
+            &mut stdout,
+            &mut stderr,
+            &runner,
+            false,
+        )
+        .expect("show logs");
+
+        assert!(stderr.is_empty());
+        let out = String::from_utf8(stdout).expect("utf8");
+        assert!(out.contains("===== [0|-1]"));
+        assert!(out.contains("hello"));
+    }
+
+    #[test]
+    fn show_logs_uses_less_when_terminal() {
+        let workspace = tempdir().expect("tempdir");
+        write_log(workspace.path(), "kronid-001.log", "data\n");
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut runner = MockCommandRunner::new();
+        runner
+            .expect_run()
+            .withf(|program, args| {
+                program == "less" && args.len() == 3 && args[0] == "-R" && args[1] == "--"
+            })
+            .returning(|_, _| Ok(exit_status(0)));
+
+        super::show_logs(
+            &workspace.path().join("logs"),
+            &ShowArgs {
+                selection: "0".to_string(),
+                no_pager: false,
+            },
+            &mut stdout,
+            &mut stderr,
+            &runner,
+            true,
+        )
+        .expect("pager");
+
+        assert!(stdout.is_empty());
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn show_logs_falls_back_when_less_missing() {
+        let workspace = tempdir().expect("tempdir");
+        write_log(workspace.path(), "kronid-001.log", "fallback\n");
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut runner = MockCommandRunner::new();
+        runner
+            .expect_run()
+            .returning(|_, _| Err(io::Error::new(io::ErrorKind::NotFound, "less")));
+
+        super::show_logs(
+            &workspace.path().join("logs"),
+            &ShowArgs {
+                selection: "0".to_string(),
+                no_pager: false,
+            },
+            &mut stdout,
+            &mut stderr,
+            &runner,
+            true,
+        )
+        .expect("fallback");
+
+        let err = String::from_utf8(stderr).expect("utf8");
+        assert!(err.contains("less not found"));
+        let out = String::from_utf8(stdout).expect("utf8");
+        assert!(out.contains("fallback"));
+    }
+
+    #[test]
+    fn show_logs_propagates_pager_errors() {
+        let workspace = tempdir().expect("tempdir");
+        write_log(workspace.path(), "kronid-001.log", "data\n");
+
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+        let mut runner = MockCommandRunner::new();
+        runner
+            .expect_run()
+            .returning(|_, _| Err(io::Error::new(io::ErrorKind::Other, "boom")));
+
+        let err = super::show_logs(
+            &workspace.path().join("logs"),
+            &ShowArgs {
+                selection: "0".to_string(),
+                no_pager: false,
+            },
+            &mut stdout,
+            &mut stderr,
+            &runner,
+            true,
+        )
+        .expect_err("pager error");
+
+        assert!(err.to_string().contains("failed to launch pager"));
+    }
+
+    #[test]
+    fn filter_logs_prefers_rg() {
+        let workspace = tempdir().expect("tempdir");
+        write_log(workspace.path(), "kronid-001.log", "match line\n");
+
+        let mut stdout = Vec::new();
+        let mut runner = MockCommandRunner::new();
+        runner
+            .expect_run()
+            .withf(|program, _| program == "rg")
+            .returning(|_, _| Ok(exit_status(0)));
+
+        super::filter_logs(
+            &workspace.path().join("logs"),
+            &FilterArgs {
+                pattern: "match".to_string(),
+                hours: 24,
+            },
+            &mut stdout,
+            &runner,
+        )
+        .expect("rg path");
+        assert!(stdout.is_empty());
+    }
+
+    #[test]
+    fn filter_logs_uses_grep_when_rg_missing() {
+        let workspace = tempdir().expect("tempdir");
+        write_log(workspace.path(), "kronid-001.log", "another line\n");
+
+        let mut stdout = Vec::new();
+        let mut runner = MockCommandRunner::new();
+        let mut seq = Sequence::new();
+        runner
+            .expect_run()
+            .times(1)
+            .in_sequence(&mut seq)
+            .withf(|program, _| program == "rg")
+            .returning(|_, _| Err(io::Error::new(io::ErrorKind::NotFound, "rg")));
+        runner
+            .expect_run()
+            .times(1)
+            .in_sequence(&mut seq)
+            .withf(|program, _| program == "grep")
+            .returning(|_, _| Ok(exit_status(0)));
+
+        super::filter_logs(
+            &workspace.path().join("logs"),
+            &FilterArgs {
+                pattern: "another".to_string(),
+                hours: 24,
+            },
+            &mut stdout,
+            &runner,
+        )
+        .expect("grep fallback");
+        assert!(stdout.is_empty());
+    }
+
+    #[test]
+    fn filter_logs_uses_regex_when_tools_missing() {
+        let workspace = tempdir().expect("tempdir");
+        write_log(workspace.path(), "kronid-001.log", "alpha\n");
+
+        let mut stdout = Vec::new();
+        let mut runner = MockCommandRunner::new();
+        let mut seq = Sequence::new();
+        runner
+            .expect_run()
+            .times(1)
+            .in_sequence(&mut seq)
+            .returning(|_, _| Err(io::Error::new(io::ErrorKind::NotFound, "rg")));
+        runner
+            .expect_run()
+            .times(1)
+            .in_sequence(&mut seq)
+            .returning(|_, _| Err(io::Error::new(io::ErrorKind::NotFound, "grep")));
+
+        super::filter_logs(
+            &workspace.path().join("logs"),
+            &FilterArgs {
+                pattern: "alpha".to_string(),
+                hours: 24,
+            },
+            &mut stdout,
+            &runner,
+        )
+        .expect("regex fallback");
+
+        let out = String::from_utf8(stdout).expect("utf8");
+        assert!(out.contains("alpha"));
+    }
+
+    #[test]
+    fn filter_logs_reports_when_no_matches() {
+        let workspace = tempdir().expect("tempdir");
+        write_log(workspace.path(), "kronid-001.log", "beta\n");
+
+        let mut stdout = Vec::new();
+        let mut runner = MockCommandRunner::new();
+        runner
+            .expect_run()
+            .times(2)
+            .returning(|_, _| Err(io::Error::new(io::ErrorKind::NotFound, "tool")));
+
+        super::filter_logs(
+            &workspace.path().join("logs"),
+            &FilterArgs {
+                pattern: "gamma".to_string(),
+                hours: 24,
+            },
+            &mut stdout,
+            &runner,
+        )
+        .expect("regex fallback");
+
+        let out = String::from_utf8(stdout).expect("utf8");
+        assert!(out.contains("No matches found"));
     }
 }
