@@ -618,7 +618,7 @@ fn publish_snapshot(
         ActivityState::Active => 2000,
         ActivityState::Passive => 10000,
         ActivityState::Inactive => 20000,
-        ActivityState::Locked => 30000,
+        ActivityState::Locked => 0,
     };
     poll_handle.store(ms, Ordering::Relaxed);
 
@@ -629,7 +629,11 @@ fn publish_snapshot(
         ActivityState::Inactive => "Inactive",
         ActivityState::Locked => "Locked",
     };
-    let next_timeout = Some(Utc::now() + chrono::Duration::milliseconds(ms as i64));
+    let next_timeout = if ms > 0 {
+        Some(Utc::now() + chrono::Duration::milliseconds(ms as i64))
+    } else {
+        None
+    };
     let sm = sm_rx.borrow().clone();
 
     snapshot_bus.publish_basic(

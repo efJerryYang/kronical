@@ -158,7 +158,7 @@ impl DefaultStateEngine {
     }
     fn compute(&self, now: DateTime<Utc>) -> ActivityState {
         if self.locked {
-            ActivityState::Inactive
+            ActivityState::Locked
         } else {
             let dt = (now - self.last_signal_time).num_seconds();
             if dt <= self.active_grace_secs {
@@ -182,7 +182,7 @@ impl StateEngine for DefaultStateEngine {
             EventKind::Signal(SignalKind::LockStart) => {
                 self.locked = true;
                 let from = self.current;
-                self.current = ActivityState::Inactive;
+                self.current = ActivityState::Locked;
                 return Some(StateTransition {
                     from,
                     to: self.current,
@@ -317,7 +317,8 @@ mod tests {
         let tr_locked = engine
             .on_signal(&lock_start, lock_start.timestamp)
             .expect("lock start should emit transition");
-        assert_eq!(tr_locked.to, ActivityState::Inactive);
+        assert_eq!(tr_locked.from, ActivityState::Inactive);
+        assert_eq!(tr_locked.to, ActivityState::Locked);
         assert!(
             engine
                 .on_tick(lock_start.timestamp + Duration::seconds(10))
@@ -337,6 +338,6 @@ mod tests {
         let tr_unlock = engine
             .on_signal(&lock_end, lock_end.timestamp)
             .expect("lock end restores activity");
-        assert_eq!(tr_unlock.from, ActivityState::Inactive);
+        assert_eq!(tr_unlock.from, ActivityState::Locked);
     }
 }

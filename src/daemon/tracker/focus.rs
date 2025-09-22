@@ -213,10 +213,14 @@ fn run_focus_worker(
         if should_stop.load(Ordering::Relaxed) {
             break;
         }
-        let ms = poll_ms.load(Ordering::Relaxed);
-        let ms = if ms == 0 { 2000 } else { ms };
+        let wait_ms = poll_ms.load(Ordering::Relaxed);
+        let timeout = if wait_ms == 0 {
+            Duration::from_millis(250)
+        } else {
+            Duration::from_millis(wait_ms)
+        };
 
-        match rx.recv_timeout(Duration::from_millis(ms)) {
+        match rx.recv_timeout(timeout) {
             Ok(msg) => match msg {
                 FocusMsg::AppChange { pid, app_name } => {
                     if state.app_name == app_name && state.pid == pid {
@@ -279,6 +283,9 @@ fn run_focus_worker(
                 FocusMsg::Stop => break,
             },
             Err(mpsc::RecvTimeoutError::Timeout) => {
+                if wait_ms == 0 {
+                    continue;
+                }
                 // Polling tick
                 match get_active_window_info() {
                     Ok(info) => {

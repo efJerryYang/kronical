@@ -19,21 +19,35 @@ impl StateDeriver {
     pub fn on_signal(&mut self, env: &EventEnvelope) -> Option<EventEnvelope> {
         let now = env.timestamp;
         if let EventKind::Signal(SignalKind::LockStart) = env.kind {
-            let _ = self.engine.on_signal(env, now);
-            let from = self.engine.current();
-            return Some(EventEnvelope {
-                id: env.id,
-                timestamp: now,
-                source: EventSource::Derived,
-                kind: EventKind::Hint(HintKind::StateChanged),
-                payload: EventPayload::State {
-                    from,
-                    to: ActivityState::Locked,
-                },
-                derived: true,
-                polling: false,
-                sensitive: false,
-            });
+            if let Some(tr) = self.engine.on_signal(env, now) {
+                return Some(EventEnvelope {
+                    id: env.id,
+                    timestamp: now,
+                    source: EventSource::Derived,
+                    kind: EventKind::Hint(HintKind::StateChanged),
+                    payload: EventPayload::State {
+                        from: tr.from,
+                        to: ActivityState::Locked,
+                    },
+                    derived: true,
+                    polling: false,
+                    sensitive: false,
+                });
+            } else {
+                return Some(EventEnvelope {
+                    id: env.id,
+                    timestamp: now,
+                    source: EventSource::Derived,
+                    kind: EventKind::Hint(HintKind::StateChanged),
+                    payload: EventPayload::State {
+                        from: self.engine.current(),
+                        to: ActivityState::Locked,
+                    },
+                    derived: true,
+                    polling: false,
+                    sensitive: false,
+                });
+            }
         }
         if let EventKind::Signal(SignalKind::LockEnd) = env.kind {
             let from = ActivityState::Locked;
@@ -290,6 +304,9 @@ mod tests {
         deriver
             .on_signal(&keyboard_event(70, start))
             .expect("keyboard input should promote to active");
+        // dbg initial transition
+        // let (from0, to0) = activity_hint(first_hint.clone());
+        // println!("first from={:?} to={:?}", from0, to0);
 
         let lock_start = EventEnvelope {
             id: 71,
