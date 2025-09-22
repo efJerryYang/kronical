@@ -201,6 +201,94 @@ mod tests {
     }
 
     #[test]
+    fn activity_pulse_does_not_unlock_login_window() {
+        let mut deriver = LockDeriver::new();
+        let login_event = focus_event(9, "loginwindow", SignalKind::AppChanged);
+        let _ = deriver.derive(&[login_event]);
+
+        let activity_pulse = EventEnvelope {
+            id: 10,
+            timestamp: Utc
+                .with_ymd_and_hms(2024, 4, 22, 9, 32, 0)
+                .unwrap(),
+            source: EventSource::Hook,
+            kind: EventKind::Signal(SignalKind::ActivityPulse),
+            payload: EventPayload::None,
+            derived: false,
+            polling: false,
+            sensitive: false,
+        };
+
+        let out = deriver.derive(&[activity_pulse.clone()]);
+        let derived_kinds: Vec<_> = out
+            .iter()
+            .filter(|env| env.derived)
+            .map(|env| env.kind.clone())
+            .collect();
+
+        assert!(
+            derived_kinds
+                .iter()
+                .all(|kind| *kind != EventKind::Signal(SignalKind::LockEnd)),
+            "Activity pulse should not emit LockEnd while loginwindow is focused"
+        );
+        assert_eq!(out.last().unwrap().kind, activity_pulse.kind);
+    }
+
+    #[test]
+    fn activity_pulse_keeps_state_engine_locked() {
+        use crate::events::derive_hint::StateDeriver;
+        use crate::records::ActivityState;
+
+        let start = Utc.with_ymd_and_hms(2024, 4, 22, 9, 30, 0).unwrap();
+        let mut lock_deriver = LockDeriver::new();
+        let mut state_deriver = StateDeriver::new(start, 30, 120);
+
+        let login_event = focus_event(30, "loginwindow", SignalKind::AppChanged);
+        let derived_login = lock_deriver.derive(&[login_event]);
+
+        let mut locked = false;
+        for env in derived_login {
+            if let EventKind::Signal(_) = env.kind {
+                if let Some(state_hint) = state_deriver.on_signal(&env) {
+                    if let EventPayload::State { to, .. } = state_hint.payload {
+                        if to == ActivityState::Locked {
+                            locked = true;
+                        }
+                    }
+                }
+            }
+        }
+        assert!(locked, "LockStart should push the state engine into Locked state");
+
+        let pulse_event = EventEnvelope {
+            id: 31,
+            timestamp: start + chrono::Duration::seconds(2),
+            source: EventSource::Hook,
+            kind: EventKind::Signal(SignalKind::ActivityPulse),
+            payload: EventPayload::None,
+            derived: false,
+            polling: false,
+            sensitive: false,
+        };
+
+        let derived_pulse = lock_deriver.derive(&[pulse_event]);
+        let mut unlock_hints = Vec::new();
+        for env in derived_pulse {
+            if let EventKind::Signal(_) = env.kind {
+                if let Some(state_hint) = state_deriver.on_signal(&env) {
+                    unlock_hints.push(state_hint);
+                }
+            }
+        }
+
+        assert!(
+            unlock_hints.is_empty(),
+            "Activity pulse should not unlock the engine while loginwindow remains focused"
+        );
+    }
+
+    #[test]
     fn app_change_without_focus_payload_does_not_toggle_lock() {
         let mut deriver = LockDeriver::new();
         let ts = Utc.with_ymd_and_hms(2024, 4, 22, 9, 45, 0).unwrap();
