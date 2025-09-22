@@ -280,4 +280,34 @@ mod tests {
 
         assert!(deriver.on_tick(start + Duration::seconds(10)).is_none());
     }
+
+    #[test]
+    fn lock_start_uses_current_state_as_transition_source() {
+        let start = Utc.with_ymd_and_hms(2024, 4, 22, 13, 0, 0).unwrap();
+        let mut deriver = StateDeriver::new(start, 45, 180);
+
+        // Promote to active first.
+        deriver
+            .on_signal(&keyboard_event(70, start))
+            .expect("keyboard input should promote to active");
+
+        let lock_start = EventEnvelope {
+            id: 71,
+            timestamp: start + Duration::seconds(5),
+            source: EventSource::Hook,
+            kind: EventKind::Signal(SignalKind::LockStart),
+            payload: EventPayload::None,
+            derived: false,
+            polling: false,
+            sensitive: false,
+        };
+
+        let hint = deriver
+            .on_signal(&lock_start)
+            .expect("lock start should emit state change");
+        let (from, to) = activity_hint(hint);
+
+        assert_eq!(from, ActivityState::Active);
+        assert_eq!(to, ActivityState::Locked);
+    }
 }

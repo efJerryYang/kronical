@@ -650,6 +650,46 @@ fn publish_snapshot(
     );
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn locked_state_should_pause_focus_polling() {
+        let bus = snapshot::SnapshotBus::new();
+        let sm_rx = storage_metrics_watch();
+        let mut counts = snapshot::Counts::default();
+        let mut records = VecDeque::new();
+        let mut last_transition = None;
+        let poll_handle = Arc::new(AtomicU64::new(2000));
+        let cfg = snapshot::ConfigSummary::default();
+
+        publish_snapshot(
+            &bus,
+            &mut records,
+            &sm_rx,
+            &mut counts,
+            &ActivityState::Locked,
+            &None,
+            &mut last_transition,
+            &cfg,
+            &poll_handle,
+            chrono::Duration::minutes(5),
+            60,
+            1,
+            10,
+            120,
+            2,
+        );
+
+        assert_eq!(
+            poll_handle.load(Ordering::Relaxed),
+            0,
+            "locked cadence should pause focus polling"
+        );
+    }
+}
+
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
 fn build_app_tree(
     aggregated_activities: &[AggregatedActivity],

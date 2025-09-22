@@ -212,9 +212,7 @@ mod tests {
 
         let activity_pulse = EventEnvelope {
             id: 10,
-            timestamp: Utc
-                .with_ymd_and_hms(2024, 4, 22, 9, 32, 0)
-                .unwrap(),
+            timestamp: Utc.with_ymd_and_hms(2024, 4, 22, 9, 32, 0).unwrap(),
             source: EventSource::Hook,
             kind: EventKind::Signal(SignalKind::ActivityPulse),
             payload: EventPayload::None,
@@ -263,7 +261,10 @@ mod tests {
                 }
             }
         }
-        assert!(locked, "LockStart should push the state engine into Locked state");
+        assert!(
+            locked,
+            "LockStart should push the state engine into Locked state"
+        );
 
         let pulse_event = EventEnvelope {
             id: 31,
