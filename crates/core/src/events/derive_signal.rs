@@ -51,6 +51,10 @@ impl LockDeriver {
                             self.locked = false;
                         }
                     }
+                    SignalKind::ActivityPulse => {
+                        // Activity pulses are generated alongside focus changes; they should
+                        // never be treated as evidence that the lock screen cleared.
+                    }
                     _ => {
                         // Any other signal clears the loginwindow lock if present.
                         if self.locked {
