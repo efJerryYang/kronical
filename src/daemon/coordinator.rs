@@ -271,6 +271,47 @@ impl EventCoordinator {
         self.threads.clone()
     }
 
+    pub fn spawn_tracker_thread(
+        &self,
+        workspace_dir: &std::path::PathBuf,
+        thread_registry: ThreadRegistry,
+    ) -> Result<()> {
+        if !self.tracker_enabled {
+            info!("System tracker disabled in configuration");
+            return Ok(());
+        }
+
+        let current_pid = std::process::id();
+        let tracker_db_path =
+            crate::util::paths::tracker_db_with_backend(workspace_dir, &self.tracker_db_backend);
+
+        let mut tracker = SystemTracker::new(
+            current_pid,
+            self.tracker_interval_secs,
+            self.tracker_batch_size,
+            tracker_db_path.clone(),
+            self.tracker_db_backend.clone(),
+            self.duckdb_memory_limit_mb_tracker,
+        );
+
+        if let Err(e) = tracker.start_with_registry(thread_registry) {
+            error!("Failed to start system tracker: {}", e);
+            return Err(anyhow::anyhow!("Failed to start system tracker: {}", e));
+        }
+
+        info!(
+            "System tracker started successfully for PID {}",
+            current_pid
+        );
+        crate::daemon::api::set_system_tracker_db_path(tracker_db_path.clone());
+        info!(
+            "System tracker DB path set for gRPC API: {:?}",
+            tracker_db_path
+        );
+
+        Ok(())
+    }
+
     pub fn start_main_thread(
         &self,
         data_store: Box<dyn StorageBackend>,
@@ -292,35 +333,7 @@ impl EventCoordinator {
             thread_registry.clone(),
         )?;
 
-        if self.tracker_enabled {
-            let current_pid = std::process::id();
-            let tracker_db_path = crate::util::paths::tracker_db_with_backend(
-                &workspace_dir,
-                &self.tracker_db_backend,
-            );
-            let mut tracker = SystemTracker::new(
-                current_pid,
-                self.tracker_interval_secs,
-                self.tracker_batch_size,
-                tracker_db_path.clone(),
-                self.tracker_db_backend.clone(),
-                self.duckdb_memory_limit_mb_tracker,
-            );
-            if let Err(e) = tracker.start_with_registry(thread_registry.clone()) {
-                error!("Failed to start system tracker: {}", e);
-            } else {
-                info!(
-                    "System tracker started successfully for PID {}",
-                    current_pid
-                );
-
-                crate::daemon::api::set_system_tracker_db_path(tracker_db_path.clone());
-                info!(
-                    "System tracker DB path set for gRPC API: {:?}",
-                    tracker_db_path
-                );
-            }
-        }
+        self.spawn_tracker_thread(&workspace_dir, thread_registry.clone())?;
 
         let poll_handle_arc = Arc::new(AtomicU64::new(2000));
         let pipeline_config = crate::daemon::pipeline::PipelineConfig {
