@@ -628,6 +628,7 @@ mod tests {
     use super::*;
     use crate::daemon::events::{
         KeyboardEventData, MouseEventData, MouseEventKind, MousePosition, WheelAxis,
+        WheelScrollType,
     };
     use chrono::{TimeZone, Utc};
 
@@ -643,6 +644,7 @@ mod tests {
                 wheel_amount: Some(amount.abs()),
                 wheel_rotation: Some(rotation),
                 wheel_axis: Some(axis),
+                wheel_scroll_type: Some(WheelScrollType::Unit),
             },
         }
     }
@@ -659,6 +661,7 @@ mod tests {
                 wheel_amount: None,
                 wheel_rotation: None,
                 wheel_axis: None,
+                wheel_scroll_type: None,
             },
         }
     }

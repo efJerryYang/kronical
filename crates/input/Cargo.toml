@@ -1,0 +1,8 @@
+[package]
+name = "kronical-input"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+kronical-core = { path = "../core" }
+uiohook-rs = "0.2"

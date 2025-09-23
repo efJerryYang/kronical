@@ -18,7 +18,7 @@ pub struct KeyboardEventData {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MouseEventData {
     pub position: MousePosition,
-    pub button: Option<String>,
+    pub button: Option<MouseButton>,
     pub click_count: Option<u16>,
     // Mouse movement/drag/click classification
     pub event_type: Option<MouseEventKind>,
@@ -29,6 +29,18 @@ pub struct MouseEventData {
     pub wheel_rotation: Option<i32>,
     // axis of wheel movement (Vertical or Horizontal)
     pub wheel_axis: Option<WheelAxis>,
+    // scroll granularity (unit vs block)
+    pub wheel_scroll_type: Option<WheelScrollType>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MouseButton {
+    Primary,
+    Secondary,
+    Middle,
+    Button4,
+    Button5,
+    Other(u8),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -44,6 +56,13 @@ pub enum MouseEventKind {
 pub enum WheelAxis {
     Vertical,
     Horizontal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WheelScrollType {
+    Unit,
+    Block,
+    Unknown(u8),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -140,12 +159,13 @@ mod tests {
             event_id: 11,
             data: MouseEventData {
                 position: MousePosition { x: 1, y: 2 },
-                button: Some("left".into()),
+                button: Some(MouseButton::Primary),
                 click_count: Some(1),
                 event_type: Some(MouseEventKind::Clicked),
                 wheel_amount: None,
                 wheel_rotation: None,
                 wheel_axis: None,
+                wheel_scroll_type: None,
             },
         };
         assert_eq!(mouse.timestamp(), ts);

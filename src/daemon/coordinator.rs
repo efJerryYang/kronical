@@ -1,11 +1,17 @@
-use crate::daemon::events::MouseEventKind;
+use crate::daemon::api::ApiHandles;
 use crate::daemon::events::WindowFocusInfo;
+use crate::daemon::events::{MouseButton, MouseEventKind, WheelAxis, WheelScrollType};
+use crate::daemon::pipeline::PipelineHandles;
 use crate::daemon::runtime::ThreadRegistry;
 use crate::daemon::tracker::SystemTracker;
 use crate::daemon::tracker::{FocusCacheCaps, FocusChangeCallback, FocusEventWrapper};
 use crate::storage::StorageBackend;
-use anyhow::Result;
+use anyhow::{Result, anyhow};
+use kronical_input::mouse::{
+    button_from_hook, event_kind_from_hook, wheel_axis_from_direction, wheel_scroll_type_from_raw,
+};
 use log::{debug, error, info, trace};
+use std::path::Path;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
@@ -20,7 +26,7 @@ pub enum KronicalEvent {
     MouseInput {
         x: i32,
         y: i32,
-        button: Option<String>,
+        button: Option<MouseButton>,
         clicks: u16,
         kind: MouseEventKind,
     },
@@ -28,10 +34,10 @@ pub enum KronicalEvent {
         clicks: u16,
         x: i32,
         y: i32,
-        type_: u8,
+        scroll_type: WheelScrollType,
         amount: u16,
         rotation: i16,
-        direction: u8,
+        axis: Option<WheelAxis>,
     },
     WindowFocusChange {
         focus_info: WindowFocusInfo,
@@ -39,6 +45,47 @@ pub enum KronicalEvent {
     Shutdown,
 }
 
+struct CoordinatorShutdownGuard<'a> {
+    coordinator: &'a EventCoordinator,
+    workspace_dir: &'a Path,
+    api_handles: Option<ApiHandles>,
+    pipeline_handles: Option<PipelineHandles>,
+    uiohook: Option<Uiohook>,
+    window_hook: Option<WindowFocusHook>,
+}
+
+impl<'a> CoordinatorShutdownGuard<'a> {
+    fn new(coordinator: &'a EventCoordinator, workspace_dir: &'a Path) -> Self {
+        Self {
+            coordinator,
+            workspace_dir,
+            api_handles: None,
+            pipeline_handles: None,
+            uiohook: None,
+            window_hook: None,
+        }
+    }
+}
+
+impl Drop for CoordinatorShutdownGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(uiohook) = self.uiohook.take() {
+            let _ = self.coordinator.cleanup_uiohook(uiohook);
+        }
+        if let Some(window_hook) = self.window_hook.take() {
+            let _ = self.coordinator.cleanup_window_hook(window_hook);
+        }
+        if let Some(pipeline) = self.pipeline_handles.take() {
+            let _ = self.coordinator.cleanup_pipeline(pipeline);
+        }
+        if let Some(api) = self.api_handles.take() {
+            let _ = self.coordinator.cleanup_api_servers(api);
+        }
+        self.coordinator.cleanup_socket_files(self.workspace_dir);
+    }
+}
+
+#[derive(Clone)]
 pub struct KronicalEventHandler {
     sender: mpsc::Sender<KronicalEvent>,
     focus_wrapper: FocusEventWrapper,
@@ -82,7 +129,7 @@ impl FocusChangeCallback for FocusCallback {
         {
             error!("Failed to send unified focus change event: {}", e);
         } else {
-            info!("Unified focus change event sent successfully");
+            trace!("Unified focus change event sent successfully");
         }
     }
 }
@@ -96,38 +143,29 @@ impl EventHandler for KronicalEventHandler {
                 KronicalEvent::KeyboardInput
             }
             UiohookEvent::Mouse(m) => {
-                use uiohook_rs::hook::mouse::MouseEventType as VMouseEventType;
                 trace!("Mouse event detected");
-                let kind = match m.event_type {
-                    VMouseEventType::Moved => MouseEventKind::Moved,
-                    VMouseEventType::Pressed => MouseEventKind::Pressed,
-                    VMouseEventType::Released => MouseEventKind::Released,
-                    VMouseEventType::Clicked => MouseEventKind::Clicked,
-                    VMouseEventType::Dragged => MouseEventKind::Dragged,
-                };
-                // Map button; treat NoButton as None
-                let button_str = match format!("{:?}", m.button).as_str() {
-                    "NoButton" => None,
-                    other => Some(other.to_string()),
-                };
+                let kind = event_kind_from_hook(m.event_type);
+                let button = button_from_hook(m.button);
                 KronicalEvent::MouseInput {
                     x: m.x as i32,
                     y: m.y as i32,
-                    button: button_str,
+                    button,
                     clicks: m.clicks,
                     kind,
                 }
             }
             UiohookEvent::Wheel(w) => {
                 trace!("Wheel event detected");
+                let scroll_type = wheel_scroll_type_from_raw(w.type_);
+                let axis = wheel_axis_from_direction(w.direction);
                 KronicalEvent::MouseWheel {
                     clicks: w.clicks,
                     x: w.x as i32,
                     y: w.y as i32,
-                    type_: w.type_,
+                    scroll_type,
                     amount: w.amount,
                     rotation: w.rotation,
-                    direction: w.direction,
+                    axis,
                 }
             }
             UiohookEvent::HookEnabled => {
@@ -245,9 +283,196 @@ impl EventCoordinator {
             threads,
         }
     }
+    pub fn initialize(config: &crate::util::config::AppConfig) -> Self {
+        Self::new(
+            config.retention_minutes,
+            config.active_grace_secs,
+            config.idle_threshold_secs,
+            config.ephemeral_max_duration_secs,
+            config.ephemeral_min_distinct_ids,
+            config.max_windows_per_app,
+            config.ephemeral_app_max_duration_secs,
+            config.ephemeral_app_min_distinct_procs,
+            config.pid_cache_capacity,
+            config.title_cache_capacity,
+            config.title_cache_ttl_secs,
+            config.focus_interner_max_strings,
+            config.tracker_enabled,
+            config.tracker_interval_secs,
+            config.tracker_batch_size,
+            config.tracker_db_backend.clone(),
+            config.duckdb_memory_limit_mb_tracker,
+        )
+    }
 
     pub fn thread_registry(&self) -> ThreadRegistry {
         self.threads.clone()
+    }
+
+    pub fn spawn_tracker(
+        &self,
+        workspace_dir: &Path,
+        thread_registry: ThreadRegistry,
+    ) -> Result<()> {
+        if !self.tracker_enabled {
+            info!("System tracker disabled in configuration");
+            return Ok(());
+        }
+
+        let current_pid = std::process::id();
+        let tracker_db_path =
+            crate::util::paths::tracker_db_with_backend(workspace_dir, &self.tracker_db_backend);
+
+        let mut tracker = SystemTracker::new(
+            current_pid,
+            self.tracker_interval_secs,
+            self.tracker_batch_size,
+            tracker_db_path.clone(),
+            self.tracker_db_backend.clone(),
+            self.duckdb_memory_limit_mb_tracker,
+        );
+
+        if let Err(e) = tracker.start_with_registry(thread_registry) {
+            error!("Failed to start system tracker: {}", e);
+            return Err(anyhow!("Failed to start system tracker: {}", e));
+        }
+
+        info!(
+            "System tracker started successfully for PID {}",
+            current_pid
+        );
+        crate::daemon::api::set_system_tracker_db_path(tracker_db_path.clone());
+        info!(
+            "System tracker DB path set for gRPC API: {:?}",
+            tracker_db_path
+        );
+
+        Ok(())
+    }
+
+    pub fn spawn_api_servers(
+        &self,
+        workspace_dir: &Path,
+        snapshot_bus: Arc<crate::daemon::snapshot::SnapshotBus>,
+        thread_registry: ThreadRegistry,
+    ) -> Result<ApiHandles> {
+        let uds_grpc = crate::util::paths::grpc_uds(workspace_dir);
+        let uds_http = crate::util::paths::http_uds(workspace_dir);
+        let api_handles = crate::daemon::api::spawn_all(
+            uds_grpc,
+            uds_http,
+            Arc::clone(&snapshot_bus),
+            thread_registry,
+        )?;
+        info!("API servers started successfully");
+        Ok(api_handles)
+    }
+
+    pub fn spawn_pipeline(
+        &self,
+        data_store: Box<dyn StorageBackend>,
+        event_rx: mpsc::Receiver<KronicalEvent>,
+        poll_handle: Arc<AtomicU64>,
+        snapshot_bus: Arc<crate::daemon::snapshot::SnapshotBus>,
+        thread_registry: ThreadRegistry,
+    ) -> Result<PipelineHandles> {
+        let pipeline_config = crate::daemon::pipeline::PipelineConfig {
+            retention_minutes: self.retention_minutes,
+            active_grace_secs: self.active_grace_secs,
+            idle_threshold_secs: self.idle_threshold_secs,
+            ephemeral_max_duration_secs: self.ephemeral_max_duration_secs,
+            ephemeral_min_distinct_ids: self.ephemeral_min_distinct_ids,
+            max_windows_per_app: self.max_windows_per_app,
+            ephemeral_app_max_duration_secs: self.ephemeral_app_max_duration_secs,
+            ephemeral_app_min_distinct_procs: self.ephemeral_app_min_distinct_procs,
+            focus_interner_max_strings: self.focus_interner_max_strings,
+        };
+
+        let pipeline_handles = crate::daemon::pipeline::spawn_pipeline(
+            pipeline_config,
+            crate::daemon::pipeline::PipelineResources {
+                storage: data_store,
+                event_rx,
+                poll_handle: Arc::clone(&poll_handle),
+                snapshot_bus: Arc::clone(&snapshot_bus),
+            },
+            thread_registry,
+        )?;
+        info!("Pipeline thread started successfully");
+        Ok(pipeline_handles)
+    }
+
+    pub fn run_uiohook(
+        &self,
+        sender: mpsc::Sender<KronicalEvent>,
+        poll_handle: Arc<AtomicU64>,
+    ) -> Result<Uiohook> {
+        info!("Setting up UIohook on main thread");
+        let handler = KronicalEventHandler::new(
+            sender,
+            FocusCacheCaps {
+                pid_cache_capacity: self.pid_cache_capacity,
+                title_cache_capacity: self.title_cache_capacity,
+                title_cache_ttl_secs: self.title_cache_ttl_secs,
+            },
+            Arc::clone(&poll_handle),
+            self.thread_registry(),
+        )?;
+
+        let uiohook = Uiohook::new(handler);
+        if let Err(e) = uiohook.run() {
+            error!("UIohook failed: {}", e);
+            return Err(anyhow!("UIohook failed: {}", e));
+        }
+        info!("UIohook setup completed");
+        Ok(uiohook)
+    }
+
+    pub fn run_window_hook(
+        &self,
+        sender: mpsc::Sender<KronicalEvent>,
+        poll_handle: Arc<AtomicU64>,
+    ) -> Result<WindowFocusHook> {
+        info!("Setting up Window hook on main thread");
+        let handler = KronicalEventHandler::new(
+            sender,
+            FocusCacheCaps {
+                pid_cache_capacity: self.pid_cache_capacity,
+                title_cache_capacity: self.title_cache_capacity,
+                title_cache_ttl_secs: self.title_cache_ttl_secs,
+            },
+            Arc::clone(&poll_handle),
+            self.thread_registry(),
+        )?;
+
+        let window_hook = WindowFocusHook::with_config(
+            handler,
+            WindowHookConfig {
+                monitoring_mode: MonitoringMode::Combined,
+                embed_active_info: true,
+            },
+        );
+
+        info!("Starting window hook (this will block main thread)");
+        if let Err(e) = window_hook.run() {
+            error!("Window hook failed: {}", e);
+            return Err(anyhow!("Window hook failed: {}", e));
+        }
+        info!("Window hook completed");
+        Ok(window_hook)
+    }
+
+    fn setup_shutdown_handler(&self, sender: mpsc::Sender<KronicalEvent>) -> Result<()> {
+        ctrlc::set_handler(move || {
+            info!("Ctrl+C received, sending shutdown signal");
+            if let Err(e) = sender.send(KronicalEvent::Shutdown) {
+                error!("Failed to send shutdown: {}", e);
+            }
+            if let Err(e) = winshift::stop_hook() {
+                error!("Failed to stop winshift: {}", e);
+            }
+        })?;
+        Ok(())
     }
 
     pub fn start_main_thread(
@@ -260,161 +485,83 @@ impl EventCoordinator {
 
         let (sender, receiver) = mpsc::channel();
         let thread_registry = self.thread_registry();
+        let poll_handle_arc = Arc::new(AtomicU64::new(2000));
+        let workspace_path = workspace_dir.as_path();
+        let mut shutdown_guard = CoordinatorShutdownGuard::new(self, workspace_path);
 
-        // Start API servers (gRPC + HTTP/SSE) via unified API facade.
-        let uds_grpc = crate::util::paths::grpc_uds(&workspace_dir);
-        let uds_http = crate::util::paths::http_uds(&workspace_dir);
-        let api_handles = crate::daemon::api::spawn_all(
-            uds_grpc,
-            uds_http,
+        let api_handles = self.spawn_api_servers(
+            workspace_path,
             Arc::clone(&snapshot_bus),
             thread_registry.clone(),
         )?;
+        shutdown_guard.api_handles = Some(api_handles);
 
-        if self.tracker_enabled {
-            let current_pid = std::process::id();
-            let tracker_db_path = crate::util::paths::tracker_db_with_backend(
-                &workspace_dir,
-                &self.tracker_db_backend,
-            );
-            let mut tracker = SystemTracker::new(
-                current_pid,
-                self.tracker_interval_secs,
-                self.tracker_batch_size,
-                tracker_db_path.clone(),
-                self.tracker_db_backend.clone(),
-                self.duckdb_memory_limit_mb_tracker,
-            );
-            if let Err(e) = tracker.start_with_registry(thread_registry.clone()) {
-                error!("Failed to start system tracker: {}", e);
-            } else {
-                info!(
-                    "System tracker started successfully for PID {}",
-                    current_pid
-                );
-
-                crate::daemon::api::set_system_tracker_db_path(tracker_db_path.clone());
-                info!(
-                    "System tracker DB path set for gRPC API: {:?}",
-                    tracker_db_path
-                );
-            }
-        }
-
-        let poll_handle_arc = Arc::new(AtomicU64::new(2000));
-        let pipeline_config = crate::daemon::pipeline::PipelineConfig {
-            retention_minutes: self.retention_minutes,
-            active_grace_secs: self.active_grace_secs,
-            idle_threshold_secs: self.idle_threshold_secs,
-            ephemeral_max_duration_secs: self.ephemeral_max_duration_secs,
-            ephemeral_min_distinct_ids: self.ephemeral_min_distinct_ids,
-            max_windows_per_app: self.max_windows_per_app,
-            ephemeral_app_max_duration_secs: self.ephemeral_app_max_duration_secs,
-            ephemeral_app_min_distinct_procs: self.ephemeral_app_min_distinct_procs,
-            focus_interner_max_strings: self.focus_interner_max_strings,
-        };
-        let pipeline_handles = crate::daemon::pipeline::spawn_pipeline(
-            pipeline_config,
-            crate::daemon::pipeline::PipelineResources {
-                storage: data_store,
-                event_rx: receiver,
-                poll_handle: Arc::clone(&poll_handle_arc),
-                snapshot_bus: Arc::clone(&snapshot_bus),
-            },
+        self.spawn_tracker(workspace_path, thread_registry.clone())?;
+        let pipeline_handles = self.spawn_pipeline(
+            data_store,
+            receiver,
+            Arc::clone(&poll_handle_arc),
+            Arc::clone(&snapshot_bus),
             thread_registry.clone(),
         )?;
+        shutdown_guard.pipeline_handles = Some(pipeline_handles);
 
-        let shutdown_sender = sender.clone();
-        ctrlc::set_handler(move || {
-            info!("Step S: Ctrl+C received, sending shutdown signal");
-            if let Err(e) = shutdown_sender.send(KronicalEvent::Shutdown) {
-                error!("Step S: Failed to send shutdown: {}", e);
-            }
+        self.setup_shutdown_handler(sender.clone())?;
+        let uiohook = self.run_uiohook(sender.clone(), Arc::clone(&poll_handle_arc))?;
+        shutdown_guard.uiohook = Some(uiohook);
+        let window_hook = self.run_window_hook(sender, Arc::clone(&poll_handle_arc))?;
+        shutdown_guard.window_hook = Some(window_hook);
 
-            info!("Step S: Stopping winshift hook");
-            if let Err(e) = winshift::stop_hook() {
-                error!("Step S: Failed to stop winshift: {}", e);
-            }
-        })?;
+        drop(shutdown_guard);
+        info!("Step C: Kronical shutdown complete");
+        Ok(())
+    }
 
-        // poll_handle_arc already created earlier; reuse it for the handler
-        let handler = KronicalEventHandler::new(
-            sender,
-            FocusCacheCaps {
-                pid_cache_capacity: self.pid_cache_capacity,
-                title_cache_capacity: self.title_cache_capacity,
-                title_cache_ttl_secs: self.title_cache_ttl_secs,
-            },
-            std::sync::Arc::clone(&poll_handle_arc),
-            thread_registry.clone(),
-        )?;
-
-        info!("Step M1: Setting up UIohook on main thread");
-        let uiohook = Uiohook::new(handler.clone());
-
-        if let Err(e) = uiohook.run() {
-            error!("Step M1: UIohook failed: {}", e);
-            return Err(e.into());
-        }
-        info!("Step M1: UIohook setup completed");
-
-        info!("Step M2: Setting up Window hook on main thread");
-        let window_hook = WindowFocusHook::with_config(
-            handler,
-            WindowHookConfig {
-                monitoring_mode: MonitoringMode::Combined,
-                embed_active_info: true,
-            },
-        );
-
-        info!("Step M2: Starting window hook (this will block main thread)");
-        if let Err(e) = window_hook.run() {
-            error!("Step M2: Window hook failed: {}", e);
-        }
-        info!("Step M2: Window hook completed");
-
+    fn cleanup_uiohook(&self, uiohook: Uiohook) -> Result<()> {
         info!("Step C: Cleaning up UIohook");
         if let Err(e) = uiohook.stop() {
             error!("Step C: Failed to stop UIohook: {}", e);
         }
+        Ok(())
+    }
 
+    fn cleanup_window_hook(&self, _window_hook: WindowFocusHook) -> Result<()> {
+        info!("Step C: Cleaning up Window hook");
+        // TODO: after the winshift crate is fixed for the stop() method, re-enable this
+        // if let Err(e) = window_hook.stop() {
+        if let Err(e) = WindowFocusHook::stop() {
+            error!("Step C: Failed to stop Window hook: {}", e);
+        }
+        Ok(())
+    }
+
+    fn cleanup_pipeline(&self, pipeline_handles: PipelineHandles) -> Result<()> {
         info!("Step C: Waiting for background thread to finish");
         if let Err(e) = pipeline_handles.join() {
             error!("Step C: Background thread panicked: {:?}", e);
         }
-
-        info!("Step C: Cleaning up socket files");
-        let grpc_sock = crate::util::paths::grpc_uds(&workspace_dir);
-        let http_sock = crate::util::paths::http_uds(&workspace_dir);
-
-        if grpc_sock.exists() {
-            if let Err(e) = std::fs::remove_file(&grpc_sock) {
-                error!("Failed to remove gRPC socket: {}", e);
-            } else {
-                info!("Removed gRPC socket file");
-            }
-        }
-
-        if http_sock.exists() {
-            if let Err(e) = std::fs::remove_file(&http_sock) {
-                error!("Failed to remove HTTP socket: {}", e);
-            } else {
-                info!("Removed HTTP socket file");
-            }
-        }
-
-        api_handles.join_all();
-
-        info!("Step C: Kronical shutdown complete");
         Ok(())
     }
-}
 
-impl Clone for KronicalEventHandler {
-    fn clone(&self) -> Self {
-        Self {
-            sender: self.sender.clone(),
-            focus_wrapper: self.focus_wrapper.clone(),
+    fn cleanup_api_servers(&self, api_handles: ApiHandles) -> Result<()> {
+        info!("Step C: Cleaning up API servers");
+        api_handles.join_all();
+        Ok(())
+    }
+
+    fn cleanup_socket_files(&self, workspace_dir: &Path) {
+        info!("Cleaning up socket files");
+        let grpc_sock = crate::util::paths::grpc_uds(workspace_dir);
+        let http_sock = crate::util::paths::http_uds(workspace_dir);
+
+        for sock in [grpc_sock, http_sock] {
+            if sock.exists() {
+                if let Err(e) = std::fs::remove_file(&sock) {
+                    error!("Failed to remove socket file {}: {}", sock.display(), e);
+                } else {
+                    info!("Removed socket file: {}", sock.display());
+                }
+            }
         }
     }
 }
