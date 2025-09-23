@@ -2099,6 +2099,7 @@ dependencies = [
  "indicatif",
  "kronical-common",
  "kronical-core",
+ "kronical-input",
  "kronical-rpc",
  "kronical-storage",
  "libc",
@@ -2147,6 +2148,14 @@ dependencies = [
  "once_cell",
  "serde",
  "tokio",
+]
+
+[[package]]
+name = "kronical-input"
+version = "0.1.0"
+dependencies = [
+ "kronical-core",
+ "uiohook-rs",
 ]
 
 [[package]]

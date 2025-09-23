@@ -1,13 +1,15 @@
 use crate::daemon::api::ApiHandles;
-use crate::daemon::events::MouseEventKind;
 use crate::daemon::events::WindowFocusInfo;
+use crate::daemon::events::{MouseButton, MouseEventKind};
 use crate::daemon::pipeline::PipelineHandles;
 use crate::daemon::runtime::ThreadRegistry;
 use crate::daemon::tracker::SystemTracker;
 use crate::daemon::tracker::{FocusCacheCaps, FocusChangeCallback, FocusEventWrapper};
 use crate::storage::StorageBackend;
-use anyhow::Result;
+use anyhow::{Result, anyhow};
+use kronical_input::mouse::{button_from_hook, event_kind_from_hook};
 use log::{debug, error, info, trace};
+use std::path::Path;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, mpsc};
 use std::time::Duration;
@@ -22,7 +24,7 @@ pub enum KronicalEvent {
     MouseInput {
         x: i32,
         y: i32,
-        button: Option<String>,
+        button: Option<MouseButton>,
         clicks: u16,
         kind: MouseEventKind,
     },
@@ -41,6 +43,47 @@ pub enum KronicalEvent {
     Shutdown,
 }
 
+struct CoordinatorShutdownGuard<'a> {
+    coordinator: &'a EventCoordinator,
+    workspace_dir: &'a Path,
+    api_handles: Option<ApiHandles>,
+    pipeline_handles: Option<PipelineHandles>,
+    uiohook: Option<Uiohook>,
+    window_hook: Option<WindowFocusHook>,
+}
+
+impl<'a> CoordinatorShutdownGuard<'a> {
+    fn new(coordinator: &'a EventCoordinator, workspace_dir: &'a Path) -> Self {
+        Self {
+            coordinator,
+            workspace_dir,
+            api_handles: None,
+            pipeline_handles: None,
+            uiohook: None,
+            window_hook: None,
+        }
+    }
+}
+
+impl Drop for CoordinatorShutdownGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(uiohook) = self.uiohook.take() {
+            let _ = self.coordinator.cleanup_uiohook(uiohook);
+        }
+        if let Some(window_hook) = self.window_hook.take() {
+            let _ = self.coordinator.cleanup_window_hook(window_hook);
+        }
+        if let Some(pipeline) = self.pipeline_handles.take() {
+            let _ = self.coordinator.cleanup_pipeline(pipeline);
+        }
+        if let Some(api) = self.api_handles.take() {
+            let _ = self.coordinator.cleanup_api_servers(api);
+        }
+        self.coordinator.cleanup_socket_files(self.workspace_dir);
+    }
+}
+
+#[derive(Clone)]
 pub struct KronicalEventHandler {
     sender: mpsc::Sender<KronicalEvent>,
     focus_wrapper: FocusEventWrapper,
@@ -84,7 +127,7 @@ impl FocusChangeCallback for FocusCallback {
         {
             error!("Failed to send unified focus change event: {}", e);
         } else {
-            info!("Unified focus change event sent successfully");
+            trace!("Unified focus change event sent successfully");
         }
     }
 }
@@ -98,24 +141,13 @@ impl EventHandler for KronicalEventHandler {
                 KronicalEvent::KeyboardInput
             }
             UiohookEvent::Mouse(m) => {
-                use uiohook_rs::hook::mouse::MouseEventType as VMouseEventType;
                 trace!("Mouse event detected");
-                let kind = match m.event_type {
-                    VMouseEventType::Moved => MouseEventKind::Moved,
-                    VMouseEventType::Pressed => MouseEventKind::Pressed,
-                    VMouseEventType::Released => MouseEventKind::Released,
-                    VMouseEventType::Clicked => MouseEventKind::Clicked,
-                    VMouseEventType::Dragged => MouseEventKind::Dragged,
-                };
-                // Map button; treat NoButton as None
-                let button_str = match format!("{:?}", m.button).as_str() {
-                    "NoButton" => None,
-                    other => Some(other.to_string()),
-                };
+                let kind = event_kind_from_hook(m.event_type);
+                let button = button_from_hook(m.button);
                 KronicalEvent::MouseInput {
                     x: m.x as i32,
                     y: m.y as i32,
-                    button: button_str,
+                    button,
                     clicks: m.clicks,
                     kind,
                 }
@@ -275,7 +307,7 @@ impl EventCoordinator {
 
     pub fn spawn_tracker(
         &self,
-        workspace_dir: &std::path::PathBuf,
+        workspace_dir: &Path,
         thread_registry: ThreadRegistry,
     ) -> Result<()> {
         if !self.tracker_enabled {
@@ -298,7 +330,7 @@ impl EventCoordinator {
 
         if let Err(e) = tracker.start_with_registry(thread_registry) {
             error!("Failed to start system tracker: {}", e);
-            return Err(anyhow::anyhow!("Failed to start system tracker: {}", e));
+            return Err(anyhow!("Failed to start system tracker: {}", e));
         }
 
         info!(
@@ -316,7 +348,7 @@ impl EventCoordinator {
 
     pub fn spawn_api_servers(
         &self,
-        workspace_dir: &std::path::PathBuf,
+        workspace_dir: &Path,
         snapshot_bus: Arc<crate::daemon::snapshot::SnapshotBus>,
         thread_registry: ThreadRegistry,
     ) -> Result<ApiHandles> {
@@ -386,7 +418,7 @@ impl EventCoordinator {
         let uiohook = Uiohook::new(handler);
         if let Err(e) = uiohook.run() {
             error!("UIohook failed: {}", e);
-            return Err(anyhow::anyhow!("UIohook failed: {}", e));
+            return Err(anyhow!("UIohook failed: {}", e));
         }
         info!("UIohook setup completed");
         Ok(uiohook)
@@ -420,6 +452,7 @@ impl EventCoordinator {
         info!("Starting window hook (this will block main thread)");
         if let Err(e) = window_hook.run() {
             error!("Window hook failed: {}", e);
+            return Err(anyhow!("Window hook failed: {}", e));
         }
         info!("Window hook completed");
         Ok(window_hook)
@@ -449,13 +482,17 @@ impl EventCoordinator {
         let (sender, receiver) = mpsc::channel();
         let thread_registry = self.thread_registry();
         let poll_handle_arc = Arc::new(AtomicU64::new(2000));
+        let workspace_path = workspace_dir.as_path();
+        let mut shutdown_guard = CoordinatorShutdownGuard::new(self, workspace_path);
 
         let api_handles = self.spawn_api_servers(
-            &workspace_dir,
+            workspace_path,
             Arc::clone(&snapshot_bus),
             thread_registry.clone(),
         )?;
-        self.spawn_tracker(&workspace_dir, thread_registry.clone())?;
+        shutdown_guard.api_handles = Some(api_handles);
+
+        self.spawn_tracker(workspace_path, thread_registry.clone())?;
         let pipeline_handles = self.spawn_pipeline(
             data_store,
             receiver,
@@ -463,43 +500,32 @@ impl EventCoordinator {
             Arc::clone(&snapshot_bus),
             thread_registry.clone(),
         )?;
+        shutdown_guard.pipeline_handles = Some(pipeline_handles);
 
         self.setup_shutdown_handler(sender.clone())?;
         let uiohook = self.run_uiohook(sender.clone(), Arc::clone(&poll_handle_arc))?;
+        shutdown_guard.uiohook = Some(uiohook);
         let window_hook = self.run_window_hook(sender, Arc::clone(&poll_handle_arc))?;
+        shutdown_guard.window_hook = Some(window_hook);
 
-        self.cleanup_uiohook(uiohook)?;
-        self.cleanup_window_hook(window_hook)?;
-        self.cleanup_pipeline(pipeline_handles)?;
-        self.cleanup_api_servers(api_handles)?;
-        self.cleanup_socket_files(&workspace_dir);
-
+        drop(shutdown_guard);
         info!("Step C: Kronical shutdown complete");
         Ok(())
     }
 
     fn cleanup_uiohook(&self, uiohook: Uiohook) -> Result<()> {
         info!("Step C: Cleaning up UIohook");
-        if let Err(e) = Uiohook::new(KronicalEventHandler::new(
-            mpsc::channel().0,
-            FocusCacheCaps {
-                pid_cache_capacity: self.pid_cache_capacity,
-                title_cache_capacity: self.title_cache_capacity,
-                title_cache_ttl_secs: self.title_cache_ttl_secs,
-            },
-            Arc::new(AtomicU64::new(2000)),
-            self.thread_registry(),
-        )?)
-        .stop()
-        {
+        if let Err(e) = uiohook.stop() {
             error!("Step C: Failed to stop UIohook: {}", e);
         }
         Ok(())
     }
 
-    fn cleanup_window_hook(&self, window_hook: WindowFocusHook) -> Result<()> {
+    fn cleanup_window_hook(&self, _window_hook: WindowFocusHook) -> Result<()> {
         info!("Step C: Cleaning up Window hook");
-        if let Err(e) = window_hook.stop() {
+        // TODO: after the winshift crate is fixed for the stop() method, re-enable this
+        // if let Err(e) = window_hook.stop() {
+        if let Err(e) = WindowFocusHook::stop() {
             error!("Step C: Failed to stop Window hook: {}", e);
         }
         Ok(())
@@ -519,7 +545,7 @@ impl EventCoordinator {
         Ok(())
     }
 
-    fn cleanup_socket_files(&self, workspace_dir: &std::path::PathBuf) {
+    fn cleanup_socket_files(&self, workspace_dir: &Path) {
         info!("Cleaning up socket files");
         let grpc_sock = crate::util::paths::grpc_uds(workspace_dir);
         let http_sock = crate::util::paths::http_uds(workspace_dir);
@@ -532,15 +558,6 @@ impl EventCoordinator {
                     info!("Removed socket file: {}", sock.display());
                 }
             }
-        }
-    }
-}
-
-impl Clone for KronicalEventHandler {
-    fn clone(&self) -> Self {
-        Self {
-            sender: self.sender.clone(),
-            focus_wrapper: self.focus_wrapper.clone(),
         }
     }
 }

@@ -192,7 +192,9 @@ impl EventAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{KeyboardEventData, MouseEventData, MouseEventKind, MousePosition};
+    use crate::events::{
+        KeyboardEventData, MouseButton, MouseEventData, MouseEventKind, MousePosition,
+    };
     use chrono::{TimeZone, Utc};
     use std::sync::Arc;
 
@@ -236,7 +238,7 @@ mod tests {
                 event_id: 2,
                 data: MouseEventData {
                     position: MousePosition { x: 1, y: 2 },
-                    button: Some("left".into()),
+                    button: Some(MouseButton::Primary),
                     click_count: Some(1),
                     event_type: Some(MouseEventKind::Clicked),
                     wheel_amount: None,

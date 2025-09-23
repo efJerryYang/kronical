@@ -107,7 +107,9 @@ impl StateDeriver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::events::{KeyboardEventData, MouseEventData, MouseEventKind, MousePosition};
+    use crate::events::{
+        KeyboardEventData, MouseButton, MouseEventData, MouseEventKind, MousePosition,
+    };
     use chrono::{Duration, TimeZone, Utc};
 
     fn keyboard_event(id: u64, ts: DateTime<Utc>) -> EventEnvelope {
@@ -135,7 +137,7 @@ mod tests {
             kind: EventKind::Signal(SignalKind::MouseInput),
             payload: EventPayload::Mouse(MouseEventData {
                 position: MousePosition { x: 0, y: 0 },
-                button: Some("left".into()),
+                button: Some(MouseButton::Primary),
                 click_count: Some(1),
                 event_type: Some(MouseEventKind::Clicked),
                 wheel_amount: None,
