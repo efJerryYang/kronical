@@ -1,5 +1,7 @@
+use crate::daemon::api::ApiHandles;
 use crate::daemon::events::MouseEventKind;
 use crate::daemon::events::WindowFocusInfo;
+use crate::daemon::pipeline::PipelineHandles;
 use crate::daemon::runtime::ThreadRegistry;
 use crate::daemon::tracker::SystemTracker;
 use crate::daemon::tracker::{FocusCacheCaps, FocusChangeCallback, FocusEventWrapper};
@@ -271,7 +273,7 @@ impl EventCoordinator {
         self.threads.clone()
     }
 
-    pub fn spawn_tracker_thread(
+    pub fn spawn_tracker(
         &self,
         workspace_dir: &std::path::PathBuf,
         thread_registry: ThreadRegistry,
@@ -312,30 +314,32 @@ impl EventCoordinator {
         Ok(())
     }
 
-    pub fn start_main_thread(
+    pub fn spawn_api_servers(
         &self,
-        data_store: Box<dyn StorageBackend>,
-        workspace_dir: std::path::PathBuf,
+        workspace_dir: &std::path::PathBuf,
         snapshot_bus: Arc<crate::daemon::snapshot::SnapshotBus>,
-    ) -> Result<()> {
-        info!("Step A: Starting Kronical on MAIN THREAD (required for hooks)");
-
-        let (sender, receiver) = mpsc::channel();
-        let thread_registry = self.thread_registry();
-
-        // Start API servers (gRPC + HTTP/SSE) via unified API facade.
-        let uds_grpc = crate::util::paths::grpc_uds(&workspace_dir);
-        let uds_http = crate::util::paths::http_uds(&workspace_dir);
+        thread_registry: ThreadRegistry,
+    ) -> Result<ApiHandles> {
+        let uds_grpc = crate::util::paths::grpc_uds(workspace_dir);
+        let uds_http = crate::util::paths::http_uds(workspace_dir);
         let api_handles = crate::daemon::api::spawn_all(
             uds_grpc,
             uds_http,
             Arc::clone(&snapshot_bus),
-            thread_registry.clone(),
+            thread_registry,
         )?;
+        info!("API servers started successfully");
+        Ok(api_handles)
+    }
 
-        self.spawn_tracker_thread(&workspace_dir, thread_registry.clone())?;
-
-        let poll_handle_arc = Arc::new(AtomicU64::new(2000));
+    pub fn spawn_pipeline(
+        &self,
+        data_store: Box<dyn StorageBackend>,
+        event_rx: mpsc::Receiver<KronicalEvent>,
+        poll_handle: Arc<AtomicU64>,
+        snapshot_bus: Arc<crate::daemon::snapshot::SnapshotBus>,
+        thread_registry: ThreadRegistry,
+    ) -> Result<PipelineHandles> {
         let pipeline_config = crate::daemon::pipeline::PipelineConfig {
             retention_minutes: self.retention_minutes,
             active_grace_secs: self.active_grace_secs,
@@ -347,31 +351,27 @@ impl EventCoordinator {
             ephemeral_app_min_distinct_procs: self.ephemeral_app_min_distinct_procs,
             focus_interner_max_strings: self.focus_interner_max_strings,
         };
+
         let pipeline_handles = crate::daemon::pipeline::spawn_pipeline(
             pipeline_config,
             crate::daemon::pipeline::PipelineResources {
                 storage: data_store,
-                event_rx: receiver,
-                poll_handle: Arc::clone(&poll_handle_arc),
+                event_rx,
+                poll_handle: Arc::clone(&poll_handle),
                 snapshot_bus: Arc::clone(&snapshot_bus),
             },
-            thread_registry.clone(),
+            thread_registry,
         )?;
+        info!("Pipeline thread started successfully");
+        Ok(pipeline_handles)
+    }
 
-        let shutdown_sender = sender.clone();
-        ctrlc::set_handler(move || {
-            info!("Step S: Ctrl+C received, sending shutdown signal");
-            if let Err(e) = shutdown_sender.send(KronicalEvent::Shutdown) {
-                error!("Step S: Failed to send shutdown: {}", e);
-            }
-
-            info!("Step S: Stopping winshift hook");
-            if let Err(e) = winshift::stop_hook() {
-                error!("Step S: Failed to stop winshift: {}", e);
-            }
-        })?;
-
-        // poll_handle_arc already created earlier; reuse it for the handler
+    pub fn run_uiohook(
+        &self,
+        sender: mpsc::Sender<KronicalEvent>,
+        poll_handle: Arc<AtomicU64>,
+    ) -> Result<Uiohook> {
+        info!("Setting up UIohook on main thread");
         let handler = KronicalEventHandler::new(
             sender,
             FocusCacheCaps {
@@ -379,20 +379,36 @@ impl EventCoordinator {
                 title_cache_capacity: self.title_cache_capacity,
                 title_cache_ttl_secs: self.title_cache_ttl_secs,
             },
-            std::sync::Arc::clone(&poll_handle_arc),
-            thread_registry.clone(),
+            Arc::clone(&poll_handle),
+            self.thread_registry(),
         )?;
 
-        info!("Step M1: Setting up UIohook on main thread");
-        let uiohook = Uiohook::new(handler.clone());
-
+        let uiohook = Uiohook::new(handler);
         if let Err(e) = uiohook.run() {
-            error!("Step M1: UIohook failed: {}", e);
-            return Err(e.into());
+            error!("UIohook failed: {}", e);
+            return Err(anyhow::anyhow!("UIohook failed: {}", e));
         }
-        info!("Step M1: UIohook setup completed");
+        info!("UIohook setup completed");
+        Ok(uiohook)
+    }
 
-        info!("Step M2: Setting up Window hook on main thread");
+    pub fn run_window_hook(
+        &self,
+        sender: mpsc::Sender<KronicalEvent>,
+        poll_handle: Arc<AtomicU64>,
+    ) -> Result<WindowFocusHook> {
+        info!("Setting up Window hook on main thread");
+        let handler = KronicalEventHandler::new(
+            sender,
+            FocusCacheCaps {
+                pid_cache_capacity: self.pid_cache_capacity,
+                title_cache_capacity: self.title_cache_capacity,
+                title_cache_ttl_secs: self.title_cache_ttl_secs,
+            },
+            Arc::clone(&poll_handle),
+            self.thread_registry(),
+        )?;
+
         let window_hook = WindowFocusHook::with_config(
             handler,
             WindowHookConfig {
@@ -401,46 +417,122 @@ impl EventCoordinator {
             },
         );
 
-        info!("Step M2: Starting window hook (this will block main thread)");
+        info!("Starting window hook (this will block main thread)");
         if let Err(e) = window_hook.run() {
-            error!("Step M2: Window hook failed: {}", e);
+            error!("Window hook failed: {}", e);
         }
-        info!("Step M2: Window hook completed");
+        info!("Window hook completed");
+        Ok(window_hook)
+    }
 
+    fn setup_shutdown_handler(&self, sender: mpsc::Sender<KronicalEvent>) -> Result<()> {
+        ctrlc::set_handler(move || {
+            info!("Ctrl+C received, sending shutdown signal");
+            if let Err(e) = sender.send(KronicalEvent::Shutdown) {
+                error!("Failed to send shutdown: {}", e);
+            }
+            if let Err(e) = winshift::stop_hook() {
+                error!("Failed to stop winshift: {}", e);
+            }
+        })?;
+        Ok(())
+    }
+
+    pub fn start_main_thread(
+        &self,
+        data_store: Box<dyn StorageBackend>,
+        workspace_dir: std::path::PathBuf,
+        snapshot_bus: Arc<crate::daemon::snapshot::SnapshotBus>,
+    ) -> Result<()> {
+        info!("Step A: Starting Kronical on MAIN THREAD (required for hooks)");
+
+        let (sender, receiver) = mpsc::channel();
+        let thread_registry = self.thread_registry();
+        let poll_handle_arc = Arc::new(AtomicU64::new(2000));
+
+        let api_handles = self.spawn_api_servers(
+            &workspace_dir,
+            Arc::clone(&snapshot_bus),
+            thread_registry.clone(),
+        )?;
+        self.spawn_tracker(&workspace_dir, thread_registry.clone())?;
+        let pipeline_handles = self.spawn_pipeline(
+            data_store,
+            receiver,
+            Arc::clone(&poll_handle_arc),
+            Arc::clone(&snapshot_bus),
+            thread_registry.clone(),
+        )?;
+
+        self.setup_shutdown_handler(sender.clone())?;
+        let uiohook = self.run_uiohook(sender.clone(), Arc::clone(&poll_handle_arc))?;
+        let window_hook = self.run_window_hook(sender, Arc::clone(&poll_handle_arc))?;
+
+        self.cleanup_uiohook(uiohook)?;
+        self.cleanup_window_hook(window_hook)?;
+        self.cleanup_pipeline(pipeline_handles)?;
+        self.cleanup_api_servers(api_handles)?;
+        self.cleanup_socket_files(&workspace_dir);
+
+        info!("Step C: Kronical shutdown complete");
+        Ok(())
+    }
+
+    fn cleanup_uiohook(&self, uiohook: Uiohook) -> Result<()> {
         info!("Step C: Cleaning up UIohook");
-        if let Err(e) = uiohook.stop() {
+        if let Err(e) = Uiohook::new(KronicalEventHandler::new(
+            mpsc::channel().0,
+            FocusCacheCaps {
+                pid_cache_capacity: self.pid_cache_capacity,
+                title_cache_capacity: self.title_cache_capacity,
+                title_cache_ttl_secs: self.title_cache_ttl_secs,
+            },
+            Arc::new(AtomicU64::new(2000)),
+            self.thread_registry(),
+        )?)
+        .stop()
+        {
             error!("Step C: Failed to stop UIohook: {}", e);
         }
+        Ok(())
+    }
 
+    fn cleanup_window_hook(&self, window_hook: WindowFocusHook) -> Result<()> {
+        info!("Step C: Cleaning up Window hook");
+        if let Err(e) = window_hook.stop() {
+            error!("Step C: Failed to stop Window hook: {}", e);
+        }
+        Ok(())
+    }
+
+    fn cleanup_pipeline(&self, pipeline_handles: PipelineHandles) -> Result<()> {
         info!("Step C: Waiting for background thread to finish");
         if let Err(e) = pipeline_handles.join() {
             error!("Step C: Background thread panicked: {:?}", e);
         }
-
-        info!("Step C: Cleaning up socket files");
-        let grpc_sock = crate::util::paths::grpc_uds(&workspace_dir);
-        let http_sock = crate::util::paths::http_uds(&workspace_dir);
-
-        if grpc_sock.exists() {
-            if let Err(e) = std::fs::remove_file(&grpc_sock) {
-                error!("Failed to remove gRPC socket: {}", e);
-            } else {
-                info!("Removed gRPC socket file");
-            }
-        }
-
-        if http_sock.exists() {
-            if let Err(e) = std::fs::remove_file(&http_sock) {
-                error!("Failed to remove HTTP socket: {}", e);
-            } else {
-                info!("Removed HTTP socket file");
-            }
-        }
-
-        api_handles.join_all();
-
-        info!("Step C: Kronical shutdown complete");
         Ok(())
+    }
+
+    fn cleanup_api_servers(&self, api_handles: ApiHandles) -> Result<()> {
+        info!("Step C: Cleaning up API servers");
+        api_handles.join_all();
+        Ok(())
+    }
+
+    fn cleanup_socket_files(&self, workspace_dir: &std::path::PathBuf) {
+        info!("Cleaning up socket files");
+        let grpc_sock = crate::util::paths::grpc_uds(workspace_dir);
+        let http_sock = crate::util::paths::http_uds(workspace_dir);
+
+        for sock in [grpc_sock, http_sock] {
+            if sock.exists() {
+                if let Err(e) = std::fs::remove_file(&sock) {
+                    error!("Failed to remove socket file {}: {}", sock.display(), e);
+                } else {
+                    info!("Removed socket file: {}", sock.display());
+                }
+            }
+        }
     }
 }
 
