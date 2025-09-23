@@ -5,7 +5,7 @@ use crate::daemon::events::derive_hint::StateDeriver;
 use crate::daemon::events::derive_signal::LockDeriver;
 use crate::daemon::events::model::{EventEnvelope, EventKind, EventPayload, SignalKind};
 use crate::daemon::events::{
-    KeyboardEventData, MouseEventData, MousePosition, RawEvent, WheelAxis, WindowFocusInfo,
+    KeyboardEventData, MouseEventData, MousePosition, RawEvent, WindowFocusInfo,
 };
 use crate::daemon::records::{
     ActivityRecord, ActivityState, AggregatedActivity, aggregate_activities_since,
@@ -15,16 +15,14 @@ use crate::daemon::snapshot;
 use crate::storage::{StorageBackend, StorageCommand, storage_metrics_watch};
 use anyhow::{Context, Result};
 use chrono::Utc;
+#[cfg(feature = "hotpath")]
+use hotpath::Format;
 use log::{debug, error, info, trace};
 use std::collections::{HashMap as StdHashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, mpsc};
 use std::thread;
 use std::time::Duration;
-use uiohook_rs::hook::wheel::{WHEEL_HORIZONTAL_DIRECTION, WHEEL_VERTICAL_DIRECTION};
-
-#[cfg(feature = "hotpath")]
-use hotpath::Format;
 
 #[derive(Debug, Clone)]
 pub struct PipelineConfig {
@@ -855,38 +853,31 @@ fn convert_kronid_to_raw(event: KronicalEvent) -> Result<RawEvent> {
                 wheel_amount: None,
                 wheel_rotation: None,
                 wheel_axis: None,
+                wheel_scroll_type: None,
             },
         }),
         KronicalEvent::MouseWheel {
             clicks,
             x,
             y,
-            type_: _,
+            scroll_type,
             amount,
             rotation,
-            direction,
-        } => {
-            let axis = if direction == WHEEL_VERTICAL_DIRECTION {
-                Some(WheelAxis::Vertical)
-            } else if direction == WHEEL_HORIZONTAL_DIRECTION {
-                Some(WheelAxis::Horizontal)
-            } else {
-                None
-            };
-            Ok(RawEvent::MouseInput {
-                timestamp: now,
-                event_id,
-                data: MouseEventData {
-                    position: MousePosition { x, y },
-                    button: None,
-                    click_count: Some(clicks as u16),
-                    event_type: None,
-                    wheel_amount: Some(amount as i32),
-                    wheel_rotation: Some(rotation as i32),
-                    wheel_axis: axis,
-                },
-            })
-        }
+            axis,
+        } => Ok(RawEvent::MouseInput {
+            timestamp: now,
+            event_id,
+            data: MouseEventData {
+                position: MousePosition { x, y },
+                button: None,
+                click_count: Some(clicks as u16),
+                event_type: None,
+                wheel_amount: Some(amount as i32),
+                wheel_rotation: Some(rotation as i32),
+                wheel_axis: axis,
+                wheel_scroll_type: Some(scroll_type),
+            },
+        }),
         KronicalEvent::WindowFocusChange { focus_info } => Ok(RawEvent::WindowFocusChange {
             timestamp: now,
             event_id,

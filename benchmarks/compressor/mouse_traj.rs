@@ -168,6 +168,7 @@ impl DbReader for SqliteReader {
                     wheel_amount: None,
                     wheel_rotation: None,
                     wheel_axis: None,
+                    wheel_scroll_type: None,
                 });
                 // Only movement and dragged
                 let kind = match data.event_type {
@@ -256,6 +257,7 @@ impl DbReader for DuckReader {
                     wheel_amount: None,
                     wheel_rotation: None,
                     wheel_axis: None,
+                    wheel_scroll_type: None,
                 });
                 let kind = match data.event_type {
                     Some(MouseEventKind::Moved) => MouseEventKind::Moved,

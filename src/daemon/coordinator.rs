@@ -1,13 +1,15 @@
 use crate::daemon::api::ApiHandles;
 use crate::daemon::events::WindowFocusInfo;
-use crate::daemon::events::{MouseButton, MouseEventKind};
+use crate::daemon::events::{MouseButton, MouseEventKind, WheelAxis, WheelScrollType};
 use crate::daemon::pipeline::PipelineHandles;
 use crate::daemon::runtime::ThreadRegistry;
 use crate::daemon::tracker::SystemTracker;
 use crate::daemon::tracker::{FocusCacheCaps, FocusChangeCallback, FocusEventWrapper};
 use crate::storage::StorageBackend;
 use anyhow::{Result, anyhow};
-use kronical_input::mouse::{button_from_hook, event_kind_from_hook};
+use kronical_input::mouse::{
+    button_from_hook, event_kind_from_hook, wheel_axis_from_direction, wheel_scroll_type_from_raw,
+};
 use log::{debug, error, info, trace};
 use std::path::Path;
 use std::sync::atomic::AtomicU64;
@@ -32,10 +34,10 @@ pub enum KronicalEvent {
         clicks: u16,
         x: i32,
         y: i32,
-        type_: u8,
+        scroll_type: WheelScrollType,
         amount: u16,
         rotation: i16,
-        direction: u8,
+        axis: Option<WheelAxis>,
     },
     WindowFocusChange {
         focus_info: WindowFocusInfo,
@@ -154,14 +156,16 @@ impl EventHandler for KronicalEventHandler {
             }
             UiohookEvent::Wheel(w) => {
                 trace!("Wheel event detected");
+                let scroll_type = wheel_scroll_type_from_raw(w.type_);
+                let axis = wheel_axis_from_direction(w.direction);
                 KronicalEvent::MouseWheel {
                     clicks: w.clicks,
                     x: w.x as i32,
                     y: w.y as i32,
-                    type_: w.type_,
+                    scroll_type,
                     amount: w.amount,
                     rotation: w.rotation,
-                    direction: w.direction,
+                    axis,
                 }
             }
             UiohookEvent::HookEnabled => {

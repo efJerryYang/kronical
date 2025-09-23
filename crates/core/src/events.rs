@@ -29,6 +29,8 @@ pub struct MouseEventData {
     pub wheel_rotation: Option<i32>,
     // axis of wheel movement (Vertical or Horizontal)
     pub wheel_axis: Option<WheelAxis>,
+    // scroll granularity (unit vs block)
+    pub wheel_scroll_type: Option<WheelScrollType>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -54,6 +56,13 @@ pub enum MouseEventKind {
 pub enum WheelAxis {
     Vertical,
     Horizontal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WheelScrollType {
+    Unit,
+    Block,
+    Unknown(u8),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -156,6 +165,7 @@ mod tests {
                 wheel_amount: None,
                 wheel_rotation: None,
                 wheel_axis: None,
+                wheel_scroll_type: None,
             },
         };
         assert_eq!(mouse.timestamp(), ts);

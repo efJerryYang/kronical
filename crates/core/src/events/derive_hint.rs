@@ -143,6 +143,7 @@ mod tests {
                 wheel_amount: None,
                 wheel_rotation: None,
                 wheel_axis: None,
+                wheel_scroll_type: None,
             }),
             derived: false,
             polling: false,

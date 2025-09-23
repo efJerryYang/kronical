@@ -1,8 +1,10 @@
 pub mod mouse {
-    use kronical_core::events::{MouseButton, MouseEventKind};
+    use kronical_core::events::{MouseButton, MouseEventKind, WheelAxis, WheelScrollType};
     use uiohook_rs::hook::mouse::{
         MouseButton as HookMouseButton, MouseEventType as HookMouseEventType,
     };
+    use uiohook_rs::hook::wheel::{WHEEL_HORIZONTAL_DIRECTION, WHEEL_VERTICAL_DIRECTION};
+    use uiohook_rs::{WHEEL_BLOCK_SCROLL, WHEEL_UNIT_SCROLL};
 
     /// Convert a uiohook mouse button enum into the internal representation.
     pub fn button_from_hook(button: HookMouseButton) -> Option<MouseButton> {
@@ -24,6 +26,28 @@ pub mod mouse {
             HookMouseEventType::Released => MouseEventKind::Released,
             HookMouseEventType::Clicked => MouseEventKind::Clicked,
             HookMouseEventType::Dragged => MouseEventKind::Dragged,
+        }
+    }
+
+    /// Map uiohook scroll type codes to the internal scroll type enum.
+    pub fn wheel_scroll_type_from_raw(raw: u8) -> WheelScrollType {
+        if raw == WHEEL_UNIT_SCROLL as u8 {
+            WheelScrollType::Unit
+        } else if raw == WHEEL_BLOCK_SCROLL as u8 {
+            WheelScrollType::Block
+        } else {
+            WheelScrollType::Unknown(raw)
+        }
+    }
+
+    /// Convert direction codes into an optional wheel axis.
+    pub fn wheel_axis_from_direction(direction: u8) -> Option<WheelAxis> {
+        if direction == WHEEL_VERTICAL_DIRECTION {
+            Some(WheelAxis::Vertical)
+        } else if direction == WHEEL_HORIZONTAL_DIRECTION {
+            Some(WheelAxis::Horizontal)
+        } else {
+            None
         }
     }
 
@@ -78,6 +102,32 @@ pub mod mouse {
                 event_kind_from_hook(HookMouseEventType::Dragged),
                 MouseEventKind::Dragged
             );
+        }
+
+        #[test]
+        fn converts_wheel_scroll_type() {
+            assert_eq!(
+                wheel_scroll_type_from_raw(WHEEL_UNIT_SCROLL as u8),
+                WheelScrollType::Unit
+            );
+            assert_eq!(
+                wheel_scroll_type_from_raw(WHEEL_BLOCK_SCROLL as u8),
+                WheelScrollType::Block
+            );
+            assert_eq!(wheel_scroll_type_from_raw(99), WheelScrollType::Unknown(99));
+        }
+
+        #[test]
+        fn converts_wheel_axis() {
+            assert_eq!(
+                wheel_axis_from_direction(WHEEL_VERTICAL_DIRECTION),
+                Some(WheelAxis::Vertical)
+            );
+            assert_eq!(
+                wheel_axis_from_direction(WHEEL_HORIZONTAL_DIRECTION),
+                Some(WheelAxis::Horizontal)
+            );
+            assert_eq!(wheel_axis_from_direction(42), None);
         }
     }
 }
