@@ -1,4 +1,3 @@
-use anyhow::{Context, Result};
 use kronical::daemon::coordinator::EventCoordinator;
 use kronical::daemon::snapshot::SnapshotBus;
 use kronical::storage::StorageBackend;
@@ -12,14 +11,15 @@ use std::sync::Arc;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
-fn ensure_workspace_dir(workspace_dir: &PathBuf) -> Result<()> {
+fn ensure_workspace_dir(workspace_dir: &PathBuf) {
     if !workspace_dir.exists() {
-        std::fs::create_dir_all(workspace_dir).context("Failed to create workspace directory")?;
+        std::fs::create_dir_all(workspace_dir).unwrap_or_else(|e| {
+            eprintln!("Failed to create workspace directory: {}", e);
+            std::process::exit(1);
+        });
     }
-    Ok(())
 }
 
-// TODO: bad code, we should use certain library to check
 fn is_process_running(pid: u32) -> bool {
     std::process::Command::new("ps")
         .args(["-p", &pid.to_string()])
@@ -28,16 +28,14 @@ fn is_process_running(pid: u32) -> bool {
         .unwrap_or(false)
 }
 
-fn write_pid_file(pid_file: &PathBuf) -> Result<()> {
+fn write_pid_file(pid_file: &PathBuf) {
     if pid_file.exists() {
         match std::fs::read_to_string(pid_file) {
             Ok(content) => {
                 if let Ok(existing_pid) = content.trim().parse::<u32>() {
                     if is_process_running(existing_pid) {
-                        return Err(anyhow::anyhow!(
-                            "Kronical daemon is already running (PID: {})",
-                            existing_pid
-                        ));
+                        eprintln!("Kronical daemon is already running (PID: {})", existing_pid);
+                        std::process::exit(1);
                     } else {
                         info!(
                             "Removing stale PID file (process {} no longer exists)",
@@ -55,29 +53,33 @@ fn write_pid_file(pid_file: &PathBuf) -> Result<()> {
     }
 
     let current_pid = std::process::id();
-    std::fs::write(pid_file, current_pid.to_string()).context("Failed to write PID file")?;
-    Ok(())
+    std::fs::write(pid_file, current_pid.to_string()).unwrap_or_else(|e| {
+        eprintln!("Failed to write PID file: {}", e);
+        std::process::exit(1);
+    });
 }
 
-fn verify_pid_file(pid_file: &PathBuf) -> Result<()> {
+fn verify_pid_file(pid_file: &PathBuf) {
     let current_pid = std::process::id();
-    let content =
-        std::fs::read_to_string(pid_file).context("Failed to read PID file for verification")?;
-    let file_pid: u32 = content
-        .trim()
-        .parse()
-        .context("PID file contains invalid PID format")?;
+    let content = std::fs::read_to_string(pid_file).unwrap_or_else(|e| {
+        eprintln!("Failed to read PID file for verification: {}", e);
+        std::process::exit(1);
+    });
+
+    let file_pid: u32 = content.trim().parse().unwrap_or_else(|_| {
+        eprintln!("PID file contains invalid PID format: {}", content);
+        std::process::exit(1);
+    });
 
     if file_pid != current_pid {
-        return Err(anyhow::anyhow!(
+        eprintln!(
             "PID file verification failed: expected {}, found {}",
-            current_pid,
-            file_pid
-        ));
+            current_pid, file_pid
+        );
+        std::process::exit(1);
     }
 
     info!("PID file verification successful (PID: {})", current_pid);
-    Ok(())
 }
 
 fn cleanup_pid_file(pid_file: &PathBuf) {
@@ -115,8 +117,11 @@ fn cleanup_pid_file(pid_file: &PathBuf) {
     }
 }
 
-fn setup_file_logging(log_dir: &PathBuf) -> Result<()> {
-    std::fs::create_dir_all(log_dir).context("Failed to create log directory")?;
+fn setup_file_logging(log_dir: &PathBuf) {
+    std::fs::create_dir_all(log_dir).unwrap_or_else(|e| {
+        eprintln!("Failed to create log directory: {}", e);
+        std::process::exit(1);
+    });
 
     let file_appender = RollingFileAppender::builder()
         .rotation(Rotation::DAILY)
@@ -124,7 +129,10 @@ fn setup_file_logging(log_dir: &PathBuf) -> Result<()> {
         .filename_suffix("log")
         .max_log_files(7)
         .build(log_dir)
-        .context("Failed to create log appender")?;
+        .unwrap_or_else(|e| {
+            eprintln!("Failed to create log appender: {}", e);
+            std::process::exit(1);
+        });
 
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
@@ -142,100 +150,70 @@ fn setup_file_logging(log_dir: &PathBuf) -> Result<()> {
         )
         .with(env_filter)
         .init();
-
-    Ok(())
 }
 
-fn main() {
-    let config = match AppConfig::load() {
-        Ok(c) => c,
+fn load_app_config() -> AppConfig {
+    match AppConfig::load() {
+        Ok(config) => config,
         Err(e) => {
             eprintln!("Failed to load configuration: {}", e);
             std::process::exit(1);
         }
-    };
-
-    if let Err(e) = ensure_workspace_dir(&config.workspace_dir) {
-        eprintln!("Failed to create workspace directory: {}", e);
-        std::process::exit(1);
     }
+}
 
-    let log_dir = config.workspace_dir.join("logs");
-    if let Err(e) = setup_file_logging(&log_dir) {
-        eprintln!("Failed to setup logging: {}", e);
-        std::process::exit(1);
-    }
-
+fn create_data_store(
+    config: &AppConfig,
+    snapshot_bus: &Arc<SnapshotBus>,
+    thread_registry: &kronical_common::threading::ThreadRegistry,
+) -> Box<dyn StorageBackend> {
     let data_file = match config.db_backend {
         DatabaseBackendConfig::Duckdb => config.workspace_dir.join("data.duckdb"),
         DatabaseBackendConfig::Sqlite3 => config.workspace_dir.join("data.sqlite3"),
     };
-    let pid_file = kronical::util::paths::pid_file(&config.workspace_dir);
-    if let Err(e) = write_pid_file(&pid_file) {
-        error!("Failed to write PID: {}", e);
-        std::process::exit(1);
-    }
 
-    if let Err(e) = verify_pid_file(&pid_file) {
-        error!("PID file verification failed: {}", e);
-        std::process::exit(1);
+    match config.db_backend {
+        DatabaseBackendConfig::Duckdb => DuckDbStorage::new_with_limit(
+            &data_file,
+            config.duckdb_memory_limit_mb_main,
+            Arc::clone(snapshot_bus),
+            thread_registry.clone(),
+        )
+        .map(|s| Box::new(s) as Box<dyn StorageBackend>)
+        .unwrap_or_else(|e| {
+            error!("Failed to initialize DuckDB store: {}", e);
+            std::process::exit(1);
+        }),
+        DatabaseBackendConfig::Sqlite3 => SqliteStorage::new(
+            &data_file,
+            Arc::clone(snapshot_bus),
+            thread_registry.clone(),
+        )
+        .map(|s| Box::new(s) as Box<dyn StorageBackend>)
+        .unwrap_or_else(|e| {
+            error!("Failed to initialize SQLite store: {}", e);
+            std::process::exit(1);
+        }),
     }
+}
+
+fn main() {
+    let config = load_app_config();
+    ensure_workspace_dir(&config.workspace_dir);
+
+    let log_dir = config.workspace_dir.join("logs");
+    setup_file_logging(&log_dir);
+
+    let pid_file = kronical::util::paths::pid_file(&config.workspace_dir);
+    write_pid_file(&pid_file);
+    verify_pid_file(&pid_file);
 
     info!("Starting Kronical daemon (kronid)");
 
     let snapshot_bus = Arc::new(SnapshotBus::new());
-
-    let coordinator = EventCoordinator::new(
-        config.retention_minutes,
-        config.active_grace_secs,
-        config.idle_threshold_secs,
-        config.ephemeral_max_duration_secs,
-        config.ephemeral_min_distinct_ids,
-        config.max_windows_per_app,
-        config.ephemeral_app_max_duration_secs,
-        config.ephemeral_app_min_distinct_procs,
-        config.pid_cache_capacity,
-        config.title_cache_capacity,
-        config.title_cache_ttl_secs,
-        config.focus_interner_max_strings,
-        config.tracker_enabled,
-        config.tracker_interval_secs,
-        config.tracker_batch_size,
-        config.tracker_db_backend.clone(),
-        config.duckdb_memory_limit_mb_tracker,
-    );
-
+    let coordinator = EventCoordinator::from_app_config(&config);
     let thread_registry = coordinator.thread_registry();
-
-    let data_store: Box<dyn StorageBackend> = match config.db_backend {
-        DatabaseBackendConfig::Duckdb => {
-            match DuckDbStorage::new_with_limit(
-                &data_file,
-                config.duckdb_memory_limit_mb_main,
-                Arc::clone(&snapshot_bus),
-                thread_registry.clone(),
-            ) {
-                Ok(s) => Box::new(s),
-                Err(e) => {
-                    error!("Failed to initialize DuckDB store: {}", e);
-                    std::process::exit(1);
-                }
-            }
-        }
-        DatabaseBackendConfig::Sqlite3 => {
-            match SqliteStorage::new(
-                &data_file,
-                Arc::clone(&snapshot_bus),
-                thread_registry.clone(),
-            ) {
-                Ok(s) => Box::new(s),
-                Err(e) => {
-                    error!("Failed to initialize SQLite store: {}", e);
-                    std::process::exit(1);
-                }
-            }
-        }
-    };
+    let data_store = create_data_store(&config, &snapshot_bus, &thread_registry);
 
     info!("Kronical daemon will run on MAIN THREAD (required by macOS hooks)");
     let result = coordinator.start_main_thread(

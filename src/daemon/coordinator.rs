@@ -245,6 +245,27 @@ impl EventCoordinator {
             threads,
         }
     }
+    pub fn from_app_config(config: &crate::util::config::AppConfig) -> Self {
+        Self::new(
+            config.retention_minutes,
+            config.active_grace_secs,
+            config.idle_threshold_secs,
+            config.ephemeral_max_duration_secs,
+            config.ephemeral_min_distinct_ids,
+            config.max_windows_per_app,
+            config.ephemeral_app_max_duration_secs,
+            config.ephemeral_app_min_distinct_procs,
+            config.pid_cache_capacity,
+            config.title_cache_capacity,
+            config.title_cache_ttl_secs,
+            config.focus_interner_max_strings,
+            config.tracker_enabled,
+            config.tracker_interval_secs,
+            config.tracker_batch_size,
+            config.tracker_db_backend.clone(),
+            config.duckdb_memory_limit_mb_tracker,
+        )
+    }
 
     pub fn thread_registry(&self) -> ThreadRegistry {
         self.threads.clone()
