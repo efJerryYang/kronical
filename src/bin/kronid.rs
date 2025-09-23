@@ -1,23 +1,27 @@
+use std::error::Error;
+use std::fs::{self, OpenOptions};
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+
 use anyhow::{Context, Result};
+use log::{error, info};
+use tracing::subscriber::SetGlobalDefaultError;
+use tracing_appender::rolling::{RollingFileAppender, Rotation};
+use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
+
 use kronical::daemon::coordinator::EventCoordinator;
 use kronical::daemon::snapshot::SnapshotBus;
 use kronical::storage::StorageBackend;
 use kronical::storage::duckdb::DuckDbStorage;
 use kronical::storage::sqlite3::SqliteStorage;
 use kronical::util::config::{AppConfig, DatabaseBackendConfig};
-use log::{error, info};
-use std::fs;
-use std::path::{Path, PathBuf};
-use std::sync::Arc;
-use tracing_appender::rolling::{RollingFileAppender, Rotation};
-use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
 fn ensure_workspace_dir(workspace_dir: &Path) -> Result<()> {
-    if !workspace_dir.exists() {
-        fs::create_dir_all(workspace_dir)
-            .with_context(|| format!("creating workspace dir {}", workspace_dir.display()))?;
-    }
-    Ok(())
+    fs::create_dir_all(workspace_dir)
+        .with_context(|| format!("creating workspace dir {}", workspace_dir.display()))
 }
 
 fn is_process_running(pid: u32) -> Result<bool> {
@@ -28,7 +32,9 @@ fn is_process_running(pid: u32) -> Result<bool> {
     Ok(out.status.success())
 }
 
-fn write_pid_file(pid_file: &Path) -> Result<()> {
+fn write_pid_file(pid_file: &Path) -> Result<PathBuf> {
+    let lock_path = pid_file.with_extension("pid.lock");
+
     if pid_file.exists() {
         match fs::read_to_string(pid_file) {
             Ok(content) => {
@@ -41,29 +47,69 @@ fn write_pid_file(pid_file: &Path) -> Result<()> {
                             existing_pid
                         );
                         let _ = fs::remove_file(pid_file);
+                        let _ = fs::remove_file(&lock_path);
                     }
                 } else {
                     info!("Removing unreadable PID file (invalid format)");
                     let _ = fs::remove_file(pid_file);
+                    let _ = fs::remove_file(&lock_path);
                 }
             }
             Err(_) => {
                 info!("Removing unreadable PID file");
                 let _ = fs::remove_file(pid_file);
+                let _ = fs::remove_file(&lock_path);
             }
         }
+    } else if lock_path.exists() {
+        info!("Removing stale PID lock file");
+        let _ = fs::remove_file(&lock_path);
     }
 
-    let current_pid = std::process::id().to_string();
+    let mut lock_opts = OpenOptions::new();
+    lock_opts.create_new(true).write(true);
+    #[cfg(unix)]
+    {
+        lock_opts.mode(0o644);
+    }
+    let lock = lock_opts
+        .open(&lock_path)
+        .with_context(|| format!("creating lock {}", lock_path.display()))?;
+    drop(lock);
+
     let mut tmp = pid_file.to_path_buf();
     tmp.set_extension("pid.tmp");
+    let current_pid = std::process::id();
 
-    fs::write(&tmp, current_pid.as_bytes())
-        .with_context(|| format!("writing temp pid file {}", tmp.display()))?;
-    fs::rename(&tmp, pid_file)
-        .with_context(|| format!("renaming {} -> {}", tmp.display(), pid_file.display()))?;
+    let write_result = (|| -> Result<()> {
+        let mut opts = OpenOptions::new();
+        opts.create(true).write(true).truncate(true);
+        #[cfg(unix)]
+        {
+            opts.mode(0o644);
+        }
+        let mut tmp_file = opts
+            .open(&tmp)
+            .with_context(|| format!("opening temp pid file {}", tmp.display()))?;
+        write!(tmp_file, "{}", current_pid)
+            .with_context(|| format!("writing pid {}", current_pid))?;
+        tmp_file
+            .sync_all()
+            .with_context(|| format!("syncing temp pid file {}", tmp.display()))?;
+        drop(tmp_file);
+        fs::rename(&tmp, pid_file)
+            .with_context(|| format!("renaming {} -> {}", tmp.display(), pid_file.display()))?;
+        Ok(())
+    })();
 
-    Ok(())
+    match write_result {
+        Ok(()) => Ok(lock_path),
+        Err(e) => {
+            let _ = fs::remove_file(&lock_path);
+            let _ = fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
 }
 
 fn verify_pid_file(pid_file: &Path) -> Result<()> {
@@ -74,7 +120,7 @@ fn verify_pid_file(pid_file: &Path) -> Result<()> {
     let file_pid: u32 = content
         .trim()
         .parse()
-        .with_context(|| format!("parsing pid from {}", content))?;
+        .with_context(|| format!("parsing pid (len {})", content.len()))?;
 
     if file_pid != current_pid {
         anyhow::bail!(
@@ -134,7 +180,7 @@ fn setup_file_logging(log_dir: &Path) -> Result<()> {
 
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
-    tracing_subscriber::registry()
+    match tracing_subscriber::registry()
         .with(
             fmt::layer()
                 .with_writer(file_appender)
@@ -148,9 +194,19 @@ fn setup_file_logging(log_dir: &Path) -> Result<()> {
         )
         .with(env_filter)
         .try_init()
-        .ok();
-
-    Ok(())
+    {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            if e.source()
+                .and_then(|source| source.downcast_ref::<SetGlobalDefaultError>())
+                .is_some()
+            {
+                Ok(())
+            } else {
+                Err(e.into())
+            }
+        }
+    }
 }
 
 fn load_app_config() -> Result<AppConfig> {
@@ -189,29 +245,35 @@ fn create_data_store(
 }
 
 struct PidFileGuard {
-    path: PathBuf,
+    pid_path: PathBuf,
+    lock_path: PathBuf,
     active: bool,
 }
 impl PidFileGuard {
-    fn new(path: PathBuf) -> Self {
-        Self { path, active: true }
+    fn new(pid_path: PathBuf, lock_path: PathBuf) -> Self {
+        Self {
+            pid_path,
+            lock_path,
+            active: true,
+        }
     }
-    fn disarm(mut self) {
+
+    fn disarm(&mut self) {
         self.active = false;
     }
 }
 impl Drop for PidFileGuard {
     fn drop(&mut self) {
-        if !self.active {
-            return;
-        }
-        if let Ok(content) = fs::read_to_string(&self.path) {
-            if let Ok(file_pid) = content.trim().parse::<u32>() {
-                if file_pid == std::process::id() {
-                    let _ = fs::remove_file(&self.path);
+        if self.active {
+            if let Ok(content) = fs::read_to_string(&self.pid_path) {
+                if let Ok(file_pid) = content.trim().parse::<u32>() {
+                    if file_pid == std::process::id() {
+                        let _ = fs::remove_file(&self.pid_path);
+                    }
                 }
             }
         }
+        let _ = fs::remove_file(&self.lock_path);
     }
 }
 
@@ -223,9 +285,9 @@ fn run() -> Result<()> {
     setup_file_logging(&log_dir)?;
 
     let pid_file = kronical::util::paths::pid_file(&config.workspace_dir);
-    write_pid_file(&pid_file)?;
+    let lock_path = write_pid_file(&pid_file)?;
     verify_pid_file(&pid_file)?;
-    let guard = PidFileGuard::new(pid_file.clone());
+    let mut guard = PidFileGuard::new(pid_file.clone(), lock_path);
 
     info!("Starting Kronical daemon (kronid)");
 
@@ -244,6 +306,7 @@ fn run() -> Result<()> {
         )
         .context("coordinator main thread exited with error")?;
 
+    // start_main_thread blocks until all workers stop, so it is safe to remove the PID now.
     cleanup_pid_file(&pid_file)?;
     guard.disarm();
 
@@ -252,7 +315,7 @@ fn run() -> Result<()> {
 
 fn main() {
     if let Err(e) = run() {
-        error!("Kronical daemon error: {:#}", e);
+        error!("Kronical daemon error: {}", e);
         eprintln!("fatal: {}", e);
         std::process::exit(1);
     }
