@@ -1,127 +1,128 @@
+use anyhow::{Context, Result};
 use kronical::daemon::coordinator::EventCoordinator;
 use kronical::daemon::snapshot::SnapshotBus;
 use kronical::storage::StorageBackend;
 use kronical::storage::duckdb::DuckDbStorage;
 use kronical::storage::sqlite3::SqliteStorage;
-use kronical::util::config::AppConfig;
-use kronical::util::config::DatabaseBackendConfig;
+use kronical::util::config::{AppConfig, DatabaseBackendConfig};
 use log::{error, info};
-use std::path::PathBuf;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
 
-fn ensure_workspace_dir(workspace_dir: &PathBuf) {
+fn ensure_workspace_dir(workspace_dir: &Path) -> Result<()> {
     if !workspace_dir.exists() {
-        std::fs::create_dir_all(workspace_dir).unwrap_or_else(|e| {
-            eprintln!("Failed to create workspace directory: {}", e);
-            std::process::exit(1);
-        });
+        fs::create_dir_all(workspace_dir)
+            .with_context(|| format!("creating workspace dir {}", workspace_dir.display()))?;
     }
+    Ok(())
 }
 
-fn is_process_running(pid: u32) -> bool {
-    std::process::Command::new("ps")
+fn is_process_running(pid: u32) -> Result<bool> {
+    let out = std::process::Command::new("ps")
         .args(["-p", &pid.to_string()])
         .output()
-        .map(|output| output.status.success())
-        .unwrap_or(false)
+        .with_context(|| format!("invoking 'ps -p {}'", pid))?;
+    Ok(out.status.success())
 }
 
-fn write_pid_file(pid_file: &PathBuf) {
+fn write_pid_file(pid_file: &Path) -> Result<()> {
     if pid_file.exists() {
-        match std::fs::read_to_string(pid_file) {
+        match fs::read_to_string(pid_file) {
             Ok(content) => {
                 if let Ok(existing_pid) = content.trim().parse::<u32>() {
-                    if is_process_running(existing_pid) {
-                        eprintln!("Kronical daemon is already running (PID: {})", existing_pid);
-                        std::process::exit(1);
+                    if is_process_running(existing_pid).context("checking existing pid")? {
+                        anyhow::bail!("Kronical daemon is already running (PID: {})", existing_pid);
                     } else {
                         info!(
                             "Removing stale PID file (process {} no longer exists)",
                             existing_pid
                         );
-                        let _ = std::fs::remove_file(pid_file);
+                        let _ = fs::remove_file(pid_file);
                     }
+                } else {
+                    info!("Removing unreadable PID file (invalid format)");
+                    let _ = fs::remove_file(pid_file);
                 }
             }
             Err(_) => {
                 info!("Removing unreadable PID file");
-                let _ = std::fs::remove_file(pid_file);
+                let _ = fs::remove_file(pid_file);
             }
         }
     }
 
-    let current_pid = std::process::id();
-    std::fs::write(pid_file, current_pid.to_string()).unwrap_or_else(|e| {
-        eprintln!("Failed to write PID file: {}", e);
-        std::process::exit(1);
-    });
+    let current_pid = std::process::id().to_string();
+    let mut tmp = pid_file.to_path_buf();
+    tmp.set_extension("pid.tmp");
+
+    fs::write(&tmp, current_pid.as_bytes())
+        .with_context(|| format!("writing temp pid file {}", tmp.display()))?;
+    fs::rename(&tmp, pid_file)
+        .with_context(|| format!("renaming {} -> {}", tmp.display(), pid_file.display()))?;
+
+    Ok(())
 }
 
-fn verify_pid_file(pid_file: &PathBuf) {
+fn verify_pid_file(pid_file: &Path) -> Result<()> {
     let current_pid = std::process::id();
-    let content = std::fs::read_to_string(pid_file).unwrap_or_else(|e| {
-        eprintln!("Failed to read PID file for verification: {}", e);
-        std::process::exit(1);
-    });
+    let content = fs::read_to_string(pid_file)
+        .with_context(|| format!("reading pid file {}", pid_file.display()))?;
 
-    let file_pid: u32 = content.trim().parse().unwrap_or_else(|_| {
-        eprintln!("PID file contains invalid PID format: {}", content);
-        std::process::exit(1);
-    });
+    let file_pid: u32 = content
+        .trim()
+        .parse()
+        .with_context(|| format!("parsing pid from {}", content))?;
 
     if file_pid != current_pid {
-        eprintln!(
+        anyhow::bail!(
             "PID file verification failed: expected {}, found {}",
-            current_pid, file_pid
+            current_pid,
+            file_pid
         );
-        std::process::exit(1);
     }
 
     info!("PID file verification successful (PID: {})", current_pid);
+    Ok(())
 }
 
-fn cleanup_pid_file(pid_file: &PathBuf) {
+fn cleanup_pid_file(pid_file: &Path) -> Result<()> {
     if !pid_file.exists() {
-        error!(
-            "PID file disappeared during runtime! This indicates a problem with process management."
-        );
-        return;
+        error!("PID file disappeared during runtime");
+        return Ok(());
     }
 
     let current_pid = std::process::id();
-    match std::fs::read_to_string(pid_file) {
-        Ok(content) => match content.trim().parse::<u32>() {
-            Ok(file_pid) => {
-                if file_pid == current_pid {
-                    if let Err(e) = std::fs::remove_file(pid_file) {
-                        error!("Failed to remove PID file: {}", e);
-                    } else {
-                        info!("Successfully cleaned up PID file");
-                    }
-                } else {
-                    error!(
-                        "PID file contains different PID ({}) than current process ({}). Not removing PID file!",
-                        file_pid, current_pid
-                    );
-                }
+    let content = fs::read_to_string(pid_file)
+        .with_context(|| format!("reading pid file {}", pid_file.display()))?;
+
+    match content.trim().parse::<u32>() {
+        Ok(file_pid) => {
+            if file_pid == current_pid {
+                fs::remove_file(pid_file)
+                    .with_context(|| format!("removing pid file {}", pid_file.display()))?;
+                info!("Successfully cleaned up PID file");
+            } else {
+                anyhow::bail!(
+                    "PID file belongs to a different process ({}), current is {}",
+                    file_pid,
+                    current_pid
+                );
             }
-            Err(e) => {
-                error!("PID file contains invalid PID: {}. Error: {}", content, e);
-            }
-        },
+        }
         Err(e) => {
-            error!("Failed to read PID file for cleanup: {}", e);
+            anyhow::bail!("PID file contains invalid PID '{}': {}", content, e);
         }
     }
+
+    Ok(())
 }
 
-fn setup_file_logging(log_dir: &PathBuf) {
-    std::fs::create_dir_all(log_dir).unwrap_or_else(|e| {
-        eprintln!("Failed to create log directory: {}", e);
-        std::process::exit(1);
-    });
+fn setup_file_logging(log_dir: &Path) -> Result<()> {
+    fs::create_dir_all(log_dir)
+        .with_context(|| format!("creating log directory {}", log_dir.display()))?;
 
     let file_appender = RollingFileAppender::builder()
         .rotation(Rotation::DAILY)
@@ -129,10 +130,7 @@ fn setup_file_logging(log_dir: &PathBuf) {
         .filename_suffix("log")
         .max_log_files(7)
         .build(log_dir)
-        .unwrap_or_else(|e| {
-            eprintln!("Failed to create log appender: {}", e);
-            std::process::exit(1);
-        });
+        .with_context(|| format!("creating file appender in {}", log_dir.display()))?;
 
     let env_filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
@@ -149,83 +147,113 @@ fn setup_file_logging(log_dir: &PathBuf) {
                 )),
         )
         .with(env_filter)
-        .init();
+        .try_init()
+        .ok();
+
+    Ok(())
 }
 
-fn load_app_config() -> AppConfig {
-    match AppConfig::load() {
-        Ok(config) => config,
-        Err(e) => {
-            eprintln!("Failed to load configuration: {}", e);
-            std::process::exit(1);
-        }
-    }
+fn load_app_config() -> Result<AppConfig> {
+    AppConfig::load().context("loading application configuration")
 }
 
 fn create_data_store(
     config: &AppConfig,
     snapshot_bus: &Arc<SnapshotBus>,
     thread_registry: &kronical_common::threading::ThreadRegistry,
-) -> Box<dyn StorageBackend> {
+) -> Result<Box<dyn StorageBackend>> {
     let data_file = match config.db_backend {
         DatabaseBackendConfig::Duckdb => config.workspace_dir.join("data.duckdb"),
         DatabaseBackendConfig::Sqlite3 => config.workspace_dir.join("data.sqlite3"),
     };
 
-    match config.db_backend {
+    let boxed: Box<dyn StorageBackend> = match config.db_backend {
         DatabaseBackendConfig::Duckdb => DuckDbStorage::new_with_limit(
             &data_file,
             config.duckdb_memory_limit_mb_main,
             Arc::clone(snapshot_bus),
             thread_registry.clone(),
         )
-        .map(|s| Box::new(s) as Box<dyn StorageBackend>)
-        .unwrap_or_else(|e| {
-            error!("Failed to initialize DuckDB store: {}", e);
-            std::process::exit(1);
-        }),
+        .with_context(|| format!("initializing DuckDB store at {}", data_file.display()))?
+        .into(),
         DatabaseBackendConfig::Sqlite3 => SqliteStorage::new(
             &data_file,
             Arc::clone(snapshot_bus),
             thread_registry.clone(),
         )
-        .map(|s| Box::new(s) as Box<dyn StorageBackend>)
-        .unwrap_or_else(|e| {
-            error!("Failed to initialize SQLite store: {}", e);
-            std::process::exit(1);
-        }),
+        .with_context(|| format!("initializing SQLite store at {}", data_file.display()))?
+        .into(),
+    };
+
+    Ok(boxed)
+}
+
+struct PidFileGuard {
+    path: PathBuf,
+    active: bool,
+}
+impl PidFileGuard {
+    fn new(path: PathBuf) -> Self {
+        Self { path, active: true }
+    }
+    fn disarm(mut self) {
+        self.active = false;
+    }
+}
+impl Drop for PidFileGuard {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        if let Ok(content) = fs::read_to_string(&self.path) {
+            if let Ok(file_pid) = content.trim().parse::<u32>() {
+                if file_pid == std::process::id() {
+                    let _ = fs::remove_file(&self.path);
+                }
+            }
+        }
     }
 }
 
-fn main() {
-    let config = load_app_config();
-    ensure_workspace_dir(&config.workspace_dir);
+fn run() -> Result<()> {
+    let config = load_app_config()?;
 
+    ensure_workspace_dir(&config.workspace_dir)?;
     let log_dir = config.workspace_dir.join("logs");
-    setup_file_logging(&log_dir);
+    setup_file_logging(&log_dir)?;
 
     let pid_file = kronical::util::paths::pid_file(&config.workspace_dir);
-    write_pid_file(&pid_file);
-    verify_pid_file(&pid_file);
+    write_pid_file(&pid_file)?;
+    verify_pid_file(&pid_file)?;
+    let guard = PidFileGuard::new(pid_file.clone());
 
     info!("Starting Kronical daemon (kronid)");
 
     let snapshot_bus = Arc::new(SnapshotBus::new());
-    let coordinator = EventCoordinator::from_app_config(&config);
+    let coordinator = EventCoordinator::initialize(&config);
     let thread_registry = coordinator.thread_registry();
-    let data_store = create_data_store(&config, &snapshot_bus, &thread_registry);
+    let data_store = create_data_store(&config, &snapshot_bus, &thread_registry)?;
 
     info!("Kronical daemon will run on MAIN THREAD (required by macOS hooks)");
-    let result = coordinator.start_main_thread(
-        data_store,
-        config.workspace_dir.clone(),
-        Arc::clone(&snapshot_bus),
-    );
 
-    cleanup_pid_file(&pid_file);
+    coordinator
+        .start_main_thread(
+            data_store,
+            config.workspace_dir.clone(),
+            Arc::clone(&snapshot_bus),
+        )
+        .context("coordinator main thread exited with error")?;
 
-    if let Err(e) = result {
-        error!("Kronical daemon error: {}", e);
+    cleanup_pid_file(&pid_file)?;
+    guard.disarm();
+
+    Ok(())
+}
+
+fn main() {
+    if let Err(e) = run() {
+        error!("Kronical daemon error: {:#}", e);
+        eprintln!("fatal: {}", e);
         std::process::exit(1);
     }
 }
