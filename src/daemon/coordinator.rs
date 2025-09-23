@@ -245,7 +245,7 @@ impl EventCoordinator {
             threads,
         }
     }
-    pub fn initialize(config: &crate::util::config::AppConfig) -> Self {
+    pub fn from_app_config(config: &crate::util::config::AppConfig) -> Self {
         Self::new(
             config.retention_minutes,
             config.active_grace_secs,
