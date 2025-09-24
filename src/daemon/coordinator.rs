@@ -51,7 +51,7 @@ struct CoordinatorShutdownGuard<'a> {
     api_handles: Option<ApiHandles>,
     pipeline_handles: Option<PipelineHandles>,
     uiohook: Option<Uiohook>,
-    window_hook: Option<WindowFocusHook>,
+    focus_hook: Option<WindowFocusHook>,
 }
 
 impl<'a> CoordinatorShutdownGuard<'a> {
@@ -62,7 +62,7 @@ impl<'a> CoordinatorShutdownGuard<'a> {
             api_handles: None,
             pipeline_handles: None,
             uiohook: None,
-            window_hook: None,
+            focus_hook: None,
         }
     }
 }
@@ -72,8 +72,8 @@ impl Drop for CoordinatorShutdownGuard<'_> {
         if let Some(uiohook) = self.uiohook.take() {
             let _ = self.coordinator.cleanup_uiohook(uiohook);
         }
-        if let Some(window_hook) = self.window_hook.take() {
-            let _ = self.coordinator.cleanup_window_hook(window_hook);
+        if let Some(focus_hook) = self.focus_hook.take() {
+            let _ = self.coordinator.cleanup_focus_hook(focus_hook);
         }
         if let Some(pipeline) = self.pipeline_handles.take() {
             let _ = self.coordinator.cleanup_pipeline(pipeline);
@@ -428,12 +428,12 @@ impl EventCoordinator {
         Ok(uiohook)
     }
 
-    pub fn run_window_hook(
+    pub fn run_focus_hook(
         &self,
         sender: mpsc::Sender<KronicalEvent>,
         poll_handle: Arc<AtomicU64>,
     ) -> Result<WindowFocusHook> {
-        info!("Setting up Window hook on main thread");
+        info!("Setting up focus hook on main thread");
         let handler = KronicalEventHandler::new(
             sender,
             FocusCacheCaps {
@@ -445,7 +445,7 @@ impl EventCoordinator {
             self.thread_registry(),
         )?;
 
-        let window_hook = WindowFocusHook::with_config(
+        let focus_hook = WindowFocusHook::with_config(
             handler,
             WindowHookConfig {
                 monitoring_mode: MonitoringMode::Combined,
@@ -453,13 +453,13 @@ impl EventCoordinator {
             },
         );
 
-        info!("Starting window hook (this will block main thread)");
-        if let Err(e) = window_hook.run() {
-            error!("Window hook failed: {}", e);
-            return Err(anyhow!("Window hook failed: {}", e));
+        info!("Starting focus hook (this will block main thread)");
+        if let Err(e) = focus_hook.run() {
+            error!("Focus hook failed: {}", e);
+            return Err(anyhow!("Focus hook failed: {}", e));
         }
-        info!("Window hook completed");
-        Ok(window_hook)
+        info!("Focus hook completed");
+        Ok(focus_hook)
     }
 
     fn setup_shutdown_handler(&self, sender: mpsc::Sender<KronicalEvent>) -> Result<()> {
@@ -509,8 +509,8 @@ impl EventCoordinator {
         self.setup_shutdown_handler(sender.clone())?;
         let uiohook = self.run_uiohook(sender.clone(), Arc::clone(&poll_handle_arc))?;
         shutdown_guard.uiohook = Some(uiohook);
-        let window_hook = self.run_window_hook(sender, Arc::clone(&poll_handle_arc))?;
-        shutdown_guard.window_hook = Some(window_hook);
+        let focus_hook = self.run_focus_hook(sender, Arc::clone(&poll_handle_arc))?;
+        shutdown_guard.focus_hook = Some(focus_hook);
 
         drop(shutdown_guard);
         info!("Step C: Kronical shutdown complete");
@@ -525,12 +525,12 @@ impl EventCoordinator {
         Ok(())
     }
 
-    fn cleanup_window_hook(&self, _window_hook: WindowFocusHook) -> Result<()> {
-        info!("Step C: Cleaning up Window hook");
+    fn cleanup_focus_hook(&self, _focus_hook: WindowFocusHook) -> Result<()> {
+        info!("Step C: Cleaning up focus hook");
         // TODO: after the winshift crate is fixed for the stop() method, re-enable this
-        // if let Err(e) = window_hook.stop() {
+        // if let Err(e) = focus_hook.stop() {
         if let Err(e) = WindowFocusHook::stop() {
-            error!("Step C: Failed to stop Window hook: {}", e);
+            error!("Step C: Failed to stop focus hook: {}", e);
         }
         Ok(())
     }
