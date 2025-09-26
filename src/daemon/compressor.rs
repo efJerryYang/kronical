@@ -5,7 +5,8 @@ use std::collections::HashMap;
 
 use kronical_core::compression::{
     self, CompactEvent, CompactFocusEvent, CompactKeyboardActivity, CompactMouseTrajectory,
-    CompactScrollSequence, MouseTrajectoryType, ScrollDirection, StringId,
+    CompactScrollSequence, DEFAULT_RAW_EVENT_TABLE, MouseTrajectoryType, RawEventPointer,
+    ScrollDirection, StringId,
 };
 
 #[derive(Debug, Clone)]
@@ -137,7 +138,12 @@ impl EventCompressor for ScrollCompressor {
                     seq.total_amount += signed_amount as i32;
                     seq.total_rotation += rotation;
                     seq.scroll_count += 1;
-                    seq.raw_event_ids.push(event_id);
+                    if let Some(ref mut link) = seq.raw_event_ids {
+                        link.ids.push(event_id);
+                    } else {
+                        seq.raw_event_ids =
+                            RawEventPointer::new(DEFAULT_RAW_EVENT_TABLE, vec![event_id]);
+                    }
                 }
                 _ => {
                     // Start new sequence
@@ -152,7 +158,10 @@ impl EventCompressor for ScrollCompressor {
                         total_rotation: rotation,
                         scroll_count: 1,
                         position,
-                        raw_event_ids: vec![event_id],
+                        raw_event_ids: RawEventPointer::new(
+                            DEFAULT_RAW_EVENT_TABLE,
+                            vec![event_id],
+                        ),
                     });
                 }
             }
@@ -366,7 +375,7 @@ impl MouseTrajectoryCompressor {
         let path_ts_pos: Vec<(DateTime<Utc>, MousePosition)> =
             path.iter().map(|(_, ts, pos)| (*ts, pos.clone())).collect();
         let max_velocity = self.calculate_max_velocity(&path_ts_pos);
-        let raw_event_ids: Vec<u64> = path.into_iter().map(|(id, _, _)| id).collect();
+        let raw_ids: Vec<u64> = path.into_iter().map(|(id, _, _)| id).collect();
 
         CompactMouseTrajectory {
             start_time,
@@ -377,7 +386,7 @@ impl MouseTrajectoryCompressor {
             simplified_path,
             total_distance,
             max_velocity,
-            raw_event_ids,
+            raw_event_ids: RawEventPointer::new(DEFAULT_RAW_EVENT_TABLE, raw_ids),
         }
     }
 }
@@ -454,7 +463,10 @@ impl EventCompressor for KeyboardActivityCompressor {
                     keystrokes,
                     keys_per_minute: kpm,
                     density_per_sec: density,
-                    raw_event_ids: std::mem::take(&mut group_ids),
+                    raw_event_ids: RawEventPointer::new(
+                        DEFAULT_RAW_EVENT_TABLE,
+                        std::mem::take(&mut group_ids),
+                    ),
                 });
 
                 // Start new group
@@ -474,7 +486,7 @@ impl EventCompressor for KeyboardActivityCompressor {
             keystrokes,
             keys_per_minute: kpm,
             density_per_sec: density,
-            raw_event_ids: group_ids,
+            raw_event_ids: RawEventPointer::new(DEFAULT_RAW_EVENT_TABLE, group_ids),
         });
 
         out
@@ -536,7 +548,10 @@ impl EventCompressor for FocusEventProcessor {
                         window_title_id,
                         pid: focus_info.pid,
                         window_position: focus_info.window_position,
-                        event_id,
+                        raw_event_ids: RawEventPointer::new(
+                            DEFAULT_RAW_EVENT_TABLE,
+                            vec![event_id],
+                        ),
                     })
                 } else {
                     None
@@ -721,7 +736,22 @@ mod tests {
             ScrollDirection::VerticalDown,
             "negative rotation maps to downward scroll",
         );
-        assert_eq!(sequences[1].raw_event_ids, vec![3]);
+        assert_eq!(
+            sequences[1]
+                .raw_event_ids
+                .as_ref()
+                .map(|link| link.ids.clone())
+                .unwrap(),
+            vec![3]
+        );
+        assert_eq!(
+            sequences[1]
+                .raw_event_ids
+                .as_ref()
+                .map(|link| link.table.as_str())
+                .unwrap(),
+            DEFAULT_RAW_EVENT_TABLE
+        );
         assert_eq!(sequences[2].direction, ScrollDirection::HorizontalRight);
     }
 
@@ -743,14 +773,28 @@ mod tests {
 
         assert_eq!(trajectories.len(), 2);
         let first = &trajectories[0];
-        assert_eq!(first.raw_event_ids, vec![1, 2, 3]);
+        assert_eq!(
+            first
+                .raw_event_ids
+                .as_ref()
+                .map(|link| link.ids.clone())
+                .unwrap(),
+            vec![1, 2, 3]
+        );
         assert_eq!(first.event_type, MouseTrajectoryType::Movement);
         assert!(first.total_distance > 0.0);
         assert!(first.max_velocity > 0.0);
 
         let second = &trajectories[1];
         assert_eq!(second.event_type, MouseTrajectoryType::Drag);
-        assert_eq!(second.raw_event_ids, vec![4, 5, 6]);
+        assert_eq!(
+            second
+                .raw_event_ids
+                .as_ref()
+                .map(|link| link.ids.clone())
+                .unwrap(),
+            vec![4, 5, 6]
+        );
         assert!(
             second.simplified_path.len() >= 2,
             "Douglas-Peucker keeps endpoints for summary path",
@@ -772,10 +816,24 @@ mod tests {
         bursts.sort_by_key(|burst| burst.start_time);
 
         assert_eq!(bursts.len(), 2);
-        assert_eq!(bursts[0].raw_event_ids, vec![1, 2, 3]);
+        assert_eq!(
+            bursts[0]
+                .raw_event_ids
+                .as_ref()
+                .map(|link| link.ids.clone())
+                .unwrap(),
+            vec![1, 2, 3]
+        );
         assert!(bursts[0].keys_per_minute > 0.0);
         assert!(bursts[0].density_per_sec > 0.0);
-        assert_eq!(bursts[1].raw_event_ids, vec![4]);
+        assert_eq!(
+            bursts[1]
+                .raw_event_ids
+                .as_ref()
+                .map(|link| link.ids.clone())
+                .unwrap(),
+            vec![4]
+        );
         assert_eq!(bursts[1].keystrokes, 1);
     }
 }

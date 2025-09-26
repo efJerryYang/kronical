@@ -3,7 +3,7 @@ use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use clap::{ArgAction, Parser, ValueEnum};
 use kronical::daemon::events::{MouseEventData, MouseEventKind, MousePosition};
-use kronical_core::compression::CompactMouseTrajectory;
+use kronical_core::compression::{CompactMouseTrajectory, RawEventPointer};
 use rusqlite as sqlite;
 use serde::Deserialize;
 use std::cmp::Ordering;
@@ -70,7 +70,7 @@ enum DbBackend {
 struct CompactRow {
     row_index: usize,
     payload: CompactMouseTrajectory,
-    raw_event_ids: Vec<u64>,
+    raw_ref: Option<RawEventPointer>,
 }
 
 #[derive(Debug, Clone)]
@@ -95,7 +95,10 @@ struct EventWork {
 
 trait DbReader {
     fn load_all_compact_mouse(&mut self) -> Result<Vec<CompactRow>>;
-    fn load_raw_mouse_for_ids(&mut self, ids: &[u64]) -> Result<Vec<RawMousePoint>>;
+    fn load_raw_mouse_for_link(
+        &mut self,
+        link: Option<&RawEventPointer>,
+    ) -> Result<Vec<RawMousePoint>>;
 }
 
 struct SqliteReader {
@@ -113,34 +116,42 @@ impl SqliteReader {
 impl DbReader for SqliteReader {
     fn load_all_compact_mouse(&mut self) -> Result<Vec<CompactRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT rowid, payload, raw_event_ids FROM compact_events WHERE kind='compact:mouse_traj' ORDER BY start_time"
+            "SELECT rowid, payload, raw_event_ref FROM compact_events WHERE kind='compact:mouse_traj' ORDER BY start_time"
         )?;
         let rows = stmt
             .query_map([], |row| {
                 let rowid: i64 = row.get(0)?;
                 let payload_js: Option<String> = row.get(1)?;
-                let raw_ids_js: String = row.get(2)?;
+                let raw_ref_js: Option<String> = row.get(2)?;
                 let payload: CompactMouseTrajectory =
                     serde_json::from_str(&payload_js.unwrap_or_else(|| "null".to_string()))
                         .unwrap();
-                let raw_event_ids: Vec<u64> = serde_json::from_str(&raw_ids_js).unwrap_or_default();
+                let raw_ref: Option<RawEventPointer> = raw_ref_js
+                    .and_then(|js| serde_json::from_str(&js).ok())
+                    .or_else(|| payload.raw_event_ids.clone());
                 Ok(CompactRow {
                     row_index: rowid as usize - 1,
                     payload,
-                    raw_event_ids,
+                    raw_ref,
                 })
             })?
             .collect::<sqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
 
-    fn load_raw_mouse_for_ids(&mut self, ids: &[u64]) -> Result<Vec<RawMousePoint>> {
-        if ids.is_empty() {
+    fn load_raw_mouse_for_link(
+        &mut self,
+        link: Option<&RawEventPointer>,
+    ) -> Result<Vec<RawMousePoint>> {
+        let Some(link) = link else {
+            return Ok(vec![]);
+        };
+        if link.ids.is_empty() {
             return Ok(vec![]);
         }
         let mut out: Vec<RawMousePoint> = Vec::new();
         // chunk to avoid large IN clause
-        for chunk in ids.chunks(500) {
+        for chunk in link.ids.chunks(500) {
             let placeholders = (0..chunk.len()).map(|_| "?").collect::<Vec<_>>().join(",");
             let sql = format!(
                 "SELECT event_id, timestamp, kind, payload FROM raw_envelopes WHERE kind='signal:mouse' AND event_id IN ({}) ORDER BY timestamp, event_id",
@@ -209,32 +220,40 @@ impl DuckReader {
 impl DbReader for DuckReader {
     fn load_all_compact_mouse(&mut self) -> Result<Vec<CompactRow>> {
         let mut stmt = self.conn.prepare(
-            "SELECT rowid, payload, raw_event_ids FROM compact_events WHERE kind='compact:mouse_traj' ORDER BY start_time"
+            "SELECT rowid, payload, raw_event_ref FROM compact_events WHERE kind='compact:mouse_traj' ORDER BY start_time"
         )?;
         let mut rows = stmt.query([])?;
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
             let rowid: i64 = row.get(0)?;
             let payload_js: Option<String> = row.get(1)?;
-            let raw_ids_js: String = row.get(2)?;
+            let raw_ref_js: Option<String> = row.get(2)?;
             let payload: CompactMouseTrajectory =
                 serde_json::from_str(&payload_js.unwrap_or_else(|| "null".to_string())).unwrap();
-            let raw_event_ids: Vec<u64> = serde_json::from_str(&raw_ids_js).unwrap_or_default();
+            let raw_ref: Option<RawEventPointer> = raw_ref_js
+                .and_then(|js| serde_json::from_str(&js).ok())
+                .or_else(|| payload.raw_event_ids.clone());
             out.push(CompactRow {
                 row_index: rowid as usize - 1,
                 payload,
-                raw_event_ids,
+                raw_ref,
             });
         }
         Ok(out)
     }
 
-    fn load_raw_mouse_for_ids(&mut self, ids: &[u64]) -> Result<Vec<RawMousePoint>> {
-        if ids.is_empty() {
+    fn load_raw_mouse_for_link(
+        &mut self,
+        link: Option<&RawEventPointer>,
+    ) -> Result<Vec<RawMousePoint>> {
+        let Some(link) = link else {
+            return Ok(vec![]);
+        };
+        if link.ids.is_empty() {
             return Ok(vec![]);
         }
         let mut out: Vec<RawMousePoint> = Vec::new();
-        for chunk in ids.chunks(900) {
+        for chunk in link.ids.chunks(900) {
             let placeholders = (0..chunk.len()).map(|_| "?").collect::<Vec<_>>().join(",");
             let sql = format!(
                 "SELECT event_id, timestamp, kind, payload FROM raw_envelopes WHERE kind='signal:mouse' AND event_id IN ({}) ORDER BY timestamp, event_id",
@@ -823,7 +842,7 @@ fn main() -> Result<()> {
     let mut all_events: Vec<EventWork> = Vec::with_capacity(selected.len());
     for idx in &selected {
         let row = &compacts[*idx];
-        let raws = reader.load_raw_mouse_for_ids(&row.raw_event_ids)?;
+        let raws = reader.load_raw_mouse_for_link(row.raw_ref.as_ref())?;
         let raw_pts: Vec<MousePosition> = raws.into_iter().map(|p| p.pos).collect();
         if raw_pts.len() >= 3 {
             all_events.push(EventWork {

@@ -133,7 +133,7 @@ impl DuckDbStorage {
                 end_time TIMESTAMPTZ NOT NULL,
                 kind TEXT NOT NULL,
                 payload TEXT,
-                raw_event_ids TEXT NOT NULL
+                raw_event_ref TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_compact_events_start_time ON compact_events(start_time);
             CREATE INDEX IF NOT EXISTS idx_activity_records_start_time ON activity_records(start_time);
@@ -248,49 +248,57 @@ impl DuckDbStorage {
                         match ce {
                             CompactEvent::Scroll(s) => {
                                 let _ = conn.execute(
-                                    "INSERT INTO compact_events (start_time, end_time, kind, payload, raw_event_ids) VALUES (?, ?, ?, ?, ?)",
+                                    "INSERT INTO compact_events (start_time, end_time, kind, payload, raw_event_ref) VALUES (?, ?, ?, ?, ?)",
                                     params![
                                         s.start_time,
                                         s.end_time,
                                         "compact:scroll",
                                         serde_json::to_string(&s).ok(),
-                                        serde_json::to_string(&s.raw_event_ids).unwrap_or("[]".to_string()),
+                                        s.raw_event_ids
+                                            .as_ref()
+                                            .and_then(|link| serde_json::to_string(link).ok()),
                                     ],
                                 );
                             }
                             CompactEvent::MouseTrajectory(t) => {
                                 let _ = conn.execute(
-                                    "INSERT INTO compact_events (start_time, end_time, kind, payload, raw_event_ids) VALUES (?, ?, ?, ?, ?)",
+                                    "INSERT INTO compact_events (start_time, end_time, kind, payload, raw_event_ref) VALUES (?, ?, ?, ?, ?)",
                                     params![
                                         t.start_time,
                                         t.end_time,
                                         "compact:mouse_traj",
                                         serde_json::to_string(&t).ok(),
-                                        serde_json::to_string(&t.raw_event_ids).unwrap_or("[]".to_string()),
+                                        t.raw_event_ids
+                                            .as_ref()
+                                            .and_then(|link| serde_json::to_string(link).ok()),
                                     ],
                                 );
                             }
                             CompactEvent::Keyboard(k) => {
                                 let _ = conn.execute(
-                                    "INSERT INTO compact_events (start_time, end_time, kind, payload, raw_event_ids) VALUES (?, ?, ?, ?, ?)",
+                                    "INSERT INTO compact_events (start_time, end_time, kind, payload, raw_event_ref) VALUES (?, ?, ?, ?, ?)",
                                     params![
                                         k.start_time,
                                         k.end_time,
                                         "compact:keyboard",
                                         serde_json::to_string(&k).ok(),
-                                        serde_json::to_string(&k.raw_event_ids).unwrap_or("[]".to_string()),
+                                        k.raw_event_ids
+                                            .as_ref()
+                                            .and_then(|link| serde_json::to_string(link).ok()),
                                     ],
                                 );
                             }
                             CompactEvent::Focus(f) => {
                                 let _ = conn.execute(
-                                    "INSERT INTO compact_events (start_time, end_time, kind, payload, raw_event_ids) VALUES (?, ?, ?, ?, ?)",
+                                    "INSERT INTO compact_events (start_time, end_time, kind, payload, raw_event_ref) VALUES (?, ?, ?, ?, ?)",
                                     params![
                                         f.timestamp,
                                         f.timestamp,
                                         "compact:focus",
                                         serde_json::to_string(&f).ok(),
-                                        serde_json::to_string(&vec![f.event_id]).unwrap_or("[]".to_string()),
+                                        f.raw_event_ids
+                                            .as_ref()
+                                            .and_then(|link| serde_json::to_string(link).ok()),
                                     ],
                                 );
                             }

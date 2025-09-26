@@ -92,7 +92,7 @@ impl SqliteStorage {
                 end_time TEXT NOT NULL,
                 kind TEXT NOT NULL,
                 payload TEXT,
-                raw_event_ids TEXT NOT NULL
+                raw_event_ref TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_compact_events_start_time ON compact_events(start_time);
             CREATE INDEX IF NOT EXISTS idx_activity_records_start_time ON activity_records(start_time);"
@@ -185,40 +185,47 @@ impl SqliteStorage {
                 StorageCommand::CompactEvents(events) => {
                     let mut last_res: rusqlite::Result<usize> = Ok(0);
                     for ce in events.into_iter() {
-                        let (start_time, end_time, kind_s, payload_js, raw_ids_js) = match &ce {
+                        let (start_time, end_time, kind_s, payload_js, raw_ref_js) = match &ce {
                             CompactEvent::Scroll(s) => (
                                 s.start_time.to_rfc3339(),
                                 s.end_time.to_rfc3339(),
                                 "compact:scroll".to_string(),
                                 serde_json::to_string(&s).ok(),
-                                serde_json::to_string(&s.raw_event_ids).unwrap_or("[]".to_string()),
+                                s.raw_event_ids
+                                    .as_ref()
+                                    .and_then(|link| serde_json::to_string(link).ok()),
                             ),
                             CompactEvent::MouseTrajectory(t) => (
                                 t.start_time.to_rfc3339(),
                                 t.end_time.to_rfc3339(),
                                 "compact:mouse_traj".to_string(),
                                 serde_json::to_string(&t).ok(),
-                                serde_json::to_string(&t.raw_event_ids).unwrap_or("[]".to_string()),
+                                t.raw_event_ids
+                                    .as_ref()
+                                    .and_then(|link| serde_json::to_string(link).ok()),
                             ),
                             CompactEvent::Keyboard(k) => (
                                 k.start_time.to_rfc3339(),
                                 k.end_time.to_rfc3339(),
                                 "compact:keyboard".to_string(),
                                 serde_json::to_string(&k).ok(),
-                                serde_json::to_string(&k.raw_event_ids).unwrap_or("[]".to_string()),
+                                k.raw_event_ids
+                                    .as_ref()
+                                    .and_then(|link| serde_json::to_string(link).ok()),
                             ),
                             CompactEvent::Focus(f) => (
                                 f.timestamp.to_rfc3339(),
                                 f.timestamp.to_rfc3339(),
                                 "compact:focus".to_string(),
                                 serde_json::to_string(&f).ok(),
-                                serde_json::to_string(&vec![f.event_id])
-                                    .unwrap_or("[]".to_string()),
+                                f.raw_event_ids
+                                    .as_ref()
+                                    .and_then(|link| serde_json::to_string(link).ok()),
                             ),
                         };
                         last_res = tx.execute(
-                            "INSERT INTO compact_events (start_time, end_time, kind, payload, raw_event_ids) VALUES (?, ?, ?, ?, ?)",
-                            params![start_time, end_time, kind_s, payload_js, raw_ids_js],
+                            "INSERT INTO compact_events (start_time, end_time, kind, payload, raw_event_ref) VALUES (?, ?, ?, ?, ?)",
+                            params![start_time, end_time, kind_s, payload_js, raw_ref_js],
                         );
                         if last_res.is_err() {
                             break;
