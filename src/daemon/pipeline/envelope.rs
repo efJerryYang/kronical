@@ -1,7 +1,9 @@
 use crate::daemon::events::adapter::EventAdapter;
 use crate::daemon::events::derive_hint::StateDeriver;
 use crate::daemon::events::derive_signal::LockDeriver;
-use crate::daemon::events::model::{EventEnvelope, EventKind, EventPayload, SignalKind};
+use crate::daemon::events::model::{
+    EventEnvelope, EventKind, EventPayload, EventSource, HintKind, SignalKind,
+};
 use crate::daemon::runtime::{ThreadHandle, ThreadRegistry};
 use crate::daemon::snapshot;
 use crate::storage::StorageCommand;
@@ -164,7 +166,7 @@ fn apply_state_update_hint(
             from: *from,
             to: *to,
             at: env.timestamp,
-            by_signal: signal_kind.map(|sk| format!("{:?}", sk)),
+            by_signal: transition_reason(env, signal_kind),
         };
         update.transition = Some(transition);
         update.state = Some(*to);
@@ -181,9 +183,24 @@ fn apply_state_update_signal(
             from: *from,
             to: *to,
             at: env.timestamp,
-            by_signal: Some(format!("{:?}", signal_kind)),
+            by_signal: transition_reason(env, Some(signal_kind)),
         };
         update.transition = Some(transition);
         update.state = Some(*to);
+    }
+}
+
+fn transition_reason(
+    env: &EventEnvelope,
+    signal_kind: Option<&SignalKind>,
+) -> Option<String> {
+    if let Some(kind) = signal_kind {
+        Some(format!("{kind:?}"))
+    } else if matches!(env.kind, EventKind::Hint(HintKind::StateChanged))
+        && matches!(env.source, EventSource::Derived)
+    {
+        Some("IdleTimeout".to_string())
+    } else {
+        None
     }
 }
