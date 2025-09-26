@@ -190,10 +190,7 @@ fn apply_state_update_signal(
     }
 }
 
-fn transition_reason(
-    env: &EventEnvelope,
-    signal_kind: Option<&SignalKind>,
-) -> Option<String> {
+fn transition_reason(env: &EventEnvelope, signal_kind: Option<&SignalKind>) -> Option<String> {
     if let Some(kind) = signal_kind {
         Some(format!("{kind:?}"))
     } else if matches!(env.kind, EventKind::Hint(HintKind::StateChanged))

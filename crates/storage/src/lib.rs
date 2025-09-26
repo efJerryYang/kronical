@@ -114,7 +114,8 @@ mod tests {
 
     use kronical_core::compression::{
         CompactEvent, CompactFocusEvent, CompactKeyboardActivity, CompactMouseTrajectory,
-        CompactScrollSequence, MouseTrajectoryType, ScrollDirection, StringId,
+        CompactScrollSequence, DEFAULT_RAW_EVENT_TABLE, MouseTrajectoryType, RawEventPointer,
+        ScrollDirection, StringId,
     };
     use kronical_core::events::model::{
         EventEnvelope, EventKind, EventPayload, EventSource, HintKind, SignalKind,
@@ -229,7 +230,7 @@ mod tests {
             total_rotation: -10,
             scroll_count: 2,
             position: MousePosition { x: 0, y: 0 },
-            raw_event_ids: vec![1],
+            raw_event_ids: RawEventPointer::new(DEFAULT_RAW_EVENT_TABLE, vec![1]),
         });
 
         let keyboard_compact = CompactEvent::Keyboard(CompactKeyboardActivity {
@@ -238,7 +239,7 @@ mod tests {
             keystrokes: 4,
             keys_per_minute: 240.0,
             density_per_sec: 4.0,
-            raw_event_ids: vec![1],
+            raw_event_ids: RawEventPointer::new(DEFAULT_RAW_EVENT_TABLE, vec![1]),
         });
 
         let trajectory = CompactEvent::MouseTrajectory(CompactMouseTrajectory {
@@ -253,7 +254,7 @@ mod tests {
             ],
             total_distance: 28.0,
             max_velocity: 14.0,
-            raw_event_ids: vec![2, 3],
+            raw_event_ids: RawEventPointer::new(DEFAULT_RAW_EVENT_TABLE, vec![2, 3]),
         });
 
         let focus_compact = CompactEvent::Focus(CompactFocusEvent {
@@ -262,7 +263,7 @@ mod tests {
             window_title_id: 2 as StringId,
             pid: 42,
             window_position: Some(MousePosition { x: 50, y: 60 }),
-            event_id: 99,
+            raw_event_ids: RawEventPointer::new(DEFAULT_RAW_EVENT_TABLE, vec![99]),
         });
 
         SampleData {

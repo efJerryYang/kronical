@@ -4,6 +4,27 @@ use serde::{Deserialize, Serialize};
 
 pub type StringId = u16;
 
+pub const DEFAULT_RAW_EVENT_TABLE: &str = "raw_events";
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RawEventPointer {
+    pub table: String,
+    pub ids: Vec<u64>,
+}
+
+impl RawEventPointer {
+    pub fn new(table: impl Into<String>, ids: Vec<u64>) -> Option<Self> {
+        if ids.is_empty() {
+            None
+        } else {
+            Some(Self {
+                table: table.into(),
+                ids,
+            })
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CompactScrollSequence {
     pub start_time: DateTime<Utc>,
@@ -13,7 +34,7 @@ pub struct CompactScrollSequence {
     pub total_rotation: i32,
     pub scroll_count: u32,
     pub position: MousePosition,
-    pub raw_event_ids: Vec<u64>,
+    pub raw_event_ids: Option<RawEventPointer>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -34,7 +55,7 @@ pub struct CompactMouseTrajectory {
     pub simplified_path: Vec<MousePosition>,
     pub total_distance: f32,
     pub max_velocity: f32,
-    pub raw_event_ids: Vec<u64>,
+    pub raw_event_ids: Option<RawEventPointer>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -50,7 +71,7 @@ pub struct CompactKeyboardActivity {
     pub keystrokes: u32,
     pub keys_per_minute: f32,
     pub density_per_sec: f32,
-    pub raw_event_ids: Vec<u64>,
+    pub raw_event_ids: Option<RawEventPointer>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -60,7 +81,7 @@ pub struct CompactFocusEvent {
     pub window_title_id: StringId,
     pub pid: i32,
     pub window_position: Option<MousePosition>,
-    pub event_id: u64,
+    pub raw_event_ids: Option<RawEventPointer>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -124,7 +145,7 @@ mod tests {
             simplified_path: vec![MousePosition { x: 2, y: 2 }, MousePosition { x: 5, y: 5 }],
             total_distance: 14.1,
             max_velocity: 7.0,
-            raw_event_ids: vec![1, 2, 3],
+            raw_event_ids: RawEventPointer::new(DEFAULT_RAW_EVENT_TABLE, vec![1, 2, 3]),
         };
 
         let evt = CompactEvent::MouseTrajectory(trajectory.clone());
@@ -141,7 +162,7 @@ mod tests {
             keystrokes: 10,
             keys_per_minute: 120.0,
             density_per_sec: 2.0,
-            raw_event_ids: vec![10, 11],
+            raw_event_ids: RawEventPointer::new(DEFAULT_RAW_EVENT_TABLE, vec![10, 11]),
         });
         assert_eq!(
             keyboard.memory_size(),
@@ -154,7 +175,7 @@ mod tests {
             window_title_id: 2,
             pid: 4242,
             window_position: Some(MousePosition { x: 20, y: 30 }),
-            event_id: 9,
+            raw_event_ids: RawEventPointer::new(DEFAULT_RAW_EVENT_TABLE, vec![9]),
         });
         assert_eq!(
             focus.memory_size(),
@@ -172,7 +193,7 @@ mod tests {
             total_rotation: -5,
             scroll_count: 3,
             position: MousePosition { x: 10, y: 20 },
-            raw_event_ids: vec![10, 11],
+            raw_event_ids: RawEventPointer::new(DEFAULT_RAW_EVENT_TABLE, vec![10, 11]),
         };
         let event = CompactEvent::Scroll(scroll.clone());
         assert_eq!(
