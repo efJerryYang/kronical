@@ -228,6 +228,13 @@ fn apply_update(
         snapshot_bus.push_transition(transition.clone());
         *last_transition = Some(transition);
     }
+    if let Some((window_id, title)) = update.focus_title {
+        if let Some(focus) = current_focus.as_mut() {
+            if focus.window_id == window_id {
+                focus.window_title = Arc::new(title);
+            }
+        }
+    }
 }
 
 fn update_records(
