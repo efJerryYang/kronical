@@ -18,52 +18,6 @@ impl StateDeriver {
 
     pub fn on_signal(&mut self, env: &EventEnvelope) -> Option<EventEnvelope> {
         let now = env.timestamp;
-        if let EventKind::Signal(SignalKind::LockStart) = env.kind {
-            let _ = self.engine.on_signal(env, now);
-            let from = self.engine.current();
-            return Some(EventEnvelope {
-                id: env.id,
-                timestamp: now,
-                source: EventSource::Derived,
-                kind: EventKind::Hint(HintKind::StateChanged),
-                payload: EventPayload::State {
-                    from,
-                    to: ActivityState::Locked,
-                },
-                derived: true,
-                polling: false,
-                sensitive: false,
-            });
-        }
-        if let EventKind::Signal(SignalKind::LockEnd) = env.kind {
-            let from = ActivityState::Locked;
-            if let Some(tr) = self.engine.on_signal(env, now) {
-                return Some(EventEnvelope {
-                    id: env.id,
-                    timestamp: now,
-                    source: EventSource::Derived,
-                    kind: EventKind::Hint(HintKind::StateChanged),
-                    payload: EventPayload::State { from, to: tr.to },
-                    derived: true,
-                    polling: false,
-                    sensitive: false,
-                });
-            } else {
-                return Some(EventEnvelope {
-                    id: env.id,
-                    timestamp: now,
-                    source: EventSource::Derived,
-                    kind: EventKind::Hint(HintKind::StateChanged),
-                    payload: EventPayload::State {
-                        from,
-                        to: self.engine.current(),
-                    },
-                    derived: true,
-                    polling: false,
-                    sensitive: false,
-                });
-            }
-        }
         if let Some(tr) = self.engine.on_signal(env, now) {
             Some(EventEnvelope {
                 id: env.id,

@@ -57,6 +57,7 @@ impl EventAdapter {
                 } => {
                     let now: DateTime<Utc> = *timestamp;
                     let current = focus_info.clone();
+                    let login_focus = current.app_name.eq_ignore_ascii_case("loginwindow");
                     let mut emitted = false;
                     if let Some(last) = &self.last_focus {
                         if last.pid != current.pid
@@ -73,7 +74,6 @@ impl EventAdapter {
                                 polling: false,
                                 sensitive: false,
                             });
-                            // New model: emit FocusChanged hint and ActivityPulse signal
                             out.push(EventEnvelope {
                                 id: *event_id,
                                 timestamp: now,
@@ -84,16 +84,18 @@ impl EventAdapter {
                                 polling: false,
                                 sensitive: false,
                             });
-                            out.push(EventEnvelope {
-                                id: *event_id,
-                                timestamp: now,
-                                source: EventSource::Hook,
-                                kind: EventKind::Signal(SignalKind::ActivityPulse),
-                                payload: EventPayload::None,
-                                derived: false,
-                                polling: false,
-                                sensitive: false,
-                            });
+                            if !login_focus {
+                                out.push(EventEnvelope {
+                                    id: *event_id,
+                                    timestamp: now,
+                                    source: EventSource::Hook,
+                                    kind: EventKind::Signal(SignalKind::ActivityPulse),
+                                    payload: EventPayload::None,
+                                    derived: false,
+                                    polling: false,
+                                    sensitive: false,
+                                });
+                            }
                             emitted = true;
                         } else if last.window_id != current.window_id {
                             out.push(EventEnvelope {
@@ -106,7 +108,6 @@ impl EventAdapter {
                                 polling: false,
                                 sensitive: false,
                             });
-                            // New model
                             out.push(EventEnvelope {
                                 id: *event_id,
                                 timestamp: now,
@@ -117,16 +118,18 @@ impl EventAdapter {
                                 polling: false,
                                 sensitive: false,
                             });
-                            out.push(EventEnvelope {
-                                id: *event_id,
-                                timestamp: now,
-                                source: EventSource::Hook,
-                                kind: EventKind::Signal(SignalKind::ActivityPulse),
-                                payload: EventPayload::None,
-                                derived: false,
-                                polling: false,
-                                sensitive: false,
-                            });
+                            if !login_focus {
+                                out.push(EventEnvelope {
+                                    id: *event_id,
+                                    timestamp: now,
+                                    source: EventSource::Hook,
+                                    kind: EventKind::Signal(SignalKind::ActivityPulse),
+                                    payload: EventPayload::None,
+                                    derived: false,
+                                    polling: false,
+                                    sensitive: false,
+                                });
+                            }
                             emitted = true;
                         } else if last.window_title != current.window_title {
                             out.push(EventEnvelope {
@@ -145,7 +148,6 @@ impl EventAdapter {
                             emitted = true;
                         }
                     } else {
-                        // First observation — treat as AppChanged baseline
                         out.push(EventEnvelope {
                             id: *event_id,
                             timestamp: now,
@@ -166,16 +168,18 @@ impl EventAdapter {
                             polling: false,
                             sensitive: false,
                         });
-                        out.push(EventEnvelope {
-                            id: *event_id,
-                            timestamp: now,
-                            source: EventSource::Hook,
-                            kind: EventKind::Signal(SignalKind::ActivityPulse),
-                            payload: EventPayload::None,
-                            derived: false,
-                            polling: false,
-                            sensitive: false,
-                        });
+                        if !login_focus {
+                            out.push(EventEnvelope {
+                                id: *event_id,
+                                timestamp: now,
+                                source: EventSource::Hook,
+                                kind: EventKind::Signal(SignalKind::ActivityPulse),
+                                payload: EventPayload::None,
+                                derived: false,
+                                polling: false,
+                                sensitive: false,
+                            });
+                        }
                         emitted = true;
                     }
                     self.last_focus = Some(current);
@@ -366,5 +370,42 @@ mod tests {
         let _ = adapter.adapt_batch(&vec![focus_event(40, 5_000, focus.clone())]);
         let out = adapter.adapt_batch(&vec![focus_event(41, 5_001, focus)]);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn login_window_focus_suppresses_activity_pulse() {
+        let mut adapter = EventAdapter::new();
+        let login_focus = focus_info("loginwindow", 99, "Login Screen");
+        let out = adapter.adapt_batch(&vec![focus_event(50, 6_000, login_focus)]);
+
+        assert_eq!(out.len(), 2);
+        assert!(matches!(
+            out[0].kind,
+            EventKind::Signal(SignalKind::AppChanged)
+        ));
+        assert!(matches!(
+            out[1].kind,
+            EventKind::Hint(HintKind::FocusChanged)
+        ));
+        assert!(
+            out.iter()
+                .all(|e| !matches!(e.kind, EventKind::Signal(SignalKind::ActivityPulse)))
+        );
+    }
+
+    #[test]
+    fn pulse_resumes_after_unlock_focus() {
+        let mut adapter = EventAdapter::new();
+        let login_focus = focus_info("loginwindow", 99, "Login Screen");
+        let _ = adapter.adapt_batch(&vec![focus_event(51, 6_500, login_focus)]);
+
+        let finder_focus = focus_info("Finder", 222, "Desktop");
+        let out = adapter.adapt_batch(&vec![focus_event(52, 6_800, finder_focus)]);
+
+        assert_eq!(out.len(), 3);
+        assert!(
+            out.iter()
+                .any(|e| matches!(e.kind, EventKind::Signal(SignalKind::ActivityPulse)))
+        );
     }
 }

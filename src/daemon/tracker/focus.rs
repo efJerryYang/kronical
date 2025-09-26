@@ -13,6 +13,9 @@ use sysinfo::{Pid, System};
 
 use winshift::{ActiveWindowInfo, get_active_window_info};
 
+const LOGINWINDOW_APP: &str = "loginwindow";
+const LOGINWINDOW_WINDOW_ID: u32 = u32::MAX;
+
 #[derive(Debug, Clone, Copy)]
 pub struct FocusCacheCaps {
     pub pid_cache_capacity: usize,
@@ -223,13 +226,24 @@ fn run_focus_worker(
                     if state.app_name == app_name && state.pid == pid {
                         debug!("Focus worker: duplicate app change ignored");
                     } else {
+                        let is_login = app_name.eq_ignore_ascii_case(LOGINWINDOW_APP);
                         state.app_name = app_name;
                         state.pid = pid;
                         state.process_start_time = get_process_start_time(pid);
+                        if state.process_start_time == 0 {
+                            state.process_start_time = Utc::now().timestamp_millis() as u64;
+                        }
+                        if is_login {
+                            state.window_id = LOGINWINDOW_WINDOW_ID;
+                        }
                         state.window_instance_start = Utc::now();
                         state.last_app_update = Instant::now();
                         // Defer emission to allow window info to arrive
-                        schedule_emit(&mut scheduled_emit_at, 150);
+                        if is_login {
+                            schedule_emit(&mut scheduled_emit_at, 50);
+                        } else {
+                            schedule_emit(&mut scheduled_emit_at, 150);
+                        }
                     }
                 }
                 FocusMsg::WindowChange { window_title } => {
@@ -239,6 +253,11 @@ fn run_focus_worker(
                         debug!("Focus worker: duplicate window change ignored");
                     } else {
                         state.window_title = window_title;
+                        if state.app_name.eq_ignore_ascii_case(LOGINWINDOW_APP)
+                            && state.window_id == 0
+                        {
+                            state.window_id = LOGINWINDOW_WINDOW_ID;
+                        }
                         state.last_window_update = Instant::now();
                         if state.is_complete() {
                             // small settle delay
@@ -255,8 +274,18 @@ fn run_focus_worker(
                     state.app_name = info.app_name.clone();
                     state.pid = info.process_id;
                     state.process_start_time = get_process_start_time(info.process_id);
+                    if state.process_start_time == 0 {
+                        state.process_start_time = Utc::now().timestamp_millis() as u64;
+                    }
                     state.window_title = info.title.clone();
                     state.window_id = info.window_id;
+                    if state.app_name.eq_ignore_ascii_case(LOGINWINDOW_APP) {
+                        state.window_id = if info.window_id == 0 {
+                            LOGINWINDOW_WINDOW_ID
+                        } else {
+                            info.window_id
+                        };
+                    }
                     state.window_instance_start = Utc::now();
                     state.last_app_update = Instant::now();
                     state.last_window_update = state.last_app_update;
@@ -269,9 +298,18 @@ fn run_focus_worker(
                         state.pid = info.process_id;
                         state.app_name = info.app_name.clone();
                         state.process_start_time = get_process_start_time(info.process_id);
+                        if state.process_start_time == 0 {
+                            state.process_start_time = Utc::now().timestamp_millis() as u64;
+                        }
                     }
                     state.window_title = info.title.clone();
-                    state.window_id = info.window_id;
+                    state.window_id = if state.app_name.eq_ignore_ascii_case(LOGINWINDOW_APP)
+                        && info.window_id == 0
+                    {
+                        LOGINWINDOW_WINDOW_ID
+                    } else {
+                        info.window_id
+                    };
                     state.last_window_update = Instant::now();
                     if state.is_complete() {
                         schedule_emit(&mut scheduled_emit_at, 0);

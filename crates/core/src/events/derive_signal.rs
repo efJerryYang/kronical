@@ -1,4 +1,6 @@
-use crate::events::model::{EventEnvelope, EventKind, EventPayload, EventSource, SignalKind};
+use crate::events::model::{
+    EventEnvelope, EventKind, EventPayload, EventSource, HintKind, SignalKind,
+};
 
 pub struct LockDeriver {
     locked: bool,
@@ -12,30 +14,32 @@ impl LockDeriver {
     pub fn derive(&mut self, input: &[EventEnvelope]) -> Vec<EventEnvelope> {
         let mut out = Vec::with_capacity(input.len());
         for e in input.iter() {
+            let mut forward_original = true;
             if let EventKind::Signal(kind) = &e.kind {
                 match kind {
                     SignalKind::AppChanged | SignalKind::WindowChanged => {
-                        let is_login = match &e.payload {
-                            EventPayload::Focus(fi) => {
-                                fi.app_name.eq_ignore_ascii_case("loginwindow")
+                        let is_login = matches!(
+                            &e.payload,
+                            EventPayload::Focus(fi) if fi.app_name.eq_ignore_ascii_case("loginwindow")
+                        );
+                        if is_login {
+                            if !self.locked {
+                                out.push(EventEnvelope {
+                                    id: e.id,
+                                    timestamp: e.timestamp,
+                                    source: EventSource::Derived,
+                                    kind: EventKind::Signal(SignalKind::LockStart),
+                                    payload: EventPayload::Lock {
+                                        reason: "loginwindow".to_string(),
+                                    },
+                                    derived: true,
+                                    polling: false,
+                                    sensitive: false,
+                                });
                             }
-                            _ => false,
-                        };
-                        if is_login && !self.locked {
-                            out.push(EventEnvelope {
-                                id: e.id,
-                                timestamp: e.timestamp,
-                                source: EventSource::Derived,
-                                kind: EventKind::Signal(SignalKind::LockStart),
-                                payload: EventPayload::Lock {
-                                    reason: "loginwindow".to_string(),
-                                },
-                                derived: true,
-                                polling: false,
-                                sensitive: false,
-                            });
                             self.locked = true;
-                        } else if self.locked && !is_login {
+                            forward_original = false;
+                        } else if self.locked {
                             out.push(EventEnvelope {
                                 id: e.id,
                                 timestamp: e.timestamp,
@@ -51,27 +55,25 @@ impl LockDeriver {
                             self.locked = false;
                         }
                     }
+                    SignalKind::LockStart => {
+                        self.locked = true;
+                    }
+                    SignalKind::LockEnd => {
+                        self.locked = false;
+                    }
                     _ => {
-                        // Any other signal clears the loginwindow lock if present.
                         if self.locked {
-                            out.push(EventEnvelope {
-                                id: e.id,
-                                timestamp: e.timestamp,
-                                source: EventSource::Derived,
-                                kind: EventKind::Signal(SignalKind::LockEnd),
-                                payload: EventPayload::Lock {
-                                    reason: "fallback".to_string(),
-                                },
-                                derived: true,
-                                polling: false,
-                                sensitive: false,
-                            });
-                            self.locked = false;
+                            forward_original = false;
                         }
                     }
                 }
+            } else if self.locked {
+                forward_original = matches!(&e.kind, EventKind::Hint(HintKind::FocusChanged));
             }
-            out.push(e.clone());
+
+            if forward_original {
+                out.push(e.clone());
+            }
         }
         out
     }
@@ -81,7 +83,7 @@ impl LockDeriver {
 mod tests {
     use super::*;
     use crate::events::model::HintKind;
-    use crate::events::{KeyboardEventData, MousePosition, WindowFocusInfo};
+    use crate::events::{KeyboardEventData, MouseEventData, MousePosition, WindowFocusInfo};
     use chrono::{TimeZone, Utc};
     use std::sync::Arc;
 
@@ -117,7 +119,7 @@ mod tests {
         let login_event = focus_event(1, "LOGINWINDOW", SignalKind::AppChanged);
 
         let out = deriver.derive(&[login_event.clone()]);
-        assert_eq!(out.len(), 2, "derived lock start plus original event");
+        assert_eq!(out.len(), 1, "only derived lock start emitted");
         match &out[0].kind {
             EventKind::Signal(SignalKind::LockStart) => {
                 assert!(out[0].derived);
@@ -129,14 +131,10 @@ mod tests {
             }
             other => panic!("unexpected first kind: {:?}", other),
         }
-        assert_eq!(out[1].kind, login_event.kind);
-        assert!(!out[1].derived);
 
         // A subsequent loginwindow focus should not re-emit LockStart while locked.
         let second = deriver.derive(&[login_event.clone()]);
-        assert_eq!(second.len(), 1);
-        assert_eq!(second[0].kind, login_event.kind);
-        assert!(!second[0].derived);
+        assert!(second.is_empty());
     }
 
     #[test]
@@ -163,7 +161,7 @@ mod tests {
     }
 
     #[test]
-    fn other_signals_clear_lock_state() {
+    fn non_focus_signals_suppressed_while_locked() {
         let mut deriver = LockDeriver::new();
         let login_event = focus_event(7, "loginwindow", SignalKind::AppChanged);
         let _ = deriver.derive(&[login_event]);
@@ -184,20 +182,33 @@ mod tests {
         };
 
         let out = deriver.derive(&[keyboard_signal.clone()]);
-        assert_eq!(out.len(), 2);
-        match &out[0] {
-            EventEnvelope {
-                kind: EventKind::Signal(SignalKind::LockEnd),
-                payload: EventPayload::Lock { reason },
-                ..
-            } => assert_eq!(reason, "fallback"),
-            other => panic!("expected fallback lock end, got {:?}", other),
-        }
-        assert_eq!(out[1].kind, keyboard_signal.kind);
+        assert!(out.is_empty(), "keyboard input suppressed while locked");
 
-        // Another non-login event should no longer emit LockEnd since lock is cleared.
+        let mouse_signal = EventEnvelope {
+            id: 9,
+            timestamp: Utc.with_ymd_and_hms(2024, 4, 22, 9, 31, 5).unwrap(),
+            source: EventSource::Hook,
+            kind: EventKind::Signal(SignalKind::MouseInput),
+            payload: EventPayload::Mouse(MouseEventData {
+                position: MousePosition { x: 5, y: 5 },
+                button: None,
+                click_count: None,
+                event_type: None,
+                wheel_amount: None,
+                wheel_rotation: None,
+                wheel_axis: None,
+                wheel_scroll_type: None,
+            }),
+            derived: false,
+            polling: false,
+            sensitive: false,
+        };
+
+        let mouse_out = deriver.derive(&[mouse_signal]);
+        assert!(mouse_out.is_empty(), "mouse input suppressed while locked");
+
         let follow_up = deriver.derive(&[keyboard_signal.clone()]);
-        assert_eq!(follow_up.len(), 1);
+        assert!(follow_up.is_empty(), "lock remains until focus change");
     }
 
     #[test]
@@ -228,29 +239,40 @@ mod tests {
     }
 
     #[test]
-    fn non_signal_events_pass_through_unmodified() {
+    fn focus_hint_passes_and_title_hint_is_suppressed() {
         let mut deriver = LockDeriver::new();
-        let ts = Utc.with_ymd_and_hms(2024, 4, 22, 9, 50, 0).unwrap();
-        let env = EventEnvelope {
-            id: 100,
-            timestamp: ts,
+        let login_event = focus_event(110, "loginwindow", SignalKind::AppChanged);
+        let derived = deriver.derive(&[login_event.clone()]);
+        assert_eq!(derived.len(), 1);
+
+        let focus_hint = EventEnvelope {
+            id: 111,
+            timestamp: login_event.timestamp,
             source: EventSource::Hook,
             kind: EventKind::Hint(HintKind::FocusChanged),
-            payload: EventPayload::None,
+            payload: login_event.payload.clone(),
             derived: false,
             polling: false,
             sensitive: false,
         };
+        let hint_out = deriver.derive(&[focus_hint.clone()]);
+        assert_eq!(hint_out.len(), 1);
+        assert_eq!(hint_out[0].kind, focus_hint.kind);
 
-        let out = deriver.derive(&[env.clone()]);
-        assert_eq!(out.len(), 1);
-        let forwarded = &out[0];
-        assert_eq!(forwarded.id, env.id);
-        assert_eq!(forwarded.kind, env.kind);
-        assert_eq!(forwarded.source, env.source);
-        assert!(matches!(forwarded.payload, EventPayload::None));
-        assert_eq!(forwarded.polling, env.polling);
-        assert_eq!(forwarded.sensitive, env.sensitive);
-        assert!(!forwarded.derived);
+        let title_hint = EventEnvelope {
+            id: 112,
+            timestamp: login_event.timestamp,
+            source: EventSource::Polling,
+            kind: EventKind::Hint(HintKind::TitleChanged),
+            payload: EventPayload::Title {
+                window_id: 7,
+                title: "Login Screen".to_string(),
+            },
+            derived: false,
+            polling: true,
+            sensitive: false,
+        };
+        let title_out = deriver.derive(&[title_hint]);
+        assert!(title_out.is_empty(), "title hints suppressed while locked");
     }
 }
