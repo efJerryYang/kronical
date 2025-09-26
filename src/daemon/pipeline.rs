@@ -5,9 +5,10 @@ use crate::daemon::snapshot;
 use crate::storage::{StorageBackend, StorageCommand, storage_metrics_watch};
 use anyhow::{Context, Result};
 use chrono::Utc;
+use crossbeam_channel as channel;
 use log::{error, info};
 use std::any::Any;
-use std::sync::{Arc, mpsc};
+use std::sync::Arc;
 use std::thread;
 
 mod compression;
@@ -40,7 +41,7 @@ pub struct PipelineConfig {
 
 pub struct PipelineResources {
     pub storage: Box<dyn StorageBackend>,
-    pub event_rx: mpsc::Receiver<KronicalEvent>,
+    pub event_rx: channel::Receiver<KronicalEvent>,
     pub poll_handle: Arc<std::sync::atomic::AtomicU64>,
     pub snapshot_bus: Arc<snapshot::SnapshotBus>,
 }
@@ -93,11 +94,11 @@ pub fn spawn_pipeline(
 
     let initial_records = hydrate_recent_records(storage.as_mut(), retention_minutes);
 
-    let (derive_tx, derive_rx) = mpsc::channel();
-    let (hints_tx, hints_rx) = mpsc::channel();
-    let (compression_tx, compression_rx) = mpsc::channel();
-    let (snapshot_tx, snapshot_rx) = mpsc::channel();
-    let (storage_tx, storage_rx) = mpsc::channel::<StorageCommand>();
+    let (derive_tx, derive_rx) = channel::unbounded();
+    let (hints_tx, hints_rx) = channel::unbounded();
+    let (compression_tx, compression_rx) = channel::unbounded();
+    let (snapshot_tx, snapshot_rx) = channel::unbounded();
+    let (storage_tx, storage_rx) = channel::unbounded::<StorageCommand>();
 
     let mut handles = Vec::new();
 

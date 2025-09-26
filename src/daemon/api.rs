@@ -3,6 +3,7 @@ use anyhow::Result;
 use log::info;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::mpsc;
 
 /// Join handles for running API transports.
 pub struct ApiHandles {
@@ -57,16 +58,12 @@ pub fn set_system_tracker_db_path(db_path: PathBuf) {
 }
 
 /// Re-export helper to set the system tracker query channel for the gRPC API.
-pub fn set_system_tracker_query_tx(
-    tx: std::sync::mpsc::Sender<crate::daemon::tracker::MetricsQueryReq>,
-) {
+pub fn set_system_tracker_query_tx(tx: mpsc::Sender<crate::daemon::tracker::MetricsQueryReq>) {
     crate::daemon::server::grpc::set_system_tracker_query_tx(tx)
 }
 
 /// Re-export helper to set the system tracker control channel for the gRPC API.
-pub fn set_system_tracker_control_tx(
-    tx: std::sync::mpsc::Sender<crate::daemon::tracker::ControlMsg>,
-) {
+pub fn set_system_tracker_control_tx(tx: mpsc::Sender<crate::daemon::tracker::ControlRequest>) {
     crate::daemon::server::grpc::set_system_tracker_control_tx(tx)
 }
 

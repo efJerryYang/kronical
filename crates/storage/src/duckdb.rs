@@ -1,11 +1,12 @@
 use crate::{StorageBackend, StorageCommand, dec_backlog, inc_backlog, set_last_flush};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use crossbeam_channel::{self, Receiver, Sender};
 use duckdb::{Connection, params};
 use kronical_common::threading::{ThreadHandle, ThreadRegistry};
 use serde_json;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, mpsc};
+use std::sync::Arc;
 
 use kronical_core::compression::CompactEvent;
 use kronical_core::events::RawEvent;
@@ -17,7 +18,7 @@ use kronical_core::snapshot;
 
 pub struct DuckDbStorage {
     db_path: PathBuf,
-    sender: mpsc::Sender<StorageCommand>,
+    sender: Sender<StorageCommand>,
     writer_thread: Option<ThreadHandle>,
     memory_limit_mb: Option<u64>,
 }
@@ -38,7 +39,7 @@ impl DuckDbStorage {
         let conn = Connection::open(&db_path)?;
         Self::init_db(&conn)?;
 
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = crossbeam_channel::unbounded();
 
         let db_path_clone = db_path.clone();
         let bus_for_writer = Arc::clone(&snapshot_bus);
@@ -75,7 +76,7 @@ impl DuckDbStorage {
         ));
         Self::init_db(&conn)?;
 
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = crossbeam_channel::unbounded();
 
         let db_path_clone = db_path.clone();
         let bus_for_writer = Arc::clone(&snapshot_bus);
@@ -143,7 +144,7 @@ impl DuckDbStorage {
 
     fn background_writer(
         db_path: PathBuf,
-        receiver: mpsc::Receiver<StorageCommand>,
+        receiver: Receiver<StorageCommand>,
         snapshot_bus: Arc<snapshot::SnapshotBus>,
     ) {
         let conn = Connection::open(&db_path).expect("Failed to open DB in writer thread");
@@ -152,7 +153,7 @@ impl DuckDbStorage {
 
     fn background_writer_with_conn(
         conn: Connection,
-        receiver: mpsc::Receiver<StorageCommand>,
+        receiver: Receiver<StorageCommand>,
         snapshot_bus: Arc<snapshot::SnapshotBus>,
     ) {
         let mut count: usize = 0;

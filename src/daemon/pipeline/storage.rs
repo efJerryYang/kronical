@@ -1,12 +1,12 @@
 use crate::daemon::runtime::{ThreadHandle, ThreadRegistry};
 use crate::storage::{StorageBackend, StorageCommand};
 use anyhow::Result;
+use crossbeam_channel::Receiver;
 use log::{error, info};
-use std::sync::mpsc;
 
 pub fn spawn_storage_stage(
     threads: &ThreadRegistry,
-    storage_rx: mpsc::Receiver<StorageCommand>,
+    storage_rx: Receiver<StorageCommand>,
     mut storage: Box<dyn StorageBackend>,
 ) -> Result<ThreadHandle> {
     let threads = threads.clone();

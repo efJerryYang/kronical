@@ -3,16 +3,16 @@ use crate::daemon::records::{ActivityState, RecordBuilder};
 use crate::daemon::runtime::{ThreadHandle, ThreadRegistry};
 use crate::storage::StorageCommand;
 use anyhow::Result;
+use crossbeam_channel::{Receiver, Sender};
 use log::{error, info};
-use std::sync::mpsc;
 
 use super::types::SnapshotMessage;
 
 pub fn spawn_hints_stage(
     threads: &ThreadRegistry,
-    hints_rx: mpsc::Receiver<EventEnvelope>,
-    storage_tx: mpsc::Sender<StorageCommand>,
-    snapshot_tx: mpsc::Sender<SnapshotMessage>,
+    hints_rx: Receiver<EventEnvelope>,
+    storage_tx: Sender<StorageCommand>,
+    snapshot_tx: Sender<SnapshotMessage>,
 ) -> Result<ThreadHandle> {
     let threads = threads.clone();
     threads.spawn("pipeline-hints", move || {

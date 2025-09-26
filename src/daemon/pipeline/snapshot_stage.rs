@@ -7,17 +7,18 @@ use crate::daemon::snapshot;
 use crate::storage::{StorageCommand, StorageMetrics};
 use anyhow::Result;
 use chrono::Utc;
+use crossbeam_channel::{Receiver, Sender};
 use log::info;
 use std::collections::{HashMap as StdHashMap, VecDeque};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, mpsc};
 
 use super::types::{SnapshotMessage, SnapshotUpdate};
 
 pub struct SnapshotStageConfig {
-    pub receiver: mpsc::Receiver<SnapshotMessage>,
+    pub receiver: Receiver<SnapshotMessage>,
     pub snapshot_bus: Arc<snapshot::SnapshotBus>,
-    pub storage_tx: mpsc::Sender<StorageCommand>,
+    pub storage_tx: Sender<StorageCommand>,
     pub poll_handle: Arc<AtomicU64>,
     pub cfg_summary: snapshot::ConfigSummary,
     pub retention_minutes: u64,
@@ -262,7 +263,7 @@ fn maybe_finalize(
     last_transition: &Option<snapshot::Transition>,
     cfg_summary: &snapshot::ConfigSummary,
     poll_handle: &Arc<AtomicU64>,
-    storage_tx: &mpsc::Sender<StorageCommand>,
+    storage_tx: &Sender<StorageCommand>,
     retention: chrono::Duration,
     eph_max: u64,
     eph_min: usize,
@@ -551,14 +552,14 @@ mod tests {
     use crate::daemon::snapshot;
     use crate::storage::StorageCommand;
     use crate::storage::storage_metrics_watch;
-    use std::sync::mpsc;
+    use crossbeam_channel as channel;
     use std::time::Duration;
 
     #[test]
     fn snapshot_stage_sends_storage_shutdown_after_completion() {
         let registry = ThreadRegistry::new();
-        let (snapshot_tx, snapshot_rx) = mpsc::channel();
-        let (storage_tx, storage_rx) = mpsc::channel();
+        let (snapshot_tx, snapshot_rx) = channel::unbounded();
+        let (storage_tx, storage_rx) = channel::unbounded();
         let poll_handle = Arc::new(AtomicU64::new(0));
         let snapshot_bus = Arc::new(snapshot::SnapshotBus::new());
         let cfg_summary = snapshot::ConfigSummary {

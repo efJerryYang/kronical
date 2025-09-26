@@ -7,13 +7,14 @@ use crate::daemon::tracker::SystemTracker;
 use crate::daemon::tracker::{FocusCacheCaps, FocusChangeCallback, FocusEventWrapper};
 use crate::storage::StorageBackend;
 use anyhow::{Result, anyhow};
+use crossbeam_channel::{Receiver, Sender};
 use kronical_input::mouse::{
     button_from_hook, event_kind_from_hook, wheel_axis_from_direction, wheel_scroll_type_from_raw,
 };
 use log::{debug, error, info, trace};
 use std::path::Path;
+use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, mpsc};
 use std::time::Duration;
 use uiohook_rs::{EventHandler, Uiohook, UiohookEvent};
 
@@ -87,13 +88,13 @@ impl Drop for CoordinatorShutdownGuard<'_> {
 
 #[derive(Clone)]
 pub struct KronicalEventHandler {
-    sender: mpsc::Sender<KronicalEvent>,
+    sender: Sender<KronicalEvent>,
     focus_wrapper: FocusEventWrapper,
 }
 
 impl KronicalEventHandler {
     fn new(
-        sender: mpsc::Sender<KronicalEvent>,
+        sender: Sender<KronicalEvent>,
         caps: FocusCacheCaps,
         poll_handle: std::sync::Arc<std::sync::atomic::AtomicU64>,
         threads: ThreadRegistry,
@@ -118,7 +119,7 @@ impl KronicalEventHandler {
 }
 
 struct FocusCallback {
-    sender: mpsc::Sender<KronicalEvent>,
+    sender: Sender<KronicalEvent>,
 }
 
 impl FocusChangeCallback for FocusCallback {
@@ -371,7 +372,7 @@ impl EventCoordinator {
     pub fn spawn_pipeline(
         &self,
         data_store: Box<dyn StorageBackend>,
-        event_rx: mpsc::Receiver<KronicalEvent>,
+        event_rx: Receiver<KronicalEvent>,
         poll_handle: Arc<AtomicU64>,
         snapshot_bus: Arc<crate::daemon::snapshot::SnapshotBus>,
         thread_registry: ThreadRegistry,
@@ -404,7 +405,7 @@ impl EventCoordinator {
 
     pub fn run_uiohook(
         &self,
-        sender: mpsc::Sender<KronicalEvent>,
+        sender: Sender<KronicalEvent>,
         poll_handle: Arc<AtomicU64>,
     ) -> Result<Uiohook> {
         info!("Setting up UIohook on main thread");
@@ -430,7 +431,7 @@ impl EventCoordinator {
 
     pub fn run_focus_hook(
         &self,
-        sender: mpsc::Sender<KronicalEvent>,
+        sender: Sender<KronicalEvent>,
         poll_handle: Arc<AtomicU64>,
     ) -> Result<WindowFocusHook> {
         info!("Setting up focus hook on main thread");
@@ -462,7 +463,7 @@ impl EventCoordinator {
         Ok(focus_hook)
     }
 
-    fn setup_shutdown_handler(&self, sender: mpsc::Sender<KronicalEvent>) -> Result<()> {
+    fn setup_shutdown_handler(&self, sender: Sender<KronicalEvent>) -> Result<()> {
         ctrlc::set_handler(move || {
             info!("Ctrl+C received, sending shutdown signal");
             if let Err(e) = sender.send(KronicalEvent::Shutdown) {
@@ -483,7 +484,7 @@ impl EventCoordinator {
     ) -> Result<()> {
         info!("Step A: Starting Kronical on MAIN THREAD (required for hooks)");
 
-        let (sender, receiver) = mpsc::channel();
+        let (sender, receiver) = crossbeam_channel::unbounded();
         let thread_registry = self.thread_registry();
         let poll_handle_arc = Arc::new(AtomicU64::new(2000));
         let workspace_path = workspace_dir.as_path();

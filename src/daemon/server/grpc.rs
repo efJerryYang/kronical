@@ -16,8 +16,10 @@ use once_cell::sync::OnceCell;
 use prost_types::Timestamp;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{Arc, mpsc::Sender};
+use std::sync::Arc;
 use tokio::net::UnixListener;
+use tokio::sync::{mpsc, oneshot};
+use tokio::time;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::WatchStream;
 use tonic::{Request, Response, Status, transport::Server};
@@ -31,9 +33,9 @@ use std::time::Duration;
 use tokio::sync::Notify;
 
 static SYSTEM_TRACKER_DB_PATH: OnceCell<PathBuf> = OnceCell::new();
-static SYSTEM_TRACKER_QUERY_TX: OnceCell<Sender<crate::daemon::tracker::MetricsQueryReq>> =
+static SYSTEM_TRACKER_QUERY_TX: OnceCell<mpsc::Sender<crate::daemon::tracker::MetricsQueryReq>> =
     OnceCell::new();
-static SYSTEM_TRACKER_CONTROL_TX: OnceCell<Sender<crate::daemon::tracker::ControlMsg>> =
+static SYSTEM_TRACKER_CONTROL_TX: OnceCell<mpsc::Sender<crate::daemon::tracker::ControlRequest>> =
     OnceCell::new();
 
 #[cfg(test)]
@@ -56,11 +58,11 @@ pub fn set_system_tracker_db_path(db_path: PathBuf) {
     let _ = SYSTEM_TRACKER_DB_PATH.set(db_path);
 }
 
-pub fn set_system_tracker_query_tx(tx: Sender<crate::daemon::tracker::MetricsQueryReq>) {
+pub fn set_system_tracker_query_tx(tx: mpsc::Sender<crate::daemon::tracker::MetricsQueryReq>) {
     let _ = SYSTEM_TRACKER_QUERY_TX.set(tx);
 }
 
-pub fn set_system_tracker_control_tx(tx: Sender<crate::daemon::tracker::ControlMsg>) {
+pub fn set_system_tracker_control_tx(tx: mpsc::Sender<crate::daemon::tracker::ControlRequest>) {
     let _ = SYSTEM_TRACKER_CONTROL_TX.set(tx);
 }
 
@@ -115,43 +117,44 @@ impl Kroni for KroniSvc {
 
         // Proactively request a tracker flush so we read fresh data through the
         // control channel, then wait for acknowledgement (with timeout).
-        if let Some(ctrl_tx) = SYSTEM_TRACKER_CONTROL_TX.get() {
-            let (ack_tx, ack_rx) = std::sync::mpsc::channel();
-            ctrl_tx
-                .send(crate::daemon::tracker::ControlMsg::Flush(ack_tx))
-                .map_err(|_| Status::internal("Failed to request tracker flush"))?;
-            // Wait up to ~2s for the tracker to acknowledge flush
-            let _ = ack_rx
-                .recv_timeout(std::time::Duration::from_millis(2000))
-                .map_err(|_| Status::deadline_exceeded("Timed out waiting for tracker flush"))?;
-        } else {
-            return Err(Status::unavailable(
-                "System tracker control channel not configured",
-            ));
-        }
+        let ctrl_tx = SYSTEM_TRACKER_CONTROL_TX
+            .get()
+            .ok_or_else(|| Status::unavailable("System tracker control channel not configured"))?
+            .clone();
+        let (ack_tx, ack_rx) = oneshot::channel();
+        ctrl_tx
+            .send(crate::daemon::tracker::ControlRequest::Flush(ack_tx))
+            .await
+            .map_err(|_| Status::internal("Failed to request tracker flush"))?;
+        time::timeout(std::time::Duration::from_millis(2000), ack_rx)
+            .await
+            .map_err(|_| Status::deadline_exceeded("Timed out waiting for tracker flush"))?
+            .map_err(|_| Status::internal("Tracker flush acknowledgement dropped"))?;
 
         // Route the read through the tracker thread using a query channel so
         // the query runs against the same in-process DB instance as the writer.
         let tx = SYSTEM_TRACKER_QUERY_TX
             .get()
-            .ok_or_else(|| Status::unavailable("System tracker not configured (query tx)"))?;
+            .ok_or_else(|| Status::unavailable("System tracker not configured (query tx)"))?
+            .clone();
 
         let pid = request.pid;
-
-        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         let mut metrics = if request.limit > 0 {
             let query = crate::daemon::tracker::MetricsQuery::ByLimit {
                 pid,
                 limit: request.limit as usize,
             };
+            let (reply_tx, reply_rx) = oneshot::channel();
             tx.send(crate::daemon::tracker::MetricsQueryReq {
                 query,
                 reply: reply_tx,
             })
+            .await
             .map_err(|_| Status::internal("Failed to send query to tracker thread"))?;
-            reply_rx
-                .recv_timeout(std::time::Duration::from_millis(1500))
+            time::timeout(std::time::Duration::from_millis(1500), reply_rx)
+                .await
                 .map_err(|_| Status::deadline_exceeded("Timed out waiting for tracker reply"))?
+                .map_err(|_| Status::internal("Tracker query channel closed"))?
                 .map_err(|e| Status::internal(format!("Tracker query error: {}", e)))?
         } else {
             let start_time = match request.start_time.as_ref() {
@@ -169,14 +172,17 @@ impl Kroni for KroniSvc {
                 start: start_time,
                 end: end_time,
             };
+            let (reply_tx, reply_rx) = oneshot::channel();
             tx.send(crate::daemon::tracker::MetricsQueryReq {
                 query,
                 reply: reply_tx,
             })
+            .await
             .map_err(|_| Status::internal("Failed to send query to tracker thread"))?;
-            reply_rx
-                .recv_timeout(std::time::Duration::from_millis(1500))
+            time::timeout(std::time::Duration::from_millis(1500), reply_rx)
+                .await
                 .map_err(|_| Status::deadline_exceeded("Timed out waiting for tracker reply"))?
+                .map_err(|_| Status::internal("Tracker query channel closed"))?
                 .map_err(|e| Status::internal(format!("Tracker query error: {}", e)))?
         };
 
@@ -184,17 +190,25 @@ impl Kroni for KroniSvc {
         // finish persisting immediately after a flush.
         if metrics.is_empty() {
             tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            let (reply_tx, reply_rx) = std::sync::mpsc::channel();
             if request.limit > 0 {
                 let query = crate::daemon::tracker::MetricsQuery::ByLimit {
                     pid,
                     limit: request.limit as usize,
                 };
+                let (reply_tx, reply_rx) = oneshot::channel();
                 tx.send(crate::daemon::tracker::MetricsQueryReq {
                     query,
                     reply: reply_tx,
                 })
+                .await
                 .map_err(|_| Status::internal("Failed to send query to tracker thread (retry)"))?;
+                metrics = time::timeout(std::time::Duration::from_millis(1200), reply_rx)
+                    .await
+                    .map_err(|_| {
+                        Status::deadline_exceeded("Timed out waiting for tracker reply (retry)")
+                    })?
+                    .map_err(|_| Status::internal("Tracker query channel closed (retry)"))?
+                    .map_err(|e| Status::internal(format!("Tracker query error (retry): {}", e)))?;
             } else {
                 let start_time = match request.start_time.as_ref() {
                     Some(ts) => ts_to_utc(ts).map_err(|e| {
@@ -213,18 +227,21 @@ impl Kroni for KroniSvc {
                     start: start_time,
                     end: end_time,
                 };
+                let (reply_tx, reply_rx) = oneshot::channel();
                 tx.send(crate::daemon::tracker::MetricsQueryReq {
                     query,
                     reply: reply_tx,
                 })
+                .await
                 .map_err(|_| Status::internal("Failed to send query to tracker thread (retry)"))?;
+                metrics = time::timeout(std::time::Duration::from_millis(1200), reply_rx)
+                    .await
+                    .map_err(|_| {
+                        Status::deadline_exceeded("Timed out waiting for tracker reply (retry)")
+                    })?
+                    .map_err(|_| Status::internal("Tracker query channel closed (retry)"))?
+                    .map_err(|e| Status::internal(format!("Tracker query error (retry): {}", e)))?;
             }
-            metrics = reply_rx
-                .recv_timeout(std::time::Duration::from_millis(1200))
-                .map_err(|_| {
-                    Status::deadline_exceeded("Timed out waiting for tracker reply (retry)")
-                })?
-                .map_err(|e| Status::internal(format!("Tracker query error (retry): {}", e)))?;
         }
 
         let pb_metrics = metrics
@@ -364,7 +381,7 @@ pub fn spawn_server(
         warn!("Removing stale UDS: {:?}", uds_path);
         let _ = std::fs::remove_file(&uds_path);
     }
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::bounded(1);
     let bus_for_thread = Arc::clone(&snapshot_bus);
     #[cfg(test)]
     let shutdown_notify = Arc::new(Notify::new());

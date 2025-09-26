@@ -7,17 +7,17 @@ use crate::daemon::snapshot;
 use crate::storage::StorageCommand;
 use anyhow::Result;
 use chrono::Utc;
+use crossbeam_channel::{Receiver, Sender};
 use log::{debug, error, info, trace};
-use std::sync::mpsc;
 
 use super::types::{CompressionCommand, DeriveCommand, SnapshotMessage, SnapshotUpdate};
 
 pub struct EnvelopeStageConfig {
-    pub receiver: mpsc::Receiver<DeriveCommand>,
-    pub hints_tx: mpsc::Sender<EventEnvelope>,
-    pub compression_tx: mpsc::Sender<CompressionCommand>,
-    pub snapshot_tx: mpsc::Sender<SnapshotMessage>,
-    pub storage_tx: mpsc::Sender<StorageCommand>,
+    pub receiver: Receiver<DeriveCommand>,
+    pub hints_tx: Sender<EventEnvelope>,
+    pub compression_tx: Sender<CompressionCommand>,
+    pub snapshot_tx: Sender<SnapshotMessage>,
+    pub storage_tx: Sender<StorageCommand>,
     pub active_grace_secs: u64,
     pub idle_threshold_secs: u64,
 }
