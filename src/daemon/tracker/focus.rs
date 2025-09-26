@@ -15,6 +15,7 @@ use winshift::{ActiveWindowInfo, get_active_window_info};
 
 const LOGINWINDOW_APP: &str = "loginwindow";
 const LOGINWINDOW_WINDOW_ID: u32 = u32::MAX;
+const POLL_SUSPEND_MS: u64 = 0;
 
 #[derive(Debug, Clone, Copy)]
 pub struct FocusCacheCaps {
@@ -217,10 +218,14 @@ fn run_focus_worker(
         if should_stop.load(Ordering::Relaxed) {
             break;
         }
-        let ms = poll_ms.load(Ordering::Relaxed);
-        let ms = if ms == 0 { 2000 } else { ms };
+        let poll_value = poll_ms.load(Ordering::Relaxed);
+        let timeout_ms = if poll_value == POLL_SUSPEND_MS {
+            2000
+        } else {
+            poll_value.max(1)
+        };
 
-        match rx.recv_timeout(Duration::from_millis(ms)) {
+        match rx.recv_timeout(Duration::from_millis(timeout_ms)) {
             Ok(msg) => match msg {
                 FocusMsg::AppChange { pid, app_name } => {
                     if state.app_name == app_name && state.pid == pid {
@@ -318,6 +323,9 @@ fn run_focus_worker(
                 FocusMsg::Stop => break,
             },
             Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                if poll_value == POLL_SUSPEND_MS {
+                    continue;
+                }
                 // Polling tick
                 match get_active_window_info() {
                     Ok(info) => {

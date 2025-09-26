@@ -1,8 +1,5 @@
 use crate::events::model::{DefaultStateEngine, StateEngine};
-use crate::events::model::{
-    EventEnvelope, EventKind, EventPayload, EventSource, HintKind, SignalKind,
-};
-use crate::records::ActivityState;
+use crate::events::model::{EventEnvelope, EventKind, EventPayload, EventSource, HintKind};
 use chrono::{DateTime, Utc};
 
 pub struct StateDeriver {
@@ -61,9 +58,11 @@ impl StateDeriver {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::events::model::SignalKind;
     use crate::events::{
         KeyboardEventData, MouseButton, MouseEventData, MouseEventKind, MousePosition,
     };
+    use crate::records::ActivityState;
     use chrono::{Duration, TimeZone, Utc};
 
     fn keyboard_event(id: u64, ts: DateTime<Utc>) -> EventEnvelope {
