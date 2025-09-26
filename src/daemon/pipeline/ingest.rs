@@ -5,7 +5,7 @@ use anyhow::{Result, anyhow};
 use chrono::Utc;
 use crossbeam_channel::{Receiver, Sender};
 use log::{debug, error, info, trace};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::types::{DeriveCommand, FlushReason, RawBatch};
 
@@ -20,9 +20,11 @@ pub fn spawn_ingest_stage(
         let mut pending: Vec<RawEvent> = Vec::new();
         let mut event_count = 0u64;
         let ticker = crossbeam_channel::tick(Duration::from_millis(50));
+        let idle_tick_interval = Duration::from_millis(500);
+        let mut last_idle_tick = Instant::now();
 
         loop {
-            let mut should_tick = false;
+            let mut tick_due: Option<chrono::DateTime<chrono::Utc>> = None;
             crossbeam_channel::select! {
                 recv(event_rx) -> msg => {
                     match msg {
@@ -48,7 +50,7 @@ pub fn spawn_ingest_stage(
                                         pending.len() + 1
                                     );
                                     pending.push(raw);
-                                    should_tick = true;
+                                    tick_due = Some(Utc::now());
                                 }
                                 Err(e) => error!("Failed to convert event to raw: {}", e),
                             }
@@ -61,22 +63,25 @@ pub fn spawn_ingest_stage(
                 }
                 recv(ticker) -> _ => {
                     if pending.is_empty() {
-                        continue;
+                        if last_idle_tick.elapsed() >= idle_tick_interval {
+                            tick_due = Some(Utc::now());
+                        }
+                    } else {
+                        debug!("Ingest flushing {} pending raw events", pending.len());
+                        let batch = RawBatch::new(std::mem::take(&mut pending), FlushReason::Timeout);
+                        if derive_tx.send(DeriveCommand::Batch(batch)).is_err() {
+                            break;
+                        }
+                        tick_due = Some(Utc::now());
                     }
-                    debug!("Ingest flushing {} pending raw events", pending.len());
-                    let batch = RawBatch::new(std::mem::take(&mut pending), FlushReason::Timeout);
-                    if derive_tx.send(DeriveCommand::Batch(batch)).is_err() {
-                        break;
-                    }
-                    should_tick = true;
                 }
             }
 
-            if should_tick {
-                let now = Utc::now();
+            if let Some(now) = tick_due {
                 if derive_tx.send(DeriveCommand::Tick(now)).is_err() {
                     break;
                 }
+                last_idle_tick = Instant::now();
             }
         }
 

@@ -15,6 +15,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use super::types::{SnapshotMessage, SnapshotUpdate};
 
+pub const POLL_SUSPEND_MS: u64 = 0;
+
 pub struct SnapshotStageConfig {
     pub receiver: Receiver<SnapshotMessage>,
     pub snapshot_bus: Arc<snapshot::SnapshotBus>,
@@ -339,7 +341,7 @@ fn publish_snapshot(
         ActivityState::Active => 2000,
         ActivityState::Passive => 10000,
         ActivityState::Inactive => 20000,
-        ActivityState::Locked => 30000,
+        ActivityState::Locked => POLL_SUSPEND_MS,
     };
     poll_handle.store(ms, Ordering::Relaxed);
 
