@@ -47,6 +47,7 @@ pub struct SnapshotUpdate {
     pub hints_delta: u64,
     pub signals_delta: u64,
     pub focus: Option<WindowFocusInfo>,
+    pub focus_title: Option<(u32, String)>,
     pub transition: Option<snapshot::Transition>,
     pub state: Option<ActivityState>,
 }
@@ -56,6 +57,7 @@ impl SnapshotUpdate {
         self.hints_delta == 0
             && self.signals_delta == 0
             && self.focus.is_none()
+            && self.focus_title.is_none()
             && self.transition.is_none()
             && self.state.is_none()
     }

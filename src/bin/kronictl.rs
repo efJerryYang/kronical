@@ -360,15 +360,15 @@ fn run_monitor_loop<B: Backend>(terminal: &mut Terminal<B>, data_file: PathBuf) 
                         break;
                     }
                     if line.starts_with("data:") {
-                        let payload = line[5..].trim();
+                        let payload = line[5..].trim_end();
                         data_buf.push_str(payload);
                         data_buf.push('\n');
                     } else if line == "\r\n" || line == "\n" {
                         if !data_buf.is_empty() {
-                            if let Ok(snap) = serde_json::from_str::<
+                            let snap_result = serde_json::from_str::<
                                 kronical::daemon::snapshot::Snapshot,
-                            >(data_buf.trim_end())
-                            {
+                            >(data_buf.trim_end());
+                            if let Ok(snap) = snap_result {
                                 terminal.draw(|f| {
                                     let size = f.area();
                                     let layout = Layout::default()
