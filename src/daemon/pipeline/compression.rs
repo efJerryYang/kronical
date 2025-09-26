@@ -4,16 +4,16 @@ use crate::daemon::events::model::{EventKind, SignalKind};
 use crate::daemon::runtime::{ThreadHandle, ThreadRegistry};
 use crate::storage::StorageCommand;
 use anyhow::Result;
+use crossbeam_channel::{Receiver, Sender};
 use kronical_core::compression::CompactEvent;
 use log::{debug, error, info};
 use std::collections::HashSet;
-use std::sync::mpsc;
 
 use super::types::CompressionCommand;
 
 pub struct CompressionStageConfig {
-    pub receiver: mpsc::Receiver<CompressionCommand>,
-    pub storage_tx: mpsc::Sender<StorageCommand>,
+    pub receiver: Receiver<CompressionCommand>,
+    pub storage_tx: Sender<StorageCommand>,
     pub focus_interner_max_strings: usize,
 }
 
@@ -60,7 +60,7 @@ pub fn spawn_compression_stage(
 }
 
 fn forward_raw_events(
-    storage_tx: &mpsc::Sender<StorageCommand>,
+    storage_tx: &Sender<StorageCommand>,
     envelopes: &[crate::daemon::events::model::EventEnvelope],
     processed_events: Vec<RawEvent>,
 ) {
@@ -99,10 +99,7 @@ fn forward_raw_events(
     }
 }
 
-fn forward_compact_events(
-    storage_tx: &mpsc::Sender<StorageCommand>,
-    compact_events: Vec<CompactEvent>,
-) {
+fn forward_compact_events(storage_tx: &Sender<StorageCommand>, compact_events: Vec<CompactEvent>) {
     if compact_events.is_empty() {
         return;
     }

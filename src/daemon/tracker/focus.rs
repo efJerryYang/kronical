@@ -3,10 +3,11 @@ use crate::util::interner::StringInterner;
 use crate::util::lru::LruCache;
 use anyhow::Result;
 use chrono::{DateTime, Utc};
+use crossbeam_channel::{Receiver, Sender};
 use kronical_common::threading::{ThreadHandle, ThreadRegistry};
 use log::{debug, error, info, warn};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, mpsc};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 use sysinfo::{Pid, System};
 
@@ -73,7 +74,7 @@ pub trait FocusChangeCallback {
 
 #[derive(Clone)]
 pub struct FocusEventWrapper {
-    tx: mpsc::Sender<FocusMsg>,
+    tx: Sender<FocusMsg>,
     #[allow(dead_code)]
     poll_ms: Arc<AtomicU64>,
     should_stop: Arc<AtomicBool>,
@@ -96,7 +97,7 @@ impl FocusEventWrapper {
         poll_handle: Arc<AtomicU64>,
         threads: ThreadRegistry,
     ) -> Result<Self> {
-        let (tx, rx) = mpsc::channel::<FocusMsg>();
+        let (tx, rx) = crossbeam_channel::unbounded::<FocusMsg>();
         poll_handle.store(poll_interval.as_millis() as u64, Ordering::Relaxed);
         let poll_ms = poll_handle;
         let should_stop = Arc::new(AtomicBool::new(false));
@@ -161,7 +162,7 @@ impl Drop for FocusEventWrapper {
 
 fn run_focus_worker(
     callback: Arc<dyn FocusChangeCallback + Send + Sync>,
-    rx: mpsc::Receiver<FocusMsg>,
+    rx: Receiver<FocusMsg>,
     poll_ms: Arc<AtomicU64>,
     should_stop: Arc<AtomicBool>,
     caps: FocusCacheCaps,
@@ -278,7 +279,7 @@ fn run_focus_worker(
                 }
                 FocusMsg::Stop => break,
             },
-            Err(mpsc::RecvTimeoutError::Timeout) => {
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
                 // Polling tick
                 match get_active_window_info() {
                     Ok(info) => {
@@ -309,7 +310,7 @@ fn run_focus_worker(
                     Err(e) => error!("Failed to get active window during polling: {:?}", e),
                 }
             }
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         }
 
         if let Some(when) = scheduled_emit_at {

@@ -1,10 +1,11 @@
 use crate::daemon::runtime::{ThreadHandle, ThreadRegistry};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
+use crossbeam_channel::{Sender, TryRecvError};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
 use std::time::Duration;
+use tokio::sync::{mpsc as tokio_mpsc, oneshot};
 use tracing::info;
 
 pub use kronical_storage::system_metrics::{
@@ -30,7 +31,7 @@ pub enum MetricsQuery {
 #[derive(Debug)]
 pub struct MetricsQueryReq {
     pub query: MetricsQuery,
-    pub reply: std::sync::mpsc::Sender<Result<Vec<SystemMetrics>, String>>,
+    pub reply: oneshot::Sender<Result<Vec<SystemMetrics>, String>>,
 }
 
 use std::thread;
@@ -41,7 +42,10 @@ pub struct SystemTracker {
     batch_size: usize,
     db_path: PathBuf,
     started: AtomicBool,
-    control_tx: Option<mpsc::Sender<ControlMsg>>,
+    control_tx: Option<Sender<ControlMsg>>,
+    query_tx: Option<Sender<MetricsQueryReq>>,
+    control_bridge: Option<ThreadHandle>,
+    query_bridge: Option<ThreadHandle>,
     backend: crate::util::config::DatabaseBackendConfig,
     duckdb_memory_limit_mb: u64,
     thread_handle: Option<ThreadHandle>,
@@ -53,7 +57,13 @@ pub enum ControlMsg {
     /// Request an immediate flush of buffered samples. The tracker will
     /// capture the current iteration's sample then persist all buffered rows
     /// and acknowledge via the provided channel.
-    Flush(mpsc::Sender<()>),
+    Flush(Sender<()>),
+}
+
+#[derive(Debug)]
+pub enum ControlRequest {
+    Stop,
+    Flush(oneshot::Sender<()>),
 }
 
 impl SystemTracker {
@@ -72,6 +82,9 @@ impl SystemTracker {
             db_path,
             started: AtomicBool::new(false),
             control_tx: None,
+            query_tx: None,
+            control_bridge: None,
+            query_bridge: None,
             backend,
             duckdb_memory_limit_mb,
             thread_handle: None,
@@ -98,13 +111,62 @@ impl SystemTracker {
         let db_path = self.db_path.clone();
         let backend = self.backend.clone();
         let duckdb_limit = self.duckdb_memory_limit_mb;
-        let (control_tx, control_rx) = mpsc::channel::<ControlMsg>();
+        let (control_tx, control_rx) = crossbeam_channel::unbounded::<ControlMsg>();
         self.control_tx = Some(control_tx.clone());
-        // Expose control channel to APIs (e.g., gRPC) so they can request a flush.
-        crate::daemon::api::set_system_tracker_control_tx(control_tx.clone());
 
-        let (query_tx, query_rx) = mpsc::channel::<MetricsQueryReq>();
-        crate::daemon::api::set_system_tracker_query_tx(query_tx.clone());
+        let (query_tx, query_rx) = crossbeam_channel::unbounded::<MetricsQueryReq>();
+        self.query_tx = Some(query_tx.clone());
+
+        // Bridge async API requests into the tracker thread via tokio channels.
+        let (async_control_tx, mut async_control_rx) = tokio_mpsc::channel::<ControlRequest>(32);
+        crate::daemon::api::set_system_tracker_control_tx(async_control_tx.clone());
+        let control_forward = threads.spawn("system-tracker-control-bridge", move || {
+            while let Some(msg) = async_control_rx.blocking_recv() {
+                match msg {
+                    ControlRequest::Stop => {
+                        if control_tx.send(ControlMsg::Stop).is_err() {
+                            break;
+                        }
+                    }
+                    ControlRequest::Flush(ack) => {
+                        let (cb_tx, cb_rx) = crossbeam_channel::bounded(1);
+                        match control_tx.send(ControlMsg::Flush(cb_tx)) {
+                            Ok(_) => {
+                                if cb_rx.recv().is_err() {
+                                    let _ = ack.send(());
+                                    break;
+                                } else {
+                                    let _ = ack.send(());
+                                }
+                            }
+                            Err(err) => {
+                                if let ControlMsg::Flush(_) = err.into_inner() {
+                                    let _ = ack.send(());
+                                }
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        })?;
+        self.control_bridge = Some(control_forward);
+
+        let (async_query_tx, mut async_query_rx) = tokio_mpsc::channel::<MetricsQueryReq>(64);
+        crate::daemon::api::set_system_tracker_query_tx(async_query_tx.clone());
+        let query_forward = threads.spawn("system-tracker-query-bridge", move || {
+            while let Some(msg) = async_query_rx.blocking_recv() {
+                match query_tx.send(msg) {
+                    Ok(_) => {}
+                    Err(err) => {
+                        let msg = err.into_inner();
+                        let _ = msg.reply.send(Err("tracker offline".to_string()));
+                        break;
+                    }
+                }
+            }
+        })?;
+        self.query_bridge = Some(query_forward);
 
         let handle = threads
             .spawn("system-tracker", move || {
@@ -164,7 +226,7 @@ impl SystemTracker {
                 }
 
                 let mut running = true;
-                let mut pending_flush_acks: Vec<mpsc::Sender<()>> = Vec::new();
+                let mut pending_flush_acks: Vec<Sender<()>> = Vec::new();
                 while running {
                     loop {
                         match control_rx.try_recv() {
@@ -174,8 +236,8 @@ impl SystemTracker {
                             Ok(ControlMsg::Flush(ack_tx)) => {
                                 pending_flush_acks.push(ack_tx);
                             }
-                            Err(mpsc::TryRecvError::Empty) => break,
-                            Err(mpsc::TryRecvError::Disconnected) => {
+                            Err(TryRecvError::Empty) => break,
+                            Err(TryRecvError::Disconnected) => {
                                 running = false;
                                 break;
                             }
@@ -262,8 +324,8 @@ impl SystemTracker {
                                 };
                                 let _ = req.reply.send(result);
                             }
-                            Err(mpsc::TryRecvError::Empty) => break,
-                            Err(mpsc::TryRecvError::Disconnected) => break,
+                            Err(TryRecvError::Empty) => break,
+                            Err(TryRecvError::Disconnected) => break,
                         }
                     }
 
@@ -303,6 +365,18 @@ impl SystemTracker {
                 tracing::error!("System tracker thread panicked: {:?}", e);
             }
         }
+        if let Some(handle) = self.control_bridge.take() {
+            if let Err(e) = handle.join() {
+                tracing::error!("Control bridge thread panicked: {:?}", e);
+            }
+        }
+        if let Some(handle) = self.query_bridge.take() {
+            if let Err(e) = handle.join() {
+                tracing::error!("Query bridge thread panicked: {:?}", e);
+            }
+        }
+        self.control_tx = None;
+        self.query_tx = None;
         info!("System tracker stop requested");
         Ok(())
     }
@@ -316,7 +390,7 @@ impl SystemTracker {
             .control_tx
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("Tracker control channel not available"))?;
-        let (ack_tx, ack_rx) = mpsc::channel();
+        let (ack_tx, ack_rx) = crossbeam_channel::bounded(1);
         tx.send(ControlMsg::Flush(ack_tx))
             .map_err(|_| anyhow::anyhow!("Failed to send flush control message"))?;
         let _ = ack_rx

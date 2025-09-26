@@ -62,7 +62,7 @@ pub fn spawn_http_server(
         let _ = std::fs::remove_file(&uds_path);
     }
 
-    let (tx, rx) = std::sync::mpsc::channel();
+    let (tx, rx) = crossbeam_channel::bounded(1);
     let bus_for_thread = Arc::clone(&snapshot_bus);
     let handle = threads
         .spawn("http-server", move || {
