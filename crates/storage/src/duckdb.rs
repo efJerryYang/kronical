@@ -16,6 +16,19 @@ use kronical_core::events::model::{
 use kronical_core::records::{ActivityRecord, ActivityState};
 use kronical_core::snapshot;
 
+fn parse_state_label(label: &str) -> ActivityState {
+    match label {
+        "Active" => ActivityState::Active,
+        "Passive" => ActivityState::Passive,
+        "Inactive" => ActivityState::Inactive,
+        "Locked" => ActivityState::Locked,
+        other => {
+            eprintln!("Unknown state in DB: {}", other);
+            ActivityState::Inactive
+        }
+    }
+}
+
 pub struct DuckDbStorage {
     db_path: PathBuf,
     sender: Sender<StorageCommand>,
@@ -137,6 +150,14 @@ impl DuckDbStorage {
             );
             CREATE INDEX IF NOT EXISTS idx_compact_events_start_time ON compact_events(start_time);
             CREATE INDEX IF NOT EXISTS idx_activity_records_start_time ON activity_records(start_time);
+            
+            CREATE TABLE IF NOT EXISTS recent_transitions (
+                at TIMESTAMPTZ NOT NULL,
+                from_state TEXT NOT NULL,
+                to_state TEXT NOT NULL,
+                by_signal TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_recent_transitions_at ON recent_transitions(at);
             ",
         )?;
         Ok(())
@@ -306,6 +327,16 @@ impl DuckDbStorage {
                     }
                     Ok(1)
                 }
+                Ok(StorageCommand::Transition(transition)) => {
+                    conn.execute("INSERT INTO recent_transitions (at, from_state, to_state, by_signal) VALUES (?, ?, ?, ?)",
+                        params![
+                            transition.at,
+                            format!("{:?}", transition.from),
+                            format!("{:?}", transition.to),
+                            transition.by_signal.clone(),
+                        ],
+                    )
+                }
                 Ok(StorageCommand::Shutdown) => break,
                 Err(_) => break,
             };
@@ -368,12 +399,21 @@ impl StorageBackend for DuckDbStorage {
         inc_backlog();
         Ok(())
     }
-
     fn add_envelopes(&mut self, events: Vec<EventEnvelope>) -> Result<()> {
         for env in events {
             self.sender
                 .send(StorageCommand::Envelope(env))
                 .context("Failed to send envelope to writer")?;
+            inc_backlog();
+        }
+        Ok(())
+    }
+
+    fn add_transitions(&mut self, transitions: Vec<snapshot::Transition>) -> Result<()> {
+        for transition in transitions {
+            self.sender
+                .send(StorageCommand::Transition(transition.clone()))
+                .context("Failed to send transition to writer")?;
             inc_backlog();
         }
         Ok(())
@@ -404,13 +444,7 @@ impl StorageBackend for DuckDbStorage {
             let state_s: String = row.get(3)?;
             let focus_json: Option<String> = row.get(4)?;
 
-            let state = match state_s.as_str() {
-                "Active" => ActivityState::Active,
-                "Passive" => ActivityState::Passive,
-                "Inactive" => ActivityState::Inactive,
-                "Locked" => ActivityState::Locked,
-                _ => ActivityState::Inactive,
-            };
+            let state = parse_state_label(&state_s);
 
             let focus_info = match focus_json {
                 Some(js) => serde_json::from_str(&js).ok(),
@@ -549,6 +583,34 @@ impl StorageBackend for DuckDbStorage {
                 derived: derived_b,
                 polling: polling_b,
                 sensitive: sensitive_b,
+            });
+        }
+        Ok(out)
+    }
+
+    fn fetch_recent_transitions(&mut self, limit: usize) -> Result<Vec<snapshot::Transition>> {
+        let conn = Connection::open(&self.db_path)?;
+        if let Some(mb) = self.memory_limit_mb {
+            let _ = conn.execute_batch(&format!(
+                "PRAGMA memory_limit='{}MB'; PRAGMA threads=2;",
+                mb
+            ));
+        }
+        let mut stmt = conn.prepare(
+            "SELECT at, from_state, to_state, by_signal FROM recent_transitions ORDER BY at DESC LIMIT ?"
+        )?;
+        let mut rows = stmt.query([limit as i64])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let at: DateTime<Utc> = row.get(0)?;
+            let from_s: String = row.get(1)?;
+            let to_s: String = row.get(2)?;
+            let by_signal: Option<String> = row.get(3)?;
+            out.push(snapshot::Transition {
+                from: parse_state_label(&from_s),
+                to: parse_state_label(&to_s),
+                at,
+                by_signal,
             });
         }
         Ok(out)

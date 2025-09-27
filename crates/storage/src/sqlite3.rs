@@ -16,6 +16,19 @@ use kronical_core::events::model::{
 use kronical_core::records::{ActivityRecord, ActivityState};
 use kronical_core::snapshot;
 
+fn parse_state_label(label: &str) -> ActivityState {
+    match label {
+        "Active" => ActivityState::Active,
+        "Passive" => ActivityState::Passive,
+        "Inactive" => ActivityState::Inactive,
+        "Locked" => ActivityState::Locked,
+        other => {
+            eprintln!("Unknown state in DB: {}", other);
+            ActivityState::Inactive
+        }
+    }
+}
+
 // Uses shared StorageCommand from crate::storage
 
 pub struct SqliteStorage {
@@ -95,7 +108,15 @@ impl SqliteStorage {
                 raw_event_ref TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_compact_events_start_time ON compact_events(start_time);
-            CREATE INDEX IF NOT EXISTS idx_activity_records_start_time ON activity_records(start_time);"
+            CREATE INDEX IF NOT EXISTS idx_activity_records_start_time ON activity_records(start_time);
+            CREATE TABLE IF NOT EXISTS recent_transitions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                at TEXT NOT NULL,
+                from_state TEXT NOT NULL,
+                to_state TEXT NOT NULL,
+                by_signal TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_recent_transitions_at ON recent_transitions(at);"
         )?;
         Ok(())
     }
@@ -233,6 +254,16 @@ impl SqliteStorage {
                     }
                     last_res
                 }
+                StorageCommand::Transition(transition) => {
+                    tx.execute("INSERT INTO recent_transitions (at, from_state, to_state, by_signal) VALUES (?, ?, ?, ?)",
+                        params![
+                            transition.at.to_rfc3339(),
+                            format!("{:?}", transition.from),
+                            format!("{:?}", transition.to),
+                            transition.by_signal.clone(),
+                        ],
+                    )
+                }
                 StorageCommand::Shutdown => break,
             };
 
@@ -291,12 +322,21 @@ impl StorageBackend for SqliteStorage {
         inc_backlog();
         Ok(())
     }
-
     fn add_envelopes(&mut self, events: Vec<EventEnvelope>) -> Result<()> {
         for env in events {
             self.sender
                 .send(StorageCommand::Envelope(env))
                 .context("Failed to send envelope to writer")?;
+            inc_backlog();
+        }
+        Ok(())
+    }
+
+    fn add_transitions(&mut self, transitions: Vec<snapshot::Transition>) -> Result<()> {
+        for transition in transitions {
+            self.sender
+                .send(StorageCommand::Transition(transition.clone()))
+                .context("Failed to send transition to writer")?;
             inc_backlog();
         }
         Ok(())
@@ -334,16 +374,7 @@ impl StorageBackend for SqliteStorage {
                 None => None,
             };
 
-            let state = match state_s.as_str() {
-                "Active" => ActivityState::Active,
-                "Passive" => ActivityState::Passive,
-                "Inactive" => ActivityState::Inactive,
-                "Locked" => ActivityState::Locked,
-                other => {
-                    eprintln!("Unknown state in DB: {}", other);
-                    ActivityState::Inactive
-                }
-            };
+            let state = parse_state_label(&state_s);
 
             let focus_info = match focus_json {
                 Some(js) => serde_json::from_str(&js).ok(),
@@ -482,6 +513,29 @@ impl StorageBackend for SqliteStorage {
                 derived: derived_i != 0,
                 polling: polling_i != 0,
                 sensitive: sensitive_i != 0,
+            });
+        }
+        Ok(out)
+    }
+
+    fn fetch_recent_transitions(&mut self, limit: usize) -> Result<Vec<snapshot::Transition>> {
+        let conn = Connection::open(&self.db_path)?;
+        let mut stmt = conn.prepare(
+            "SELECT at, from_state, to_state, by_signal FROM recent_transitions ORDER BY at DESC LIMIT ?"
+        )?;
+        let mut rows = stmt.query([limit as i64])?;
+        let mut out = Vec::new();
+        while let Some(row) = rows.next()? {
+            let at_s: String = row.get(0)?;
+            let from_s: String = row.get(1)?;
+            let to_s: String = row.get(2)?;
+            let by_signal: Option<String> = row.get(3)?;
+            let at = DateTime::parse_from_rfc3339(&at_s).map(|dt| dt.with_timezone(&Utc))?;
+            out.push(snapshot::Transition {
+                from: parse_state_label(&from_s),
+                to: parse_state_label(&to_s),
+                at,
+                by_signal,
             });
         }
         Ok(out)

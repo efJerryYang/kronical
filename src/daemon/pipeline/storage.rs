@@ -34,6 +34,11 @@ pub fn spawn_storage_stage(
                         error!("store add_compact_events error: {}", e);
                     }
                 }
+                StorageCommand::Transition(transition) => {
+                    if let Err(e) = storage.add_transitions(vec![transition]) {
+                        error!("store add_transitions error: {}", e);
+                    }
+                }
                 StorageCommand::Shutdown => {
                     info!("Storage stage received shutdown");
                     break;

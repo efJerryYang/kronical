@@ -678,6 +678,10 @@ fn run_monitor_loop<B: Backend>(terminal: &mut Terminal<B>, data_file: PathBuf) 
                                         ]));
                                     }
                                     // Recent transitions (last 5)
+                                    details.push(Line::from(format!(
+                                        "Transitions captured: {}",
+                                        snap.transitions_recent.len()
+                                    )));
                                     if !snap.transitions_recent.is_empty() {
                                         details.push(Line::from("Recent transitions:"));
                                         for tr in snap.transitions_recent.iter().take(5) {

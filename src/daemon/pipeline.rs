@@ -93,6 +93,7 @@ pub fn spawn_pipeline(
     } = resources;
 
     let initial_records = hydrate_recent_records(storage.as_mut(), retention_minutes);
+    let initial_transitions = hydrate_recent_transitions(storage.as_mut(), 32);
 
     let (derive_tx, derive_rx) = channel::unbounded();
     let (hints_tx, hints_rx) = channel::unbounded();
@@ -142,6 +143,7 @@ pub fn spawn_pipeline(
             cfg_summary: cfg_summary.clone(),
             retention_minutes,
             initial_records,
+            initial_transitions,
             ephemeral_max_duration_secs,
             ephemeral_min_distinct_ids,
             max_windows_per_app,
@@ -199,6 +201,24 @@ fn hydrate_recent_records(
                 "Failed to hydrate historical records from storage (since {}): {}",
                 since, err
             );
+            Vec::new()
+        }
+    }
+}
+
+fn hydrate_recent_transitions(
+    storage: &mut dyn StorageBackend,
+    limit: usize,
+) -> Vec<snapshot::Transition> {
+    match storage.fetch_recent_transitions(limit) {
+        Ok(transitions) => {
+            if !transitions.is_empty() {
+                info!("Hydrated {} transitions from storage", transitions.len());
+            }
+            transitions
+        }
+        Err(err) => {
+            error!("Failed to hydrate transitions from storage: {}", err);
             Vec::new()
         }
     }
