@@ -375,7 +375,7 @@ fn run_monitor_loop<B: Backend>(terminal: &mut Terminal<B>, data_file: PathBuf) 
                                         .direction(Direction::Vertical)
                                         .constraints([
                                             Constraint::Length(7),
-                                            Constraint::Length(10),
+                                            Constraint::Length(12),
                                             Constraint::Min(5),
                                         ])
                                         .split(size);
