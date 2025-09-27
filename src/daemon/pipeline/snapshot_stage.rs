@@ -25,6 +25,7 @@ pub struct SnapshotStageConfig {
     pub cfg_summary: snapshot::ConfigSummary,
     pub retention_minutes: u64,
     pub initial_records: Vec<ActivityRecord>,
+    pub initial_transitions: Vec<snapshot::Transition>,
     pub ephemeral_max_duration_secs: u64,
     pub ephemeral_min_distinct_ids: usize,
     pub max_windows_per_app: usize,
@@ -45,6 +46,7 @@ pub fn spawn_snapshot_stage(
         cfg_summary,
         retention_minutes,
         mut initial_records,
+        mut initial_transitions,
         ephemeral_max_duration_secs,
         ephemeral_min_distinct_ids,
         max_windows_per_app,
@@ -72,6 +74,14 @@ pub fn spawn_snapshot_stage(
         let mut hints_complete = false;
         let mut storage_shutdown_sent = false;
 
+        if !initial_transitions.is_empty() {
+            for transition in initial_transitions.drain(..) {
+                current_state = transition.to;
+                last_transition = Some(transition.clone());
+                snapshot_bus.push_transition(transition);
+            }
+        }
+
         publish_snapshot(
             snapshot_bus.as_ref(),
             &mut recent_records,
@@ -96,6 +106,7 @@ pub fn spawn_snapshot_stage(
                     apply_update(
                         update,
                         &snapshot_bus,
+                        &storage_tx,
                         &mut counts,
                         &mut current_state,
                         &mut current_focus,
@@ -210,6 +221,7 @@ pub fn spawn_snapshot_stage(
 fn apply_update(
     update: SnapshotUpdate,
     snapshot_bus: &Arc<snapshot::SnapshotBus>,
+    storage_tx: &Sender<StorageCommand>,
     counts: &mut snapshot::Counts,
     current_state: &mut ActivityState,
     current_focus: &mut Option<WindowFocusInfo>,
@@ -224,16 +236,17 @@ fn apply_update(
     if let Some(state) = update.state {
         *current_state = state;
     }
-    if let Some(transition) = update.transition {
-        snapshot_bus.push_transition(transition.clone());
-        *last_transition = Some(transition);
-    }
     if let Some((window_id, title)) = update.focus_title {
         if let Some(focus) = current_focus.as_mut() {
             if focus.window_id == window_id {
                 focus.window_title = Arc::new(title);
             }
         }
+    }
+    if let Some(transition) = update.transition {
+        snapshot_bus.push_transition(transition.clone());
+        *last_transition = Some(transition.clone());
+        let _ = storage_tx.send(StorageCommand::Transition(transition));
     }
 }
 
@@ -591,6 +604,7 @@ mod tests {
                 cfg_summary: cfg_summary.clone(),
                 retention_minutes: 5,
                 initial_records: Vec::new(),
+                initial_transitions: Vec::new(),
                 ephemeral_max_duration_secs: 60,
                 ephemeral_min_distinct_ids: 2,
                 max_windows_per_app: 5,
@@ -627,12 +641,12 @@ mod tests {
         snapshot_tx.send(SnapshotMessage::HintsComplete).unwrap();
         snapshot_tx.send(SnapshotMessage::Shutdown).unwrap();
 
-        let shutdown_cmd = storage_rx
-            .recv_timeout(Duration::from_millis(500))
-            .expect("storage shutdown command");
-        match shutdown_cmd {
-            StorageCommand::Shutdown => {}
-            other => panic!("expected shutdown command, got {other:?}"),
+        loop {
+            match storage_rx.recv_timeout(Duration::from_millis(500)) {
+                Ok(StorageCommand::Shutdown) => break,
+                Ok(_) => continue,
+                Err(_) => panic!("storage shutdown command missing"),
+            }
         }
 
         handle.join().unwrap();

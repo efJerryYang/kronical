@@ -8,18 +8,21 @@ use kronical_core::compression::CompactEvent;
 use kronical_core::events::RawEvent;
 use kronical_core::events::model::EventEnvelope;
 use kronical_core::records::ActivityRecord;
+use kronical_core::snapshot;
 
 pub trait StorageBackend: Send + Sync {
     fn add_events(&mut self, events: Vec<RawEvent>) -> Result<()>;
     fn add_compact_events(&mut self, events: Vec<CompactEvent>) -> Result<()>;
     fn add_envelopes(&mut self, events: Vec<EventEnvelope>) -> Result<()>;
     fn add_records(&mut self, records: Vec<ActivityRecord>) -> Result<()>;
+    fn add_transitions(&mut self, transitions: Vec<snapshot::Transition>) -> Result<()>;
     fn fetch_records_since(&mut self, since: DateTime<Utc>) -> Result<Vec<ActivityRecord>>;
     fn fetch_envelopes_between(
         &mut self,
         since: DateTime<Utc>,
         until: DateTime<Utc>,
     ) -> Result<Vec<EventEnvelope>>;
+    fn fetch_recent_transitions(&mut self, limit: usize) -> Result<Vec<snapshot::Transition>>;
 }
 
 static STORAGE_BACKLOG: AtomicU64 = AtomicU64::new(0);
@@ -91,6 +94,7 @@ pub enum StorageCommand {
     Record(ActivityRecord),
     Envelope(EventEnvelope),
     CompactEvents(Vec<CompactEvent>),
+    Transition(snapshot::Transition),
     Shutdown,
 }
 
