@@ -238,7 +238,7 @@ fn run_focus_worker(
                         if state.process_start_time == 0 {
                             state.process_start_time = Utc::now().timestamp_millis() as u64;
                         }
-                        if is_login {
+                        if is_login && state.window_id == 0 {
                             state.window_id = LOGINWINDOW_WINDOW_ID;
                         }
                         state.window_instance_start = Utc::now();
@@ -283,14 +283,13 @@ fn run_focus_worker(
                         state.process_start_time = Utc::now().timestamp_millis() as u64;
                     }
                     state.window_title = info.title.clone();
-                    state.window_id = info.window_id;
-                    if state.app_name.eq_ignore_ascii_case(LOGINWINDOW_APP) {
-                        state.window_id = if info.window_id == 0 {
-                            LOGINWINDOW_WINDOW_ID
-                        } else {
-                            info.window_id
-                        };
-                    }
+                    state.window_id = if state.app_name.eq_ignore_ascii_case(LOGINWINDOW_APP)
+                        && info.window_id == 0
+                    {
+                        LOGINWINDOW_WINDOW_ID
+                    } else {
+                        info.window_id
+                    };
                     state.window_instance_start = Utc::now();
                     state.last_app_update = Instant::now();
                     state.last_window_update = state.last_app_update;

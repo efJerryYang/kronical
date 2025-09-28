@@ -62,6 +62,7 @@ pub fn spawn_envelope_stage(
                     let envelopes = adapter.adapt_batch(&batch.events);
                     let envelopes_with_lock = lock_deriver.derive(&envelopes);
                     let mut update = SnapshotUpdate::default();
+                    let mut send_failed = false;
 
                     for env in envelopes_with_lock.iter() {
                         trace!("Envelope stage handling envelope {:?}", env.kind);
@@ -73,6 +74,12 @@ pub fn spawn_envelope_stage(
                                 if let Err(e) = hints_tx.send(env.clone()) {
                                     error!("Failed to send hint envelope: {}", e);
                                 }
+                                if update.transition.is_some()
+                                    && !flush_snapshot_update(&snapshot_tx, &mut update)
+                                {
+                                    send_failed = true;
+                                    break;
+                                }
                             }
                             EventKind::Signal(signal_kind) => {
                                 update.signals_delta += 1;
@@ -83,6 +90,12 @@ pub fn spawn_envelope_stage(
                                 {
                                     error!("Failed to enqueue signal envelope for storage: {}", e);
                                 }
+                                if update.transition.is_some()
+                                    && !flush_snapshot_update(&snapshot_tx, &mut update)
+                                {
+                                    send_failed = true;
+                                    break;
+                                }
                                 if let Some(hint) = state_deriver.on_signal(env) {
                                     update.hints_delta += 1;
                                     apply_focus_update(&mut update, &hint);
@@ -90,9 +103,19 @@ pub fn spawn_envelope_stage(
                                     if let Err(e) = hints_tx.send(hint.clone()) {
                                         error!("Failed to forward derived hint: {}", e);
                                     }
+                                    if update.transition.is_some()
+                                        && !flush_snapshot_update(&snapshot_tx, &mut update)
+                                    {
+                                        send_failed = true;
+                                        break;
+                                    }
                                 }
                             }
                         }
+                    }
+
+                    if send_failed {
+                        break;
                     }
 
                     let job = CompressionCommand::Process {
@@ -105,7 +128,10 @@ pub fn spawn_envelope_stage(
                     }
 
                     if !update.is_empty() {
-                        if snapshot_tx.send(SnapshotMessage::Update(update)).is_err() {
+                        if snapshot_tx
+                            .send(SnapshotMessage::Update(std::mem::take(&mut update)))
+                            .is_err()
+                        {
                             error!("Snapshot stage channel closed; stopping envelope stage");
                             break;
                         }
@@ -125,8 +151,16 @@ pub fn spawn_envelope_stage(
                         if let Err(e) = hints_tx.send(state_hint.clone()) {
                             error!("Failed to forward tick-derived hint: {}", e);
                         }
+                        if update.transition.is_some()
+                            && !flush_snapshot_update(&snapshot_tx, &mut update)
+                        {
+                            break;
+                        }
                         if !update.is_empty() {
-                            if snapshot_tx.send(SnapshotMessage::Update(update)).is_err() {
+                            if snapshot_tx
+                                .send(SnapshotMessage::Update(std::mem::take(&mut update)))
+                                .is_err()
+                            {
                                 error!("Snapshot stage channel closed; stopping envelope stage");
                                 break;
                             }
@@ -201,5 +235,21 @@ fn transition_reason(env: &EventEnvelope, signal_kind: Option<&SignalKind>) -> O
         Some("IdleTimeout".to_string())
     } else {
         None
+    }
+}
+
+fn flush_snapshot_update(
+    snapshot_tx: &Sender<SnapshotMessage>,
+    update: &mut SnapshotUpdate,
+) -> bool {
+    if update.is_empty() {
+        return true;
+    }
+    let payload = std::mem::take(update);
+    if snapshot_tx.send(SnapshotMessage::Update(payload)).is_err() {
+        error!("Snapshot stage channel closed; stopping envelope stage");
+        false
+    } else {
+        true
     }
 }
