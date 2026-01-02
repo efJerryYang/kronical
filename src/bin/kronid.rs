@@ -292,6 +292,7 @@ fn run() -> Result<()> {
     info!("Starting Kronical daemon (kronid)");
 
     let snapshot_bus = Arc::new(SnapshotBus::new());
+    // TODO: app_runtime: snapshot_bus+thread_registry+config
     let coordinator = EventCoordinator::initialize(&config);
     let thread_registry = coordinator.thread_registry();
     let data_store = create_data_store(&config, &snapshot_bus, &thread_registry)?;

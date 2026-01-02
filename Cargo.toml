@@ -16,10 +16,10 @@ path = "src/bin/kronid.rs"
 
 
 [dependencies]
-#winshift = { path = "../vendor/winshift-rs" }
-winshift = "0.0.5"
-#uiohook-rs = { path = "../vendor/uiohook-rs" }
-uiohook-rs = "0.2"
+winshift = { path = "../vendor/winshift-rs" }
+# winshift = "0.0.5"
+uiohook-rs = { path = "../vendor/uiohook-rs" }
+# uiohook-rs = "0.2"
 clap = { version = "4.5", features = ["derive"] }
 serde = { version = "1.0", features = ["derive", "rc"] }
 serde_json = "1.0"
