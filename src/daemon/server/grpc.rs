@@ -11,7 +11,7 @@ use crate::kroni_api::kroni::v1::{
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use futures_core::Stream;
-use log::{info, warn};
+use crate::util::logging::{info, warn};
 use once_cell::sync::OnceCell;
 use prost_types::Timestamp;
 use std::path::PathBuf;

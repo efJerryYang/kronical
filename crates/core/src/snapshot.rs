@@ -12,6 +12,8 @@ use tokio::sync::watch;
 pub struct Snapshot {
     pub seq: u64,
     pub mono_ns: u64,
+    #[serde(default)]
+    pub run_id: Option<String>,
     pub activity_state: ActivityState,
     pub focus: Option<WindowFocusInfo>,
     pub last_transition: Option<Transition>,
@@ -50,6 +52,7 @@ impl Snapshot {
         Self {
             seq: 0,
             mono_ns: monotonic_ns(),
+            run_id: None,
             activity_state: ActivityState::Inactive,
             focus: None,
             last_transition: None,
@@ -126,6 +129,7 @@ impl SnapshotBus {
         let snap = Snapshot {
             seq,
             mono_ns: monotonic_ns(),
+            run_id: self.run_id.clone(),
             activity_state: state,
             focus,
             last_transition,

@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
-use tracing::info;
+use crate::util::logging::{debug, error, info, warn};
 
 pub use kronical_storage::system_metrics::{
     DuckDbSystemMetricsStore, SqliteSystemMetricsStore, SystemMetrics, SystemMetricsStore,
@@ -176,7 +176,7 @@ impl SystemTracker {
                         {
                             Ok(s) => Box::new(s),
                             Err(e) => {
-                                tracing::error!("Failed to create DuckDB store: {}", e);
+                                error!("Failed to create DuckDB store: {}", e);
                                 return;
                             }
                         }
@@ -185,7 +185,7 @@ impl SystemTracker {
                         match SqliteSystemMetricsStore::new_file(&db_path) {
                             Ok(s) => Box::new(s),
                             Err(e) => {
-                                tracing::error!("Failed to create SQLite store: {}", e);
+                                error!("Failed to create SQLite store: {}", e);
                                 return;
                             }
                         }
@@ -201,9 +201,9 @@ impl SystemTracker {
                      store: &mut Box<dyn SystemMetricsStore + Send>| {
                         if !buffer.is_empty() {
                             if let Err(e) = store.insert_metrics_batch(buffer, pid) {
-                                tracing::error!("Failed to flush metrics batch: {}", e);
+                                error!("Failed to flush metrics batch: {}", e);
                             } else {
-                                tracing::debug!(
+                                debug!(
                                     "Flushed {} metrics to metrics store",
                                     buffer.len()
                                 );
@@ -262,9 +262,9 @@ impl SystemTracker {
 
                             if batch_count % batch_size == 0 {
                                 if let Err(e) = store.insert_metrics_batch(&metrics_buffer, pid) {
-                                    tracing::error!("Failed to insert metrics batch: {}", e);
+                                    error!("Failed to insert metrics batch: {}", e);
                                 } else {
-                                    tracing::debug!(
+                                    debug!(
                                         "Inserted {} metrics to metrics store",
                                         metrics_buffer.len()
                                     );
@@ -273,7 +273,7 @@ impl SystemTracker {
                             }
 
                             if !pending_flush_acks.is_empty() {
-                                tracing::info!(
+                                info!(
                                     "Tracker flush requested; flushing {} buffered samples",
                                     metrics_buffer.len()
                                 );
@@ -284,9 +284,9 @@ impl SystemTracker {
                             }
                         }
                         Err(e) => {
-                            tracing::warn!("Failed to collect system metrics: {}", e);
+                            warn!("Failed to collect system metrics: {}", e);
                             if !pending_flush_acks.is_empty() {
-                                tracing::info!(
+                                info!(
                                     "Tracker flush requested (error path); flushing {} buffered samples",
                                     metrics_buffer.len()
                                 );
@@ -337,9 +337,9 @@ impl SystemTracker {
 
                 if !metrics_buffer.is_empty() {
                     if let Err(e) = store.insert_metrics_batch(&metrics_buffer, pid) {
-                        tracing::error!("Failed to flush final metrics batch: {}", e);
+                        error!("Failed to flush final metrics batch: {}", e);
                     } else {
-                        tracing::debug!(
+                        debug!(
                             "Flushed final {} metrics to metrics store",
                             metrics_buffer.len()
                         );
@@ -362,17 +362,17 @@ impl SystemTracker {
         }
         if let Some(handle) = self.thread_handle.take() {
             if let Err(e) = handle.join() {
-                tracing::error!("System tracker thread panicked: {:?}", e);
+                error!("System tracker thread panicked: {:?}", e);
             }
         }
         if let Some(handle) = self.control_bridge.take() {
             if let Err(e) = handle.join() {
-                tracing::error!("Control bridge thread panicked: {:?}", e);
+                error!("Control bridge thread panicked: {:?}", e);
             }
         }
         if let Some(handle) = self.query_bridge.take() {
             if let Err(e) = handle.join() {
-                tracing::error!("Query bridge thread panicked: {:?}", e);
+                error!("Query bridge thread panicked: {:?}", e);
             }
         }
         self.control_tx = None;

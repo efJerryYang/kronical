@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::Parser;
-use log::{error, info};
+use kronical::util::logging::{error, info};
 use tracing::subscriber::SetGlobalDefaultError;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
 use tracing_subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt};
@@ -312,6 +312,7 @@ fn run() -> Result<()> {
             .with_context(|| format!("invalid --run UUID '{id}'"))?,
         None => Uuid::new_v4().to_string(),
     };
+    kronical::util::logging::set_run_id(run_id.clone());
     let config = load_app_config()?;
 
     ensure_workspace_dir(&config.workspace_dir)?;

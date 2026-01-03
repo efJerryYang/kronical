@@ -10,7 +10,7 @@ use crate::storage::StorageCommand;
 use anyhow::Result;
 use chrono::Utc;
 use crossbeam_channel::{Receiver, Sender};
-use log::{debug, error, info, trace};
+use crate::util::logging::{debug, error, info, trace};
 
 use super::types::{CompressionCommand, DeriveCommand, SnapshotMessage, SnapshotUpdate};
 

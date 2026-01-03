@@ -6,7 +6,7 @@ use crate::storage::{StorageBackend, StorageCommand, storage_metrics_watch};
 use anyhow::{Context, Result};
 use chrono::Utc;
 use crossbeam_channel as channel;
-use log::{error, info};
+use crate::util::logging::{error, info};
 use std::any::Any;
 use std::sync::Arc;
 use std::thread;

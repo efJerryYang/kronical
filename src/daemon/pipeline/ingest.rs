@@ -4,7 +4,7 @@ use crate::daemon::runtime::{ThreadHandle, ThreadRegistry};
 use anyhow::{Result, anyhow};
 use chrono::Utc;
 use crossbeam_channel::{Receiver, Sender};
-use log::{debug, error, info, trace};
+use crate::util::logging::{debug, error, info, trace};
 use std::time::{Duration, Instant};
 
 use super::types::{DeriveCommand, FlushReason, RawBatch};
