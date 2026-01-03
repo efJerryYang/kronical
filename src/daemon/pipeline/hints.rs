@@ -1,5 +1,5 @@
 use crate::daemon::events::model::EventEnvelope;
-use crate::daemon::records::{ActivityState, RecordBuilder};
+use crate::daemon::records::{ActivityRecord, ActivityState, RecordBuilder};
 use crate::daemon::runtime::{ThreadHandle, ThreadRegistry};
 use crate::storage::StorageCommand;
 use anyhow::Result;
@@ -24,6 +24,10 @@ pub fn spawn_hints_stage(
                 error!("Failed to enqueue hint envelope for storage: {}", e);
             }
             if let Some(record) = record_builder.on_hint(&env) {
+                info!(
+                    "Record finalized: {}",
+                    record_summary(&record)
+                );
                 if let Err(e) = storage_tx.send(StorageCommand::Record(record.clone())) {
                     error!("Failed to enqueue activity record: {}", e);
                 }
@@ -32,6 +36,10 @@ pub fn spawn_hints_stage(
         }
 
         if let Some(final_record) = record_builder.finalize_all() {
+            info!(
+                "Final record finalized: {}",
+                record_summary(&final_record)
+            );
             if let Err(e) = storage_tx.send(StorageCommand::Record(final_record.clone())) {
                 error!("Failed to enqueue final activity record: {}", e);
             }
@@ -41,4 +49,31 @@ pub fn spawn_hints_stage(
         let _ = snapshot_tx.send(SnapshotMessage::HintsComplete);
         info!("Pipeline hints stage exiting");
     })
+}
+
+fn record_summary(record: &ActivityRecord) -> String {
+    let focus = match &record.focus_info {
+        Some(info) => format!(
+            "app={} window={} pid={} wid={}",
+            info.app_name,
+            info.window_title,
+            info.pid,
+            info.window_id
+        ),
+        None => "focus=none".to_string(),
+    };
+    let end_time = record
+        .end_time
+        .map(|t| t.to_string())
+        .unwrap_or_else(|| "open".to_string());
+    format!(
+        "id={} state={:?} start={} end={} events={} triggers={} {}",
+        record.record_id,
+        record.state,
+        record.start_time,
+        end_time,
+        record.event_count,
+        record.triggering_events.len(),
+        focus
+    )
 }

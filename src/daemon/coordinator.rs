@@ -225,6 +225,7 @@ pub struct EventCoordinator {
     title_cache_capacity: usize,
     title_cache_ttl_secs: u64,
     focus_interner_max_strings: usize,
+    persist_raw_events: bool,
     tracker_enabled: bool,
     tracker_interval_secs: f64,
     tracker_batch_size: usize,
@@ -247,6 +248,7 @@ impl EventCoordinator {
         title_cache_capacity: usize,
         title_cache_ttl_secs: u64,
         focus_interner_max_strings: usize,
+        persist_raw_events: bool,
         tracker_enabled: bool,
         tracker_interval_secs: f64,
         tracker_batch_size: usize,
@@ -276,6 +278,7 @@ impl EventCoordinator {
             title_cache_capacity,
             title_cache_ttl_secs,
             focus_interner_max_strings,
+            persist_raw_events,
             tracker_enabled,
             tracker_interval_secs,
             tracker_batch_size,
@@ -298,6 +301,7 @@ impl EventCoordinator {
             config.title_cache_capacity,
             config.title_cache_ttl_secs,
             config.focus_interner_max_strings,
+            config.persist_raw_events,
             config.tracker_enabled,
             config.tracker_interval_secs,
             config.tracker_batch_size,
@@ -377,6 +381,14 @@ impl EventCoordinator {
         snapshot_bus: Arc<crate::daemon::snapshot::SnapshotBus>,
         thread_registry: ThreadRegistry,
     ) -> Result<PipelineHandles> {
+        info!(
+            "Raw event persistence {}",
+            if self.persist_raw_events {
+                "enabled"
+            } else {
+                "disabled"
+            }
+        );
         let pipeline_config = crate::daemon::pipeline::PipelineConfig {
             retention_minutes: self.retention_minutes,
             active_grace_secs: self.active_grace_secs,
@@ -387,6 +399,7 @@ impl EventCoordinator {
             ephemeral_app_max_duration_secs: self.ephemeral_app_max_duration_secs,
             ephemeral_app_min_distinct_procs: self.ephemeral_app_min_distinct_procs,
             focus_interner_max_strings: self.focus_interner_max_strings,
+            persist_raw_events: self.persist_raw_events,
         };
 
         let pipeline_handles = crate::daemon::pipeline::spawn_pipeline(

@@ -4,7 +4,7 @@ use crate::daemon::records::{ActivityRecord, ActivityState};
 use crate::daemon::snapshot;
 use chrono::{DateTime, Utc};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub enum FlushReason {
     Timeout,
     Shutdown,

@@ -16,6 +16,7 @@ pub struct AppConfig {
     pub db_backend: DatabaseBackendConfig,
     // Tracker storage backend (separate from main DB)
     pub tracker_db_backend: DatabaseBackendConfig,
+    pub persist_raw_events: bool,
     pub retention_minutes: u64,
     pub active_grace_secs: u64,
     pub idle_threshold_secs: u64,
@@ -49,6 +50,7 @@ impl Default for AppConfig {
             workspace_dir,
             db_backend: DatabaseBackendConfig::Duckdb,
             tracker_db_backend: DatabaseBackendConfig::Duckdb,
+            persist_raw_events: false,
             retention_minutes: 72 * 60,
             active_grace_secs: 30,
             idle_threshold_secs: 300,
@@ -80,6 +82,7 @@ impl AppConfig {
             .set_default("workspace_dir", workspace_dir.to_string_lossy().as_ref())?
             .set_default("db_backend", "duckdb")?
             .set_default("tracker_db_backend", "duckdb")?
+            .set_default("persist_raw_events", false)?
             .set_default("retention_minutes", 72 * 60)?
             .set_default("active_grace_secs", 30)?
             .set_default("idle_threshold_secs", 300)?
@@ -145,6 +148,7 @@ mod tests {
             assert!(cfg.workspace_dir.ends_with(".kronical"));
             assert_eq!(cfg.db_backend, DatabaseBackendConfig::Duckdb);
             assert_eq!(cfg.tracker_db_backend, DatabaseBackendConfig::Duckdb);
+            assert!(!cfg.persist_raw_events);
             assert_eq!(cfg.retention_minutes, 72 * 60);
             assert_eq!(cfg.active_grace_secs, 30);
             assert_eq!(cfg.idle_threshold_secs, 300);

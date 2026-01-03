@@ -246,6 +246,16 @@ fn apply_update(
     }
     if let Some(mut transition) = update.transition {
         attach_run_id(snapshot_bus.as_ref(), &mut transition);
+        info!(
+            "State transition: {:?} -> {:?} at {} reason={}",
+            transition.from,
+            transition.to,
+            transition.at,
+            transition
+                .by_signal
+                .as_deref()
+                .unwrap_or("Unknown")
+        );
         snapshot_bus.push_transition(transition.clone());
         *last_transition = Some(transition.clone());
         let _ = storage_tx.send(StorageCommand::Transition(transition));

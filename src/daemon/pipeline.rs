@@ -37,6 +37,7 @@ pub struct PipelineConfig {
     pub ephemeral_app_max_duration_secs: u64,
     pub ephemeral_app_min_distinct_procs: usize,
     pub focus_interner_max_strings: usize,
+    pub persist_raw_events: bool,
 }
 
 pub struct PipelineResources {
@@ -83,6 +84,7 @@ pub fn spawn_pipeline(
         ephemeral_app_max_duration_secs,
         ephemeral_app_min_distinct_procs,
         focus_interner_max_strings,
+        persist_raw_events,
     } = config;
 
     let PipelineResources {
@@ -119,6 +121,7 @@ pub fn spawn_pipeline(
             receiver: compression_rx,
             storage_tx: storage_tx.clone(),
             focus_interner_max_strings,
+            persist_raw_events,
         },
     )
     .context("spawn pipeline compression stage")?;
