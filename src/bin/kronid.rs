@@ -7,6 +7,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use clap::Parser;
 use log::{error, info};
 use tracing::subscriber::SetGlobalDefaultError;
 use tracing_appender::rolling::{RollingFileAppender, Rotation};
@@ -18,6 +19,14 @@ use kronical::storage::StorageBackend;
 use kronical::storage::duckdb::DuckDbStorage;
 use kronical::storage::sqlite3::SqliteStorage;
 use kronical::util::config::{AppConfig, DatabaseBackendConfig};
+use uuid::Uuid;
+
+#[derive(Parser)]
+#[command(author, version, about, long_about = None)]
+struct Cli {
+    #[arg(long, value_name = "UUID")]
+    run: Option<String>,
+}
 
 fn ensure_workspace_dir(workspace_dir: &Path) -> Result<()> {
     fs::create_dir_all(workspace_dir)
@@ -166,6 +175,24 @@ fn cleanup_pid_file(pid_file: &Path) -> Result<()> {
     Ok(())
 }
 
+fn write_run_id_file(run_id: &str, workspace_dir: &Path) -> Result<()> {
+    let run_id_path = kronical::util::paths::run_id_file(workspace_dir);
+    let mut opts = OpenOptions::new();
+    opts.create(true).write(true).truncate(true);
+    #[cfg(unix)]
+    {
+        opts.mode(0o644);
+    }
+    let mut file = opts
+        .open(&run_id_path)
+        .with_context(|| format!("opening run id file {}", run_id_path.display()))?;
+    write!(file, "{}", run_id)
+        .with_context(|| format!("writing run id {}", run_id_path.display()))?;
+    file.sync_all()
+        .with_context(|| format!("syncing run id file {}", run_id_path.display()))?;
+    Ok(())
+}
+
 fn setup_file_logging(log_dir: &Path) -> Result<()> {
     fs::create_dir_all(log_dir)
         .with_context(|| format!("creating log directory {}", log_dir.display()))?;
@@ -278,9 +305,17 @@ impl Drop for PidFileGuard {
 }
 
 fn run() -> Result<()> {
+    let cli = Cli::parse();
+    let run_id = match cli.run {
+        Some(id) => Uuid::parse_str(&id)
+            .map(|uuid| uuid.to_string())
+            .with_context(|| format!("invalid --run UUID '{id}'"))?,
+        None => Uuid::new_v4().to_string(),
+    };
     let config = load_app_config()?;
 
     ensure_workspace_dir(&config.workspace_dir)?;
+    write_run_id_file(&run_id, &config.workspace_dir)?;
     let log_dir = config.workspace_dir.join("logs");
     setup_file_logging(&log_dir)?;
 
@@ -291,7 +326,8 @@ fn run() -> Result<()> {
 
     info!("Starting Kronical daemon (kronid)");
 
-    let snapshot_bus = Arc::new(SnapshotBus::new());
+    let snapshot_bus = Arc::new(SnapshotBus::new_with_run_id(run_id.clone()));
+    info!("Kronical run id: {}", run_id);
     // TODO: app_runtime: snapshot_bus+thread_registry+config
     let coordinator = EventCoordinator::initialize(&config);
     let thread_registry = coordinator.thread_registry();

@@ -22,7 +22,11 @@ pub trait StorageBackend: Send + Sync {
         since: DateTime<Utc>,
         until: DateTime<Utc>,
     ) -> Result<Vec<EventEnvelope>>;
-    fn fetch_recent_transitions(&mut self, limit: usize) -> Result<Vec<snapshot::Transition>>;
+    fn fetch_recent_transitions(
+        &mut self,
+        run_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<snapshot::Transition>>;
 }
 
 static STORAGE_BACKLOG: AtomicU64 = AtomicU64::new(0);

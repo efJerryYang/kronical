@@ -155,11 +155,16 @@ impl DuckDbStorage {
                 at TIMESTAMPTZ NOT NULL,
                 from_state TEXT NOT NULL,
                 to_state TEXT NOT NULL,
-                by_signal TEXT
+                by_signal TEXT,
+                run_id TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_recent_transitions_at ON recent_transitions(at);
             ",
         )?;
+        let _ = conn.execute(
+            "ALTER TABLE recent_transitions ADD COLUMN run_id TEXT",
+            [],
+        );
         Ok(())
     }
 
@@ -328,12 +333,13 @@ impl DuckDbStorage {
                     Ok(1)
                 }
                 Ok(StorageCommand::Transition(transition)) => {
-                    conn.execute("INSERT INTO recent_transitions (at, from_state, to_state, by_signal) VALUES (?, ?, ?, ?)",
+                    conn.execute("INSERT INTO recent_transitions (at, from_state, to_state, by_signal, run_id) VALUES (?, ?, ?, ?, ?)",
                         params![
                             transition.at,
                             format!("{:?}", transition.from),
                             format!("{:?}", transition.to),
                             transition.by_signal.clone(),
+                            transition.run_id.clone(),
                         ],
                     )
                 }
@@ -588,7 +594,11 @@ impl StorageBackend for DuckDbStorage {
         Ok(out)
     }
 
-    fn fetch_recent_transitions(&mut self, limit: usize) -> Result<Vec<snapshot::Transition>> {
+    fn fetch_recent_transitions(
+        &mut self,
+        run_id: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<snapshot::Transition>> {
         let conn = Connection::open(&self.db_path)?;
         if let Some(mb) = self.memory_limit_mb {
             let _ = conn.execute_batch(&format!(
@@ -596,21 +606,31 @@ impl StorageBackend for DuckDbStorage {
                 mb
             ));
         }
-        let mut stmt = conn.prepare(
-            "SELECT at, from_state, to_state, by_signal FROM recent_transitions ORDER BY at DESC LIMIT ?"
-        )?;
-        let mut rows = stmt.query([limit as i64])?;
+        let mut stmt = match run_id {
+            Some(_) => conn.prepare(
+                "SELECT at, from_state, to_state, by_signal, run_id FROM recent_transitions WHERE run_id = ? ORDER BY at DESC LIMIT ?",
+            )?,
+            None => conn.prepare(
+                "SELECT at, from_state, to_state, by_signal, run_id FROM recent_transitions ORDER BY at DESC LIMIT ?",
+            )?,
+        };
+        let mut rows = match run_id {
+            Some(id) => stmt.query(params![id, limit as i64])?,
+            None => stmt.query([limit as i64])?,
+        };
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {
             let at: DateTime<Utc> = row.get(0)?;
             let from_s: String = row.get(1)?;
             let to_s: String = row.get(2)?;
             let by_signal: Option<String> = row.get(3)?;
+            let run_id: Option<String> = row.get(4)?;
             out.push(snapshot::Transition {
                 from: parse_state_label(&from_s),
                 to: parse_state_label(&to_s),
                 at,
                 by_signal,
+                run_id,
             });
         }
         Ok(out)

@@ -81,6 +81,7 @@ hyper-util = { version = "0.1", features = [
 shellexpand = "3.1"
 indicatif = "0.18"
 regex = "1.11"
+uuid = { version = "1.11", features = ["v4"] }
 
 [dev-dependencies]
 tempfile = "3.23"
@@ -111,4 +112,3 @@ members = [
 [[bin]]
 name = "bench-mouse-traj"
 path = "benchmarks/compressor/mouse_traj.rs"
-
