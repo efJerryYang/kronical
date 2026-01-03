@@ -183,6 +183,7 @@ fn run_focus_worker(
         LruCache::with_capacity(caps.title_cache_capacity)
     };
     let mut interner = StringInterner::new();
+    let mut poll_lock_active = false;
 
     // Optional delayed emit scheduling
     let mut scheduled_emit_at: Option<Instant> = None;
@@ -204,6 +205,22 @@ fn run_focus_worker(
         } else {
             0
         }
+    };
+
+    let emit_loginwindow_focus = |interner: &mut StringInterner| {
+        let now = Utc::now();
+        let focus_info = WindowFocusInfo {
+            pid: 0,
+            process_start_time: now.timestamp_millis() as u64,
+            app_name: interner.intern(LOGINWINDOW_APP),
+            window_title: interner.intern("Login"),
+            window_id: LOGINWINDOW_WINDOW_ID,
+            window_instance_start: now,
+            window_position: None,
+            window_size: None,
+        };
+        info!("Focus worker: Emitting synthesized loginwindow focus (poll error)");
+        callback.on_focus_change(focus_info);
     };
 
     let schedule_emit = |target: &mut Option<Instant>, delay_ms: u64| {
@@ -232,6 +249,9 @@ fn run_focus_worker(
                         debug!("Focus worker: duplicate app change ignored");
                     } else {
                         let is_login = app_name.eq_ignore_ascii_case(LOGINWINDOW_APP);
+                        if !is_login {
+                            poll_lock_active = false;
+                        }
                         state.app_name = app_name;
                         state.pid = pid;
                         state.process_start_time = get_process_start_time(pid);
@@ -277,6 +297,9 @@ fn run_focus_worker(
                 }
                 FocusMsg::AppChangeInfo(info) => {
                     state.app_name = info.app_name.clone();
+                    if !state.app_name.eq_ignore_ascii_case(LOGINWINDOW_APP) {
+                        poll_lock_active = false;
+                    }
                     state.pid = info.process_id;
                     state.process_start_time = get_process_start_time(info.process_id);
                     if state.process_start_time == 0 {
@@ -301,6 +324,9 @@ fn run_focus_worker(
                     if state.pid != info.process_id {
                         state.pid = info.process_id;
                         state.app_name = info.app_name.clone();
+                        if !state.app_name.eq_ignore_ascii_case(LOGINWINDOW_APP) {
+                            poll_lock_active = false;
+                        }
                         state.process_start_time = get_process_start_time(info.process_id);
                         if state.process_start_time == 0 {
                             state.process_start_time = Utc::now().timestamp_millis() as u64;
@@ -328,6 +354,21 @@ fn run_focus_worker(
                 // Polling tick
                 match get_active_window_info() {
                     Ok(info) => {
+                        if poll_lock_active {
+                            poll_lock_active = false;
+                            state.app_name = info.app_name.clone();
+                            state.pid = info.process_id;
+                            state.process_start_time = get_process_start_time(info.process_id);
+                            if state.process_start_time == 0 {
+                                state.process_start_time = Utc::now().timestamp_millis() as u64;
+                            }
+                            state.window_title = info.title.clone();
+                            state.window_id = info.window_id;
+                            state.window_instance_start = Utc::now();
+                            state.last_app_update = Instant::now();
+                            state.last_window_update = state.last_app_update;
+                            schedule_emit(&mut scheduled_emit_at, 0);
+                        }
                         let window_id = info.window_id;
                         let current_title = info.title.clone();
                         if let Some(last_title) = last_titles.get_cloned(&window_id) {
@@ -352,7 +393,20 @@ fn run_focus_worker(
                         }
                         last_titles.put(window_id, current_title);
                     }
-                    Err(e) => error!("Failed to get active window during polling: {:?}", e),
+                    Err(e) => {
+                        let err_text = format!("{:?}", e);
+                        let is_lock_error = err_text.contains("No qualifying window found");
+                        if is_lock_error {
+                            if !poll_lock_active {
+                                poll_lock_active = true;
+                                emit_loginwindow_focus(&mut interner);
+                            } else {
+                                debug!("Polling failed while locked: {:?}", e);
+                            }
+                        } else {
+                            error!("Failed to get active window during polling: {:?}", e);
+                        }
+                    }
                 }
             }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
