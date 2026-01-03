@@ -8,6 +8,7 @@ use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender};
 use kronical_core::compression::CompactEvent;
 use std::collections::HashSet;
+use std::time::Duration;
 
 use super::types::CompressionCommand;
 
@@ -33,6 +34,7 @@ pub fn spawn_compression_stage(
     threads.spawn("pipeline-compression", move || {
         info!("Pipeline compression stage started");
         let mut engine = CompressionEngine::with_focus_cap(focus_interner_max_strings);
+        let mut rollup = RollupStats::new(Duration::from_secs(10));
         while let Ok(cmd) = receiver.recv() {
             match cmd {
                 CompressionCommand::Process { batch, envelopes } => {
@@ -49,25 +51,18 @@ pub fn spawn_compression_stage(
                         Ok((processed_events, mut compact_events)) => {
                             let compact_stats =
                                 CompactEventStats::from_events(&compact_events);
-                            info!(
-                                "Compression batch stats (reason={:?}): raw_total={} raw_keyboard={} ({:.1}%) raw_mouse={} ({:.1}%) raw_focus={} ({:.1}%) compact_total={} compact_scroll={} ({:.1}%) compact_mouse_traj={} ({:.1}%) compact_keyboard={} ({:.1}%) compact_focus={} ({:.1}%)",
+                            rollup.add_batch(reason, &raw_stats, &compact_stats);
+                            rollup.maybe_flush();
+                            debug!(
+                                "Compression batch stats (reason={:?}): Raw (keyboard/mouse/focus): {}/{}/{}; Compact (scroll/move/keyboard/focus): {}/{}/{}/{}",
                                 reason,
-                                raw_stats.total,
                                 raw_stats.keyboard,
-                                raw_stats.pct(raw_stats.keyboard),
                                 raw_stats.mouse,
-                                raw_stats.pct(raw_stats.mouse),
                                 raw_stats.focus,
-                                raw_stats.pct(raw_stats.focus),
-                                compact_stats.total,
                                 compact_stats.scroll,
-                                compact_stats.pct(compact_stats.scroll),
                                 compact_stats.mouse_traj,
-                                compact_stats.pct(compact_stats.mouse_traj),
                                 compact_stats.keyboard,
-                                compact_stats.pct(compact_stats.keyboard),
                                 compact_stats.focus,
-                                compact_stats.pct(compact_stats.focus),
                             );
                             if persist_raw_events {
                                 forward_raw_events(&storage_tx, &envelopes, processed_events);
@@ -81,6 +76,7 @@ pub fn spawn_compression_stage(
                 }
                 CompressionCommand::Shutdown => {
                     info!("Compression stage received shutdown");
+                    rollup.flush();
                     break;
                 }
             }
@@ -170,14 +166,6 @@ impl RawEventStats {
         }
         stats
     }
-
-    fn pct(&self, count: usize) -> f32 {
-        if self.total == 0 {
-            0.0
-        } else {
-            (count as f32 / self.total as f32) * 100.0
-        }
-    }
 }
 
 #[derive(Debug, Default)]
@@ -203,12 +191,77 @@ impl CompactEventStats {
         }
         stats
     }
+}
 
-    fn pct(&self, count: usize) -> f32 {
-        if self.total == 0 {
-            0.0
-        } else {
-            (count as f32 / self.total as f32) * 100.0
+struct RollupStats {
+    interval: Duration,
+    next_flush: std::time::Instant,
+    batches: u64,
+    raw: RawEventStats,
+    compact: CompactEventStats,
+    by_reason: std::collections::HashMap<super::types::FlushReason, u64>,
+}
+
+impl RollupStats {
+    fn new(interval: Duration) -> Self {
+        Self {
+            interval,
+            next_flush: std::time::Instant::now() + interval,
+            batches: 0,
+            raw: RawEventStats::default(),
+            compact: CompactEventStats::default(),
+            by_reason: std::collections::HashMap::new(),
         }
+    }
+
+    fn add_batch(
+        &mut self,
+        reason: super::types::FlushReason,
+        raw: &RawEventStats,
+        compact: &CompactEventStats,
+    ) {
+        self.batches += 1;
+        self.raw.total += raw.total;
+        self.raw.keyboard += raw.keyboard;
+        self.raw.mouse += raw.mouse;
+        self.raw.focus += raw.focus;
+        self.compact.total += compact.total;
+        self.compact.scroll += compact.scroll;
+        self.compact.mouse_traj += compact.mouse_traj;
+        self.compact.keyboard += compact.keyboard;
+        self.compact.focus += compact.focus;
+        *self.by_reason.entry(reason).or_insert(0) += 1;
+    }
+
+    fn maybe_flush(&mut self) {
+        if std::time::Instant::now() >= self.next_flush {
+            self.flush();
+            self.next_flush = std::time::Instant::now() + self.interval;
+        }
+    }
+
+    fn flush(&mut self) {
+        if self.batches == 0 {
+            return;
+        }
+        let timeout = self.by_reason.get(&super::types::FlushReason::Timeout).copied().unwrap_or(0);
+        let shutdown = self.by_reason.get(&super::types::FlushReason::Shutdown).copied().unwrap_or(0);
+        info!(
+            "Compression rollup ({} batches, timeout={}, shutdown={}): Raw (keyboard/mouse/focus): {}/{}/{}; Compact (scroll/move/keyboard/focus): {}/{}/{}/{}",
+            self.batches,
+            timeout,
+            shutdown,
+            self.raw.keyboard,
+            self.raw.mouse,
+            self.raw.focus,
+            self.compact.scroll,
+            self.compact.mouse_traj,
+            self.compact.keyboard,
+            self.compact.focus,
+        );
+        self.batches = 0;
+        self.raw = RawEventStats::default();
+        self.compact = CompactEventStats::default();
+        self.by_reason.clear();
     }
 }
