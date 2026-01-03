@@ -34,6 +34,7 @@ use tokio::runtime;
 use tonic::transport::Endpoint;
 
 use tower::service_fn;
+use uuid::Uuid;
 
 #[path = "kronictl/log_cli.rs"]
 mod log_cli;
@@ -110,9 +111,15 @@ struct Cli {
 #[derive(Subcommand)]
 // TODO: add journalctl like functionality.
 enum Commands {
-    Start,
+    Start {
+        #[arg(long, value_name = "UUID")]
+        run: Option<String>,
+    },
     Stop,
-    Restart,
+    Restart {
+        #[arg(long, value_name = "UUID")]
+        run: Option<String>,
+    },
     Status,
     Snapshot {
         #[arg(long)]
@@ -186,7 +193,32 @@ fn is_process_running(pid: u32) -> bool {
     system.process(Pid::from(pid as usize)).is_some()
 }
 
-fn spawn_kronid() -> Result<()> {
+fn parse_run_id(run_id: Option<String>) -> Result<Option<String>> {
+    match run_id {
+        Some(id) => Uuid::parse_str(&id)
+            .map(|uuid| Some(uuid.to_string()))
+            .with_context(|| format!("invalid --run UUID '{id}'")),
+        None => Ok(None),
+    }
+}
+
+fn load_previous_run_id(workspace_dir: &PathBuf) -> Result<Option<String>> {
+    let run_id_path = kronical::util::paths::run_id_file(workspace_dir);
+    if !run_id_path.exists() {
+        return Ok(None);
+    }
+    let raw = std::fs::read_to_string(&run_id_path)
+        .with_context(|| format!("reading run id file {}", run_id_path.display()))?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    Uuid::parse_str(trimmed)
+        .map(|uuid| Some(uuid.to_string()))
+        .with_context(|| format!("invalid run id in {}", run_id_path.display()))
+}
+
+fn spawn_kronid(run_id: Option<&str>) -> Result<()> {
     let exe_dir = std::env::current_exe()
         .ok()
         .and_then(|p| p.parent().map(|p| p.to_path_buf()));
@@ -195,7 +227,11 @@ fn spawn_kronid() -> Result<()> {
     } else {
         PathBuf::from("kronid")
     };
-    Command::new(cmd)
+    let mut command = Command::new(cmd);
+    if let Some(id) = run_id {
+        command.arg("--run").arg(id);
+    }
+    command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())
@@ -232,7 +268,11 @@ fn stop_daemon(data_file: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn start_daemon(data_file: PathBuf, _app_config: AppConfig) -> Result<()> {
+fn start_daemon(
+    data_file: PathBuf,
+    _app_config: AppConfig,
+    run_id: Option<String>,
+) -> Result<()> {
     let pid_file = kronical::util::paths::pid_file(data_file.parent().unwrap());
     if let Some(existing_pid) = read_pid_file(&pid_file)? {
         if is_process_running(existing_pid) {
@@ -245,14 +285,22 @@ fn start_daemon(data_file: PathBuf, _app_config: AppConfig) -> Result<()> {
         }
     }
     println!("Starting Kronical daemon in background...");
-    spawn_kronid()?;
+    spawn_kronid(run_id.as_deref())?;
     Ok(())
 }
 
-fn restart_daemon(data_file: PathBuf, app_config: AppConfig) -> Result<()> {
+fn restart_daemon(
+    data_file: PathBuf,
+    app_config: AppConfig,
+    run_id: Option<String>,
+) -> Result<()> {
     println!("Restarting Kronical daemon...");
     let _ = stop_daemon(data_file.clone());
-    start_daemon(data_file, app_config)
+    let run_id = match run_id {
+        Some(id) => Some(id),
+        None => load_previous_run_id(&app_config.workspace_dir)?,
+    };
+    start_daemon(data_file, app_config, run_id)
 }
 
 fn get_status(data_file: PathBuf) -> Result<()> {
@@ -798,9 +846,27 @@ fn main() {
     }
     let data_file = config.workspace_dir.join("data.db");
     let result = match cli.command {
-        Commands::Start => start_daemon(data_file, config.clone()),
+        Commands::Start { run } => {
+            let run_id = match parse_run_id(run) {
+                Ok(id) => id,
+                Err(e) => {
+                    error!("Invalid run id: {}", e);
+                    process::exit(1);
+                }
+            };
+            start_daemon(data_file, config.clone(), run_id)
+        }
         Commands::Stop => stop_daemon(data_file),
-        Commands::Restart => restart_daemon(data_file, config.clone()),
+        Commands::Restart { run } => {
+            let run_id = match parse_run_id(run) {
+                Ok(id) => id,
+                Err(e) => {
+                    error!("Invalid run id: {}", e);
+                    process::exit(1);
+                }
+            };
+            restart_daemon(data_file, config.clone(), run_id)
+        }
         Commands::Status => get_status(data_file),
         Commands::Snapshot { pretty } => snapshot_autoselect(
             &kronical::util::paths::http_uds(&config.workspace_dir),
@@ -1020,6 +1086,7 @@ fn map_pb_snapshot(
                 .and_then(|ts| chrono::DateTime::<Utc>::from_timestamp(ts.seconds, ts.nanos as u32))
                 .unwrap_or_else(Utc::now),
             by_signal: None,
+            run_id: None,
         });
     let counts = reply
         .counts

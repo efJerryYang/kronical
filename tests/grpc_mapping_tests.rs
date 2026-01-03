@@ -16,6 +16,7 @@ fn maps_aggregated_apps_in_grpc_snapshot_reply() {
             to: ActivityState::Active,
             at: now,
             by_signal: None,
+            run_id: None,
         }),
         transitions_recent: vec![],
         counts: Counts {

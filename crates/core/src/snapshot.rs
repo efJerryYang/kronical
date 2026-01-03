@@ -34,6 +34,8 @@ pub struct Transition {
     pub at: chrono::DateTime<chrono::Utc>,
     #[serde(default)]
     pub by_signal: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
@@ -69,6 +71,7 @@ impl Snapshot {
 
 pub struct SnapshotBus {
     seq: AtomicU64,
+    run_id: Option<String>,
     snapshot_tx: watch::Sender<Arc<Snapshot>>,
     snapshot_rx: watch::Receiver<Arc<Snapshot>>,
     health_tx: watch::Sender<VecDeque<String>>,
@@ -84,6 +87,7 @@ impl SnapshotBus {
         let (transitions_tx, transitions_rx) = watch::channel(VecDeque::with_capacity(64));
         Self {
             seq: AtomicU64::new(0),
+            run_id: None,
             snapshot_tx,
             snapshot_rx,
             health_tx,
@@ -91,6 +95,16 @@ impl SnapshotBus {
             transitions_tx,
             transitions_rx,
         }
+    }
+
+    pub fn new_with_run_id(run_id: impl Into<String>) -> Self {
+        let mut bus = Self::new();
+        bus.run_id = Some(run_id.into());
+        bus
+    }
+
+    pub fn run_id(&self) -> Option<&str> {
+        self.run_id.as_deref()
     }
 
     pub fn publish_basic(
@@ -247,6 +261,7 @@ mod tests {
                 .with_ymd_and_hms(2024, 4, 22, 10, 1, seq as u32 % 60)
                 .unwrap(),
             by_signal: Some(format!("signal-{seq}")),
+            run_id: None,
         }
     }
 

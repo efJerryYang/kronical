@@ -203,6 +203,7 @@ fn apply_state_update_hint(
             to: *to,
             at: env.timestamp,
             by_signal: transition_reason(env, signal_kind),
+            run_id: None,
         };
         update.transition = Some(transition);
         update.state = Some(*to);
@@ -220,6 +221,7 @@ fn apply_state_update_signal(
             to: *to,
             at: env.timestamp,
             by_signal: transition_reason(env, Some(signal_kind)),
+            run_id: None,
         };
         update.transition = Some(transition);
         update.state = Some(*to);

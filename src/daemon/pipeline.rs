@@ -93,7 +93,8 @@ pub fn spawn_pipeline(
     } = resources;
 
     let initial_records = hydrate_recent_records(storage.as_mut(), retention_minutes);
-    let initial_transitions = hydrate_recent_transitions(storage.as_mut(), 32);
+    let initial_transitions =
+        hydrate_recent_transitions(storage.as_mut(), snapshot_bus.run_id(), 32);
 
     let (derive_tx, derive_rx) = channel::unbounded();
     let (hints_tx, hints_rx) = channel::unbounded();
@@ -208,9 +209,10 @@ fn hydrate_recent_records(
 
 fn hydrate_recent_transitions(
     storage: &mut dyn StorageBackend,
+    run_id: Option<&str>,
     limit: usize,
 ) -> Vec<snapshot::Transition> {
-    match storage.fetch_recent_transitions(limit) {
+    match storage.fetch_recent_transitions(run_id, limit) {
         Ok(transitions) => {
             if !transitions.is_empty() {
                 info!("Hydrated {} transitions from storage", transitions.len());

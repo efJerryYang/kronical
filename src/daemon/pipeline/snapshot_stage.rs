@@ -75,7 +75,8 @@ pub fn spawn_snapshot_stage(
         let mut storage_shutdown_sent = false;
 
         if !initial_transitions.is_empty() {
-            for transition in initial_transitions.drain(..) {
+            for mut transition in initial_transitions.drain(..) {
+                attach_run_id(snapshot_bus.as_ref(), &mut transition);
                 current_state = transition.to;
                 last_transition = Some(transition.clone());
                 snapshot_bus.push_transition(transition);
@@ -243,10 +244,17 @@ fn apply_update(
             }
         }
     }
-    if let Some(transition) = update.transition {
+    if let Some(mut transition) = update.transition {
+        attach_run_id(snapshot_bus.as_ref(), &mut transition);
         snapshot_bus.push_transition(transition.clone());
         *last_transition = Some(transition.clone());
         let _ = storage_tx.send(StorageCommand::Transition(transition));
+    }
+}
+
+fn attach_run_id(snapshot_bus: &snapshot::SnapshotBus, transition: &mut snapshot::Transition) {
+    if transition.run_id.is_none() {
+        transition.run_id = snapshot_bus.run_id().map(|id| id.to_string());
     }
 }
 
@@ -624,6 +632,7 @@ mod tests {
             to: ActivityState::Active,
             at: Utc::now(),
             by_signal: Some("KeyboardInput".into()),
+            run_id: None,
         });
         snapshot_tx.send(SnapshotMessage::Update(update)).unwrap();
 
