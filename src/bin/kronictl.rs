@@ -13,7 +13,7 @@ use kronical::kroni_api::kroni::v1::{
     SnapshotRequest, SystemMetricsRequest, WatchRequest, kroni_client::KroniClient,
 };
 use kronical::util::config::AppConfig;
-use log::error;
+use kronical::util::logging::error;
 use ratatui::{
     Terminal,
     prelude::{Backend, Constraint, CrosstermBackend, Direction, Layout},
@@ -316,6 +316,10 @@ fn get_status(data_file: PathBuf) -> Result<()> {
         Ok(snap) => {
             println!("Kronical Daemon:");
             println!("  State: {:?}", snap.activity_state);
+            println!(
+                "  Run: {}",
+                snap.run_id.as_deref().unwrap_or("-")
+            );
             if let Some(f) = snap.focus {
                 println!("  Focus: {} [{}] - {}", f.app_name, f.pid, f.window_title);
             }
@@ -470,6 +474,17 @@ fn run_monitor_loop<B: Backend>(terminal: &mut Terminal<B>, data_file: PathBuf) 
                                                 Style::default()
                                                     .fg(Color::Cyan)
                                                     .add_modifier(Modifier::BOLD),
+                                            ),
+                                        ]),
+                                        Line::from(vec![
+                                            Span::styled(
+                                                "Run: ",
+                                                Style::default().fg(Color::Gray),
+                                            ),
+                                            Span::raw(
+                                                snap.run_id
+                                                    .as_deref()
+                                                    .unwrap_or("-"),
                                             ),
                                         ]),
                                         Line::from(vec![
@@ -1193,6 +1208,7 @@ fn map_pb_snapshot(
     kronical::daemon::snapshot::Snapshot {
         seq: reply.seq,
         mono_ns: reply.mono_ns,
+        run_id: None,
         activity_state: state,
         focus,
         last_transition,
@@ -1266,6 +1282,7 @@ fn print_snapshot_pretty(s: &kronical::daemon::snapshot::Snapshot) {
     println!("Kronical Snapshot");
     println!("- seq: {}", s.seq);
     println!("- mono_ns: {}", s.mono_ns);
+    println!("- run_id: {}", s.run_id.as_deref().unwrap_or("-"));
     println!("- state: {:?}", s.activity_state);
     if let Some(f) = &s.focus {
         println!("- focus: {} [{}] - {}", f.app_name, f.pid, f.window_title);
@@ -1336,8 +1353,13 @@ fn print_snapshot_line(s: &kronical::daemon::snapshot::Snapshot) {
         .map(|f| f.window_title.as_str())
         .unwrap_or("-");
     println!(
-        "seq={} state={:?} focus={} cad={}ms backlog={}",
-        s.seq, s.activity_state, focus, s.cadence_ms, s.storage.backlog_count
+        "seq={} run={} state={:?} focus={} cad={}ms backlog={}",
+        s.seq,
+        s.run_id.as_deref().unwrap_or("-"),
+        s.activity_state,
+        focus,
+        s.cadence_ms,
+        s.storage.backlog_count
     );
 }
 

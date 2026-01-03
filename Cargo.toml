@@ -34,6 +34,7 @@ tracing-subscriber = { version = "0.3", features = [
     "env-filter",
     "json",
     "chrono",
+    "tracing-log",
 ] }
 tracing-appender = "0.2"
 anyhow = "1.0"

@@ -6,7 +6,7 @@ use crate::storage::StorageCommand;
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender};
 use kronical_core::compression::CompactEvent;
-use log::{debug, error, info};
+use crate::util::logging::{debug, error, info};
 use std::collections::HashSet;
 
 use super::types::CompressionCommand;

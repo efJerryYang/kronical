@@ -4,7 +4,7 @@ use crate::daemon::runtime::{ThreadHandle, ThreadRegistry};
 use crate::storage::StorageCommand;
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender};
-use log::{error, info};
+use crate::util::logging::{error, info};
 
 use super::types::SnapshotMessage;
 

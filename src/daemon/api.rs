@@ -1,6 +1,6 @@
 use crate::daemon::runtime::{ThreadHandle, ThreadRegistry};
 use anyhow::Result;
-use log::info;
+use crate::util::logging::{error, info};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
@@ -15,12 +15,12 @@ impl ApiHandles {
     pub fn join_all(self) {
         if let Some(handle) = self.grpc {
             if let Err(e) = handle.join() {
-                log::error!("gRPC server thread panicked: {:?}", e);
+                error!("gRPC server thread panicked: {:?}", e);
             }
         }
         if let Some(handle) = self.http {
             if let Err(e) = handle.join() {
-                log::error!("HTTP server thread panicked: {:?}", e);
+                error!("HTTP server thread panicked: {:?}", e);
             }
         }
     }

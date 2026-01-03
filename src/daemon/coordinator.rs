@@ -11,7 +11,7 @@ use crossbeam_channel::{Receiver, Sender};
 use kronical_input::mouse::{
     button_from_hook, event_kind_from_hook, wheel_axis_from_direction, wheel_scroll_type_from_raw,
 };
-use log::{debug, error, info, trace};
+use crate::util::logging::{debug, error, info, trace};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;

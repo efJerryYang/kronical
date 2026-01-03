@@ -8,7 +8,7 @@ use crate::storage::{StorageCommand, StorageMetrics};
 use anyhow::Result;
 use chrono::Utc;
 use crossbeam_channel::{Receiver, Sender};
-use log::info;
+use crate::util::logging::info;
 use std::collections::{HashMap as StdHashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};

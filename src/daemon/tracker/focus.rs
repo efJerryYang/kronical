@@ -5,7 +5,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use crossbeam_channel::{Receiver, Sender};
 use kronical_common::threading::{ThreadHandle, ThreadRegistry};
-use log::{debug, error, info, warn};
+use crate::util::logging::{debug, error, info, warn};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};

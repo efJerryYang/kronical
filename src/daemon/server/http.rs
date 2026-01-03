@@ -8,7 +8,7 @@ use futures_util::stream::Stream;
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
-use log::{debug, info, warn};
+use crate::util::logging::{debug, info, warn};
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;
