@@ -34,7 +34,6 @@ use tokio::runtime;
 use tonic::transport::Endpoint;
 
 use tower::service_fn;
-use uuid::Uuid;
 
 #[path = "kronictl/log_cli.rs"]
 mod log_cli;
@@ -195,9 +194,7 @@ fn is_process_running(pid: u32) -> bool {
 
 fn parse_run_id(run_id: Option<String>) -> Result<Option<String>> {
     match run_id {
-        Some(id) => Uuid::parse_str(&id)
-            .map(|uuid| Some(uuid.to_string()))
-            .with_context(|| format!("invalid --run UUID '{id}'")),
+        Some(id) => kronical::util::run_id::parse_run_id(&id).map(Some),
         None => Ok(None),
     }
 }
@@ -213,8 +210,8 @@ fn load_previous_run_id(workspace_dir: &PathBuf) -> Result<Option<String>> {
     if trimmed.is_empty() {
         return Ok(None);
     }
-    Uuid::parse_str(trimmed)
-        .map(|uuid| Some(uuid.to_string()))
+    kronical::util::run_id::parse_run_id(trimmed)
+        .map(Some)
         .with_context(|| format!("invalid run id in {}", run_id_path.display()))
 }
 

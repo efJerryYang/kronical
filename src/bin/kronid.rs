@@ -307,10 +307,8 @@ impl Drop for PidFileGuard {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     let run_id = match cli.run {
-        Some(id) => Uuid::parse_str(&id)
-            .map(|uuid| uuid.to_string())
-            .with_context(|| format!("invalid --run UUID '{id}'"))?,
-        None => Uuid::new_v4().to_string(),
+        Some(id) => kronical::util::run_id::parse_run_id(&id)?,
+        None => kronical::util::run_id::encode_uuid(Uuid::new_v4()),
     };
     kronical::util::logging::set_run_id(run_id.clone());
     let config = load_app_config()?;
