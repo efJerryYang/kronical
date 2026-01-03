@@ -188,6 +188,10 @@ fn run_focus_worker(
     let mut poll_lock_active = false;
     let mut coalesce_until: Option<Instant> = None;
     let mut pending_window_title: Option<String> = None;
+    let mut last_app_window: LruCache<String, (String, u32)> =
+        LruCache::with_capacity(caps.title_cache_capacity);
+    let mut last_app_before_change: Option<String> = None;
+    let mut awaiting_poll_reconcile = false;
     let coalesce_ms = caps.focus_window_coalesce_ms;
     let allow_zero_window_id = caps.focus_allow_zero_window_id;
     let can_emit = |state: &FocusState| {
@@ -244,6 +248,49 @@ fn run_focus_worker(
         });
     };
 
+    let record_last_app_window =
+        |state: &FocusState, cache: &mut LruCache<String, (String, u32)>| {
+            if !state.app_name.is_empty() && !state.window_title.is_empty() {
+                cache.put(
+                    state.app_name.clone(),
+                    (state.window_title.clone(), state.window_id),
+                );
+            }
+        };
+
+    let reconcile_window_title = |app_name: &String,
+                                  pending: &str,
+                                  cache: &mut LruCache<String, (String, u32)>,
+                                  last_app: Option<&String>|
+     -> Option<String> {
+        if let Some((cached_title, _cached_id)) = cache.get_cloned(app_name) {
+            if cached_title == pending {
+                return Some(pending.to_string());
+            }
+            if let Some(prev_app) = last_app {
+                if let Some((prev_title, _)) = cache.get_cloned(prev_app) {
+                    if prev_title == pending {
+                        warn!(
+                            "Focus worker: reconciling window title for app {} using cached '{}' (pending='{}')",
+                            app_name, cached_title, pending
+                        );
+                        return Some(cached_title);
+                    }
+                }
+            }
+            warn!(
+                "Focus worker: dropping suspect window title '{}' for app {} (cached='{}')",
+                pending, app_name, cached_title
+            );
+            return Some(cached_title);
+        }
+        warn!(
+            "Focus worker: dropping suspect window title '{}' for app {} (no history)",
+            pending, app_name
+        );
+        None
+    };
+
     loop {
         if should_stop.load(Ordering::Relaxed) {
             break;
@@ -261,11 +308,23 @@ fn run_focus_worker(
                     if state.app_name == app_name && state.pid == pid {
                         debug!("Focus worker: duplicate app change ignored");
                     } else {
+                        if !state.app_name.is_empty() {
+                            last_app_before_change = Some(state.app_name.clone());
+                        } else {
+                            last_app_before_change = None;
+                        }
                         if coalesce_until.is_some() {
                             let pending_title = pending_window_title.take();
                             if pending_title.is_some() || !state.window_title.is_empty() {
                                 if let Some(title) = pending_title {
-                                    state.window_title = title;
+                                    if let Some(reconciled) = reconcile_window_title(
+                                        &state.app_name,
+                                        &title,
+                                        &mut last_app_window,
+                                        last_app_before_change.as_ref(),
+                                    ) {
+                                        state.window_title = reconciled;
+                                    }
                                 }
                                 if state.app_name.eq_ignore_ascii_case(LOGINWINDOW_APP)
                                     && state.window_id == 0
@@ -280,6 +339,7 @@ fn run_focus_worker(
                                         focus_info.app_name, focus_info.window_title
                                     );
                                     callback.on_focus_change(focus_info);
+                                    record_last_app_window(&state, &mut last_app_window);
                                 }
                             }
                         }
@@ -307,6 +367,7 @@ fn run_focus_worker(
                         }
                         state.window_instance_start = Utc::now();
                         state.last_app_update = Instant::now();
+                        awaiting_poll_reconcile = true;
                         // Defer emission to allow window info to arrive
                         if is_login {
                             schedule_emit(&mut scheduled_emit_at, 50);
@@ -327,7 +388,14 @@ fn run_focus_worker(
                                 continue;
                             }
                         }
-                        state.window_title = window_title;
+                        if let Some(reconciled) = reconcile_window_title(
+                            &state.app_name,
+                            &window_title,
+                            &mut last_app_window,
+                            last_app_before_change.as_ref(),
+                        ) {
+                            state.window_title = reconciled;
+                        }
                         if state.app_name.eq_ignore_ascii_case(LOGINWINDOW_APP)
                             && state.window_id == 0
                         {
@@ -368,6 +436,7 @@ fn run_focus_worker(
                     state.window_instance_start = Utc::now();
                     state.last_app_update = Instant::now();
                     state.last_window_update = state.last_app_update;
+                    awaiting_poll_reconcile = false;
                     if state.is_complete() {
                         schedule_emit(&mut scheduled_emit_at, 0);
                     }
@@ -395,6 +464,7 @@ fn run_focus_worker(
                         info.window_id
                     };
                     state.last_window_update = Instant::now();
+                    awaiting_poll_reconcile = false;
                     if state.is_complete() {
                         schedule_emit(&mut scheduled_emit_at, 0);
                     }
@@ -421,6 +491,27 @@ fn run_focus_worker(
                             state.window_instance_start = Utc::now();
                             state.last_app_update = Instant::now();
                             state.last_window_update = state.last_app_update;
+                            awaiting_poll_reconcile = false;
+                            schedule_emit(&mut scheduled_emit_at, 0);
+                        }
+                        if awaiting_poll_reconcile && state.app_name == info.app_name {
+                            state.pid = info.process_id;
+                            state.process_start_time = get_process_start_time(info.process_id);
+                            if state.process_start_time == 0 {
+                                state.process_start_time = Utc::now().timestamp_millis() as u64;
+                            }
+                            state.window_title = info.title.clone();
+                            state.window_id =
+                                if state.app_name.eq_ignore_ascii_case(LOGINWINDOW_APP)
+                                    && info.window_id == 0
+                                {
+                                    LOGINWINDOW_WINDOW_ID
+                                } else {
+                                    info.window_id
+                                };
+                            state.window_instance_start = Utc::now();
+                            state.last_window_update = Instant::now();
+                            awaiting_poll_reconcile = false;
                             schedule_emit(&mut scheduled_emit_at, 0);
                         }
                         let window_id = info.window_id;
@@ -469,12 +560,24 @@ fn run_focus_worker(
         if let Some(until) = coalesce_until {
             if Instant::now() >= until {
                 if let Some(title) = pending_window_title.take() {
-                    state.window_title = title;
-                    if state.app_name.eq_ignore_ascii_case(LOGINWINDOW_APP) && state.window_id == 0
-                    {
-                        state.window_id = LOGINWINDOW_WINDOW_ID;
+                    if let Some(reconciled) = reconcile_window_title(
+                        &state.app_name,
+                        &title,
+                        &mut last_app_window,
+                        last_app_before_change.as_ref(),
+                    ) {
+                        state.window_title = reconciled;
+                        if state.app_name.eq_ignore_ascii_case(LOGINWINDOW_APP)
+                            && state.window_id == 0
+                        {
+                            state.window_id = LOGINWINDOW_WINDOW_ID;
+                        }
+                        state.last_window_update = Instant::now();
+                        awaiting_poll_reconcile = true;
+                    } else {
+                        state.window_title.clear();
+                        awaiting_poll_reconcile = true;
                     }
-                    state.last_window_update = Instant::now();
                 }
                 coalesce_until = None;
                 if can_emit(&state) {
@@ -491,6 +594,7 @@ fn run_focus_worker(
                     focus_info.app_name, focus_info.window_title
                 );
                 callback.on_focus_change(focus_info);
+                record_last_app_window(&state, &mut last_app_window);
                 scheduled_emit_at = None;
             }
         }
