@@ -94,7 +94,8 @@ pub fn spawn_pipeline(
         snapshot_bus,
     } = resources;
 
-    let initial_records = hydrate_recent_records(storage.as_mut(), retention_minutes);
+    let initial_records =
+        hydrate_recent_records(storage.as_mut(), retention_minutes, snapshot_bus.run_id());
     let initial_transitions =
         hydrate_recent_transitions(storage.as_mut(), snapshot_bus.run_id(), 32);
 
@@ -110,9 +111,14 @@ pub fn spawn_pipeline(
         .context("spawn pipeline storage stage")?;
     handles.push(storage_handle);
 
-    let hints_handle =
-        spawn_hints_stage(&threads, hints_rx, storage_tx.clone(), snapshot_tx.clone())
-            .context("spawn pipeline hints stage")?;
+    let hints_handle = spawn_hints_stage(
+        &threads,
+        hints_rx,
+        storage_tx.clone(),
+        snapshot_tx.clone(),
+        snapshot_bus.run_id().map(|id| id.to_string()),
+    )
+    .context("spawn pipeline hints stage")?;
     handles.push(hints_handle);
 
     let compression_handle = spawn_compression_stage(
@@ -186,16 +192,18 @@ pub use types::{CompressionCommand, DeriveCommand, FlushReason, SnapshotMessage,
 fn hydrate_recent_records(
     storage: &mut dyn StorageBackend,
     retention_minutes: u64,
+    run_id: Option<&str>,
 ) -> Vec<ActivityRecord> {
     let retention = chrono::Duration::minutes(retention_minutes as i64);
     let since = Utc::now() - retention;
-    match storage.fetch_records_since(since) {
+    match storage.fetch_records_since(since, run_id) {
         Ok(records) => {
             if !records.is_empty() {
                 info!(
-                    "Hydrated {} records from storage (since {})",
+                    "Hydrated {} records from storage (since {}, run_id={})",
                     records.len(),
-                    since
+                    since,
+                    run_id.unwrap_or("-")
                 );
             }
             records

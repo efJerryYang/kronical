@@ -13,6 +13,7 @@ pub fn spawn_hints_stage(
     hints_rx: Receiver<EventEnvelope>,
     storage_tx: Sender<StorageCommand>,
     snapshot_tx: Sender<SnapshotMessage>,
+    run_id: Option<String>,
 ) -> Result<ThreadHandle> {
     let threads = threads.clone();
     threads.spawn("pipeline-hints", move || {
@@ -24,6 +25,8 @@ pub fn spawn_hints_stage(
                 error!("Failed to enqueue hint envelope for storage: {}", e);
             }
             if let Some(record) = record_builder.on_hint(&env) {
+                let mut record = record;
+                record.run_id = run_id.clone();
                 info!("Record finalized: {}", record_summary(&record));
                 if let Err(e) = storage_tx.send(StorageCommand::Record(record.clone())) {
                     error!("Failed to enqueue activity record: {}", e);
@@ -33,6 +36,8 @@ pub fn spawn_hints_stage(
         }
 
         if let Some(final_record) = record_builder.finalize_all() {
+            let mut final_record = final_record;
+            final_record.run_id = run_id.clone();
             info!("Final record finalized: {}", record_summary(&final_record));
             if let Err(e) = storage_tx.send(StorageCommand::Record(final_record.clone())) {
                 error!("Failed to enqueue final activity record: {}", e);

@@ -645,6 +645,7 @@ mod tests {
 
         let record = ActivityRecord {
             record_id: 1,
+            run_id: None,
             start_time: Utc::now(),
             end_time: Some(Utc::now()),
             state: ActivityState::Active,

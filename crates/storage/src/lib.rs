@@ -16,7 +16,11 @@ pub trait StorageBackend: Send + Sync {
     fn add_envelopes(&mut self, events: Vec<EventEnvelope>) -> Result<()>;
     fn add_records(&mut self, records: Vec<ActivityRecord>) -> Result<()>;
     fn add_transitions(&mut self, transitions: Vec<snapshot::Transition>) -> Result<()>;
-    fn fetch_records_since(&mut self, since: DateTime<Utc>) -> Result<Vec<ActivityRecord>>;
+    fn fetch_records_since(
+        &mut self,
+        since: DateTime<Utc>,
+        run_id: Option<&str>,
+    ) -> Result<Vec<ActivityRecord>>;
     fn fetch_envelopes_between(
         &mut self,
         since: DateTime<Utc>,
@@ -222,6 +226,7 @@ mod tests {
 
         let record = ActivityRecord {
             record_id: 5,
+            run_id: None,
             start_time: base_ts,
             end_time: Some(base_ts + Duration::seconds(5)),
             state: ActivityState::Active,
@@ -403,7 +408,7 @@ mod tests {
 
             let since = sample.base_ts - Duration::seconds(10);
             let records = reader
-                .fetch_records_since(since)
+                .fetch_records_since(since, None)
                 .expect("record fetch succeeds");
             assert_eq!(records.len(), 1);
             let fetched = &records[0];
@@ -504,7 +509,7 @@ mod tests {
 
             let since = sample.base_ts - Duration::seconds(10);
             let records = reader
-                .fetch_records_since(since)
+                .fetch_records_since(since, None)
                 .expect("record fetch succeeds");
             assert_eq!(records.len(), 1);
             let fetched = &records[0];
@@ -792,7 +797,7 @@ mod tests {
         )
         .expect("duckdb reader");
         let records = reader
-            .fetch_records_since(sample.base_ts - Duration::seconds(5))
+            .fetch_records_since(sample.base_ts - Duration::seconds(5), None)
             .expect("fetch records");
         assert_eq!(records.len(), 1);
         let record = &records[0];
@@ -960,7 +965,7 @@ mod tests {
         )
         .expect("sqlite reader");
         let records = reader
-            .fetch_records_since(sample.base_ts - Duration::seconds(1))
+            .fetch_records_since(sample.base_ts - Duration::seconds(1), None)
             .expect("fetch records");
         assert_eq!(records.len(), 1);
         assert_eq!(records[0].state, ActivityState::Inactive);
