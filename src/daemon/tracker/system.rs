@@ -1,4 +1,5 @@
 use crate::daemon::runtime::{ThreadHandle, ThreadRegistry};
+use crate::util::logging::{debug, error, info, warn};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use crossbeam_channel::{Sender, TryRecvError};
@@ -6,7 +7,6 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 use tokio::sync::{mpsc as tokio_mpsc, oneshot};
-use crate::util::logging::{debug, error, info, warn};
 
 pub use kronical_storage::system_metrics::{
     DuckDbSystemMetricsStore, SqliteSystemMetricsStore, SystemMetrics, SystemMetricsStore,

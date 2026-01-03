@@ -1,5 +1,6 @@
 use crate::daemon::runtime::{ThreadHandle, ThreadRegistry};
 use crate::daemon::snapshot;
+use crate::util::logging::{debug, info, warn};
 use anyhow::{Context, Result};
 use axum::extract::State;
 use axum::response::sse::{Event, Sse};
@@ -8,7 +9,6 @@ use futures_util::stream::Stream;
 use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
-use crate::util::logging::{debug, info, warn};
 use std::convert::Infallible;
 use std::path::PathBuf;
 use std::sync::Arc;

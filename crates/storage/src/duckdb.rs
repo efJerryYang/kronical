@@ -150,7 +150,6 @@ impl DuckDbStorage {
             );
             CREATE INDEX IF NOT EXISTS idx_compact_events_start_time ON compact_events(start_time);
             CREATE INDEX IF NOT EXISTS idx_activity_records_start_time ON activity_records(start_time);
-            
             CREATE TABLE IF NOT EXISTS recent_transitions (
                 at TIMESTAMPTZ NOT NULL,
                 from_state TEXT NOT NULL,
@@ -161,10 +160,7 @@ impl DuckDbStorage {
             CREATE INDEX IF NOT EXISTS idx_recent_transitions_at ON recent_transitions(at);
             ",
         )?;
-        let _ = conn.execute(
-            "ALTER TABLE recent_transitions ADD COLUMN run_id TEXT",
-            [],
-        );
+        let _ = conn.execute("ALTER TABLE recent_transitions ADD COLUMN run_id TEXT", []);
         Ok(())
     }
 

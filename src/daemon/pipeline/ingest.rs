@@ -1,10 +1,10 @@
 use crate::daemon::coordinator::KronicalEvent;
 use crate::daemon::events::{KeyboardEventData, MouseEventData, MousePosition, RawEvent};
 use crate::daemon::runtime::{ThreadHandle, ThreadRegistry};
+use crate::util::logging::{debug, error, info, trace};
 use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use crossbeam_channel::{Receiver, Sender};
-use crate::util::logging::{debug, error, info, trace};
 use std::time::{Duration, Instant};
 
 use super::types::{DeriveCommand, FlushReason, RawBatch};

@@ -1,8 +1,8 @@
 use crate::daemon::runtime::{ThreadHandle, ThreadRegistry};
 use crate::storage::{StorageBackend, StorageCommand};
+use crate::util::logging::{error, info};
 use anyhow::Result;
 use crossbeam_channel::Receiver;
-use crate::util::logging::{error, info};
 
 pub fn spawn_storage_stage(
     threads: &ThreadRegistry,

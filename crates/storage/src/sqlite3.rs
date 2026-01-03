@@ -119,10 +119,7 @@ impl SqliteStorage {
             );
             CREATE INDEX IF NOT EXISTS idx_recent_transitions_at ON recent_transitions(at);"
         )?;
-        let _ = conn.execute(
-            "ALTER TABLE recent_transitions ADD COLUMN run_id TEXT",
-            [],
-        );
+        let _ = conn.execute("ALTER TABLE recent_transitions ADD COLUMN run_id TEXT", []);
         Ok(())
     }
 

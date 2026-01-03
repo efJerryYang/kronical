@@ -5,10 +5,10 @@ use crate::daemon::records::{
 use crate::daemon::runtime::{ThreadHandle, ThreadRegistry};
 use crate::daemon::snapshot;
 use crate::storage::{StorageCommand, StorageMetrics};
+use crate::util::logging::info;
 use anyhow::Result;
 use chrono::Utc;
 use crossbeam_channel::{Receiver, Sender};
-use crate::util::logging::info;
 use std::collections::{HashMap as StdHashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -251,10 +251,7 @@ fn apply_update(
             transition.from,
             transition.to,
             transition.at,
-            transition
-                .by_signal
-                .as_deref()
-                .unwrap_or("Unknown")
+            transition.by_signal.as_deref().unwrap_or("Unknown")
         );
         snapshot_bus.push_transition(transition.clone());
         *last_transition = Some(transition.clone());

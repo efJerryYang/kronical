@@ -1,6 +1,6 @@
 use crate::daemon::runtime::{ThreadHandle, ThreadRegistry};
-use anyhow::Result;
 use crate::util::logging::{error, info};
+use anyhow::Result;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::sync::mpsc;
