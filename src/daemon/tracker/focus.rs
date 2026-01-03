@@ -22,6 +22,7 @@ pub struct FocusCacheCaps {
     pub pid_cache_capacity: usize,
     pub title_cache_capacity: usize,
     pub title_cache_ttl_secs: u64,
+    pub focus_window_coalesce_ms: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -184,6 +185,9 @@ fn run_focus_worker(
     };
     let mut interner = StringInterner::new();
     let mut poll_lock_active = false;
+    let mut coalesce_until: Option<Instant> = None;
+    let mut pending_window_title: Option<String> = None;
+    let coalesce_ms = caps.focus_window_coalesce_ms;
 
     // Optional delayed emit scheduling
     let mut scheduled_emit_at: Option<Instant> = None;
@@ -252,8 +256,17 @@ fn run_focus_worker(
                         if !is_login {
                             poll_lock_active = false;
                         }
+                        if coalesce_ms > 0 {
+                            coalesce_until =
+                                Some(Instant::now() + Duration::from_millis(coalesce_ms));
+                        } else {
+                            coalesce_until = None;
+                        }
+                        pending_window_title = None;
                         state.app_name = app_name;
                         state.pid = pid;
+                        state.window_title.clear();
+                        state.window_id = 0;
                         state.process_start_time = get_process_start_time(pid);
                         if state.process_start_time == 0 {
                             state.process_start_time = Utc::now().timestamp_millis() as u64;
@@ -277,6 +290,12 @@ fn run_focus_worker(
                     } else if state.window_title == window_title {
                         debug!("Focus worker: duplicate window change ignored");
                     } else {
+                        if let Some(until) = coalesce_until {
+                            if Instant::now() < until {
+                                pending_window_title = Some(window_title);
+                                continue;
+                            }
+                        }
                         state.window_title = window_title;
                         if state.app_name.eq_ignore_ascii_case(LOGINWINDOW_APP)
                             && state.window_id == 0
@@ -296,6 +315,8 @@ fn run_focus_worker(
                     }
                 }
                 FocusMsg::AppChangeInfo(info) => {
+                    coalesce_until = None;
+                    pending_window_title = None;
                     state.app_name = info.app_name.clone();
                     if !state.app_name.eq_ignore_ascii_case(LOGINWINDOW_APP) {
                         poll_lock_active = false;
@@ -321,6 +342,8 @@ fn run_focus_worker(
                     }
                 }
                 FocusMsg::WindowChangeInfo(info) => {
+                    coalesce_until = None;
+                    pending_window_title = None;
                     if state.pid != info.process_id {
                         state.pid = info.process_id;
                         state.app_name = info.app_name.clone();
@@ -410,6 +433,23 @@ fn run_focus_worker(
                 }
             }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+        }
+
+        if let Some(until) = coalesce_until {
+            if Instant::now() >= until {
+                if let Some(title) = pending_window_title.take() {
+                    state.window_title = title;
+                    if state.app_name.eq_ignore_ascii_case(LOGINWINDOW_APP) && state.window_id == 0
+                    {
+                        state.window_id = LOGINWINDOW_WINDOW_ID;
+                    }
+                    state.last_window_update = Instant::now();
+                }
+                coalesce_until = None;
+                if state.is_complete() {
+                    schedule_emit(&mut scheduled_emit_at, 0);
+                }
+            }
         }
 
         if let Some(when) = scheduled_emit_at {

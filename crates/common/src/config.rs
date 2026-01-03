@@ -29,6 +29,7 @@ pub struct AppConfig {
     pub title_cache_capacity: usize,
     pub title_cache_ttl_secs: u64,
     pub focus_interner_max_strings: usize,
+    pub focus_window_coalesce_ms: u64,
     pub tracker_enabled: bool,
     pub tracker_interval_secs: f64,
     pub tracker_batch_size: usize,
@@ -63,6 +64,7 @@ impl Default for AppConfig {
             title_cache_capacity: 512,
             title_cache_ttl_secs: 0,
             focus_interner_max_strings: 4096,
+            focus_window_coalesce_ms: 100,
             tracker_enabled: false,
             tracker_interval_secs: 1.0,
             tracker_batch_size: 60,
@@ -95,6 +97,7 @@ impl AppConfig {
             .set_default("title_cache_capacity", 512)?
             .set_default("title_cache_ttl_secs", 0)?
             .set_default("focus_interner_max_strings", 4096)?
+            .set_default("focus_window_coalesce_ms", 100)?
             .set_default("tracker_enabled", false)?
             .set_default("tracker_interval_secs", 1.0)?
             .set_default("tracker_batch_size", 60)?
