@@ -239,16 +239,23 @@ fn spawn_kronid(run_id: Option<&str>) -> Result<()> {
 
 fn stop_daemon(data_file: PathBuf) -> Result<()> {
     let pid_file = kronical::util::paths::pid_file(data_file.parent().unwrap());
+    let run_id = load_previous_run_id(&data_file.parent().unwrap().to_path_buf())
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "null".to_string());
     if let Some(pid) = read_pid_file(&pid_file)? {
         if is_process_running(pid) {
-            println!("Stopping Kronical daemon (PID: {})...", pid);
+            println!(
+                "Stopping Kronical daemon (PID: {}, run_id: {})...",
+                pid, run_id
+            );
             #[cfg(unix)]
             unsafe {
                 libc::kill(pid as i32, libc::SIGTERM);
             }
             std::thread::sleep(Duration::from_millis(500));
             if !is_process_running(pid) {
-                println!("Kronical daemon stopped successfully");
+                println!("Kronical daemon stopped successfully (run_id: {})", run_id);
                 let _ = std::fs::remove_file(&pid_file);
             } else {
                 println!(
@@ -265,11 +272,7 @@ fn stop_daemon(data_file: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn start_daemon(
-    data_file: PathBuf,
-    _app_config: AppConfig,
-    run_id: Option<String>,
-) -> Result<()> {
+fn start_daemon(data_file: PathBuf, _app_config: AppConfig, run_id: Option<String>) -> Result<()> {
     let pid_file = kronical::util::paths::pid_file(data_file.parent().unwrap());
     if let Some(existing_pid) = read_pid_file(&pid_file)? {
         if is_process_running(existing_pid) {
@@ -286,11 +289,7 @@ fn start_daemon(
     Ok(())
 }
 
-fn restart_daemon(
-    data_file: PathBuf,
-    app_config: AppConfig,
-    run_id: Option<String>,
-) -> Result<()> {
+fn restart_daemon(data_file: PathBuf, app_config: AppConfig, run_id: Option<String>) -> Result<()> {
     println!("Restarting Kronical daemon...");
     let _ = stop_daemon(data_file.clone());
     let run_id = match run_id {
@@ -313,10 +312,7 @@ fn get_status(data_file: PathBuf) -> Result<()> {
         Ok(snap) => {
             println!("Kronical Daemon:");
             println!("  State: {:?}", snap.activity_state);
-            println!(
-                "  Run: {}",
-                snap.run_id.as_deref().unwrap_or("-")
-            );
+            println!("  Run: {}", snap.run_id.as_deref().unwrap_or("-"));
             if let Some(f) = snap.focus {
                 println!("  Focus: {} [{}] - {}", f.app_name, f.pid, f.window_title);
             }
@@ -474,15 +470,8 @@ fn run_monitor_loop<B: Backend>(terminal: &mut Terminal<B>, data_file: PathBuf) 
                                             ),
                                         ]),
                                         Line::from(vec![
-                                            Span::styled(
-                                                "Run: ",
-                                                Style::default().fg(Color::Gray),
-                                            ),
-                                            Span::raw(
-                                                snap.run_id
-                                                    .as_deref()
-                                                    .unwrap_or("-"),
-                                            ),
+                                            Span::styled("Run: ", Style::default().fg(Color::Gray)),
+                                            Span::raw(snap.run_id.as_deref().unwrap_or("-")),
                                         ]),
                                         Line::from(vec![
                                             Span::styled(
