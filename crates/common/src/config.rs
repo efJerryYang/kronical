@@ -30,6 +30,7 @@ pub struct AppConfig {
     pub title_cache_ttl_secs: u64,
     pub focus_interner_max_strings: usize,
     pub focus_window_coalesce_ms: u64,
+    pub focus_allow_zero_window_id: bool,
     pub tracker_enabled: bool,
     pub tracker_interval_secs: f64,
     pub tracker_batch_size: usize,
@@ -65,6 +66,7 @@ impl Default for AppConfig {
             title_cache_ttl_secs: 0,
             focus_interner_max_strings: 4096,
             focus_window_coalesce_ms: 100,
+            focus_allow_zero_window_id: true,
             tracker_enabled: false,
             tracker_interval_secs: 1.0,
             tracker_batch_size: 60,
@@ -98,6 +100,7 @@ impl AppConfig {
             .set_default("title_cache_ttl_secs", 0)?
             .set_default("focus_interner_max_strings", 4096)?
             .set_default("focus_window_coalesce_ms", 100)?
+            .set_default("focus_allow_zero_window_id", true)?
             .set_default("tracker_enabled", false)?
             .set_default("tracker_interval_secs", 1.0)?
             .set_default("tracker_batch_size", 60)?
@@ -157,6 +160,8 @@ mod tests {
             assert_eq!(cfg.idle_threshold_secs, 300);
             assert_eq!(cfg.ephemeral_min_distinct_ids, 3);
             assert_eq!(cfg.max_windows_per_app, 30);
+            assert_eq!(cfg.focus_window_coalesce_ms, 100);
+            assert!(cfg.focus_allow_zero_window_id);
             assert!(!cfg.tracker_enabled);
             assert_eq!(cfg.tracker_batch_size, 60);
             assert_eq!(cfg.duckdb_memory_limit_mb_main, 10);

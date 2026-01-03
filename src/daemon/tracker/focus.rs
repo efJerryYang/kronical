@@ -23,6 +23,7 @@ pub struct FocusCacheCaps {
     pub title_cache_capacity: usize,
     pub title_cache_ttl_secs: u64,
     pub focus_window_coalesce_ms: u64,
+    pub focus_allow_zero_window_id: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -188,6 +189,14 @@ fn run_focus_worker(
     let mut coalesce_until: Option<Instant> = None;
     let mut pending_window_title: Option<String> = None;
     let coalesce_ms = caps.focus_window_coalesce_ms;
+    let allow_zero_window_id = caps.focus_allow_zero_window_id;
+    let can_emit = |state: &FocusState| {
+        !state.app_name.is_empty()
+            && !state.window_title.is_empty()
+            && state.pid > 0
+            && state.process_start_time > 0
+            && (allow_zero_window_id || state.window_id > 0)
+    };
 
     // Optional delayed emit scheduling
     let mut scheduled_emit_at: Option<Instant> = None;
@@ -252,6 +261,28 @@ fn run_focus_worker(
                     if state.app_name == app_name && state.pid == pid {
                         debug!("Focus worker: duplicate app change ignored");
                     } else {
+                        if coalesce_until.is_some() {
+                            let pending_title = pending_window_title.take();
+                            if pending_title.is_some() || !state.window_title.is_empty() {
+                                if let Some(title) = pending_title {
+                                    state.window_title = title;
+                                }
+                                if state.app_name.eq_ignore_ascii_case(LOGINWINDOW_APP)
+                                    && state.window_id == 0
+                                {
+                                    state.window_id = LOGINWINDOW_WINDOW_ID;
+                                }
+                                state.last_window_update = Instant::now();
+                                if can_emit(&state) {
+                                    let focus_info = state.to_window_focus_info(&mut interner);
+                                    info!(
+                                        "Focus worker: Emitting consolidated focus change: {} -> {}",
+                                        focus_info.app_name, focus_info.window_title
+                                    );
+                                    callback.on_focus_change(focus_info);
+                                }
+                            }
+                        }
                         let is_login = app_name.eq_ignore_ascii_case(LOGINWINDOW_APP);
                         if !is_login {
                             poll_lock_active = false;
@@ -446,14 +477,14 @@ fn run_focus_worker(
                     state.last_window_update = Instant::now();
                 }
                 coalesce_until = None;
-                if state.is_complete() {
+                if can_emit(&state) {
                     schedule_emit(&mut scheduled_emit_at, 0);
                 }
             }
         }
 
         if let Some(when) = scheduled_emit_at {
-            if Instant::now() >= when && state.is_complete() {
+            if Instant::now() >= when && can_emit(&state) {
                 let focus_info = state.to_window_focus_info(&mut interner);
                 info!(
                     "Focus worker: Emitting consolidated focus change: {} -> {}",
