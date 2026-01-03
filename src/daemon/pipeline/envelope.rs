@@ -7,10 +7,10 @@ use crate::daemon::events::model::{
 use crate::daemon::runtime::{ThreadHandle, ThreadRegistry};
 use crate::daemon::snapshot;
 use crate::storage::StorageCommand;
+use crate::util::logging::{debug, error, info, trace};
 use anyhow::Result;
 use chrono::Utc;
 use crossbeam_channel::{Receiver, Sender};
-use crate::util::logging::{debug, error, info, trace};
 
 use super::types::{CompressionCommand, DeriveCommand, SnapshotMessage, SnapshotUpdate};
 

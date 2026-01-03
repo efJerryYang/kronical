@@ -6,12 +6,12 @@ use crate::daemon::runtime::ThreadRegistry;
 use crate::daemon::tracker::SystemTracker;
 use crate::daemon::tracker::{FocusCacheCaps, FocusChangeCallback, FocusEventWrapper};
 use crate::storage::StorageBackend;
+use crate::util::logging::{debug, error, info, trace};
 use anyhow::{Result, anyhow};
 use crossbeam_channel::{Receiver, Sender};
 use kronical_input::mouse::{
     button_from_hook, event_kind_from_hook, wheel_axis_from_direction, wheel_scroll_type_from_raw,
 };
-use crate::util::logging::{debug, error, info, trace};
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;

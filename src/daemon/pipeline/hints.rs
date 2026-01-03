@@ -2,9 +2,9 @@ use crate::daemon::events::model::EventEnvelope;
 use crate::daemon::records::{ActivityRecord, ActivityState, RecordBuilder};
 use crate::daemon::runtime::{ThreadHandle, ThreadRegistry};
 use crate::storage::StorageCommand;
+use crate::util::logging::{error, info};
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender};
-use crate::util::logging::{error, info};
 
 use super::types::SnapshotMessage;
 
@@ -24,10 +24,7 @@ pub fn spawn_hints_stage(
                 error!("Failed to enqueue hint envelope for storage: {}", e);
             }
             if let Some(record) = record_builder.on_hint(&env) {
-                info!(
-                    "Record finalized: {}",
-                    record_summary(&record)
-                );
+                info!("Record finalized: {}", record_summary(&record));
                 if let Err(e) = storage_tx.send(StorageCommand::Record(record.clone())) {
                     error!("Failed to enqueue activity record: {}", e);
                 }
@@ -36,10 +33,7 @@ pub fn spawn_hints_stage(
         }
 
         if let Some(final_record) = record_builder.finalize_all() {
-            info!(
-                "Final record finalized: {}",
-                record_summary(&final_record)
-            );
+            info!("Final record finalized: {}", record_summary(&final_record));
             if let Err(e) = storage_tx.send(StorageCommand::Record(final_record.clone())) {
                 error!("Failed to enqueue final activity record: {}", e);
             }
@@ -55,10 +49,7 @@ fn record_summary(record: &ActivityRecord) -> String {
     let focus = match &record.focus_info {
         Some(info) => format!(
             "app={} window={} pid={} wid={}",
-            info.app_name,
-            info.window_title,
-            info.pid,
-            info.window_id
+            info.app_name, info.window_title, info.pid, info.window_id
         ),
         None => "focus=none".to_string(),
     };

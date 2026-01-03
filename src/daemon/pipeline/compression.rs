@@ -3,10 +3,10 @@ use crate::daemon::events::RawEvent;
 use crate::daemon::events::model::{EventKind, SignalKind};
 use crate::daemon::runtime::{ThreadHandle, ThreadRegistry};
 use crate::storage::StorageCommand;
+use crate::util::logging::{debug, error, info};
 use anyhow::Result;
 use crossbeam_channel::{Receiver, Sender};
 use kronical_core::compression::CompactEvent;
-use crate::util::logging::{debug, error, info};
 use std::collections::HashSet;
 
 use super::types::CompressionCommand;
