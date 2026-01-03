@@ -2,7 +2,7 @@ use crate::daemon::coordinator::KronicalEvent;
 use crate::daemon::events::{KeyboardEventData, MouseEventData, MousePosition, RawEvent};
 use crate::daemon::runtime::{ThreadHandle, ThreadRegistry};
 use anyhow::{Result, anyhow};
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use crossbeam_channel::{Receiver, Sender};
 use crate::util::logging::{debug, error, info, trace};
 use std::time::{Duration, Instant};
@@ -19,6 +19,8 @@ pub fn spawn_ingest_stage(
         info!("Pipeline ingest thread started");
         let mut pending: Vec<RawEvent> = Vec::new();
         let mut event_count = 0u64;
+        let mut last_event_ms: u64 = 0;
+        let mut event_seq: u64 = 0;
         let ticker = crossbeam_channel::tick(Duration::from_millis(50));
         let idle_tick_interval = Duration::from_millis(500);
         let mut last_idle_tick = Instant::now();
@@ -42,7 +44,9 @@ pub fn spawn_ingest_stage(
                         Ok(event) => {
                             event_count += 1;
                             debug!("Ingest received event #{}: {:?}", event_count, event);
-                            match convert_kronid_to_raw(event) {
+                            let (now, event_id) =
+                                next_event_id(&mut last_event_ms, &mut event_seq);
+                            match convert_kronid_to_raw(event, now, event_id) {
                                 Ok(raw) => {
                                     trace!(
                                         "Queued raw event {} (pending {})",
@@ -90,10 +94,11 @@ pub fn spawn_ingest_stage(
 }
 
 #[cfg_attr(feature = "hotpath", hotpath::measure)]
-fn convert_kronid_to_raw(event: KronicalEvent) -> Result<RawEvent> {
-    let now = Utc::now();
-    let event_id = now.timestamp_millis() as u64;
-
+fn convert_kronid_to_raw(
+    event: KronicalEvent,
+    now: DateTime<Utc>,
+    event_id: u64,
+) -> Result<RawEvent> {
     match event {
         KronicalEvent::KeyboardInput => Ok(RawEvent::KeyboardInput {
             timestamp: now,
@@ -153,6 +158,36 @@ fn convert_kronid_to_raw(event: KronicalEvent) -> Result<RawEvent> {
         }),
         KronicalEvent::Shutdown => Err(anyhow!("Cannot convert Shutdown event to RawEvent")),
     }
+}
+
+const EVENT_ID_SEQ_BITS: u64 = 12;
+const EVENT_ID_SEQ_MASK: u64 = (1 << EVENT_ID_SEQ_BITS) - 1;
+
+fn next_event_id(last_event_ms: &mut u64, event_seq: &mut u64) -> (DateTime<Utc>, u64) {
+    let mut now = Utc::now();
+    let mut now_ms = now.timestamp_millis() as u64;
+
+    if now_ms == *last_event_ms {
+        if *event_seq >= EVENT_ID_SEQ_MASK {
+            loop {
+                now = Utc::now();
+                now_ms = now.timestamp_millis() as u64;
+                if now_ms != *last_event_ms {
+                    break;
+                }
+            }
+            *last_event_ms = now_ms;
+            *event_seq = 0;
+        } else {
+            *event_seq += 1;
+        }
+    } else {
+        *last_event_ms = now_ms;
+        *event_seq = 0;
+    }
+
+    let event_id = (now_ms << EVENT_ID_SEQ_BITS) | *event_seq;
+    (now, event_id)
 }
 
 #[cfg(test)]
