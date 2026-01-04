@@ -1387,6 +1387,37 @@ fn print_snapshot_pretty(s: &kronical::daemon::snapshot::Snapshot) {
             println!("    windows: -");
         }
     }
+    println!("- records ({}):", s.records.len());
+    for record in &s.records {
+        let end = record
+            .end_time
+            .map(|t| t.to_rfc3339())
+            .unwrap_or_else(|| "-".to_string());
+        let duration_s = record
+            .end_time
+            .map(|t| (t - record.start_time).num_seconds().max(0))
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let focus = record.focus_info.as_ref().map(|f| {
+            format!(
+                "{} [{}] - {} (wid={})",
+                f.app_name, f.pid, f.window_title, f.window_id
+            )
+        });
+        println!(
+            "  - id={} state={:?} start={} end={} dur={}s events={} triggers={}",
+            record.record_id,
+            record.state,
+            record.start_time.to_rfc3339(),
+            end,
+            duration_s,
+            record.event_count,
+            record.triggering_events.len()
+        );
+        if let Some(info) = focus {
+            println!("    focus: {}", info);
+        }
+    }
 }
 
 fn print_snapshot_line(s: &kronical::daemon::snapshot::Snapshot) {
