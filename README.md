@@ -62,6 +62,15 @@ Snapshot payloads include current state, focus, cadence, counts, `run_id`,
 recent transitions, aggregated app/window durations, and the full in-memory
 `records` list for the same run ID within the retention window.
 
+Snapshot/stream payload coverage:
+
+| Endpoint | Transport | Delivery | Payload | Notes |
+| --- | --- | --- | --- | --- |
+| `GET /v1/snapshot` | HTTP (UDS) | one-shot | JSON snapshot | Latest snapshot for the current run ID within retention. |
+| `GET /v1/stream` | HTTP SSE (UDS) | stream | JSON snapshot | Starts with the current snapshot, then emits updates. |
+| `Snapshot` | gRPC (UDS) | one-shot | `SnapshotReply` | Same snapshot data as HTTP. |
+| `Watch` | gRPC (UDS) | stream | `SnapshotReply` | Starts with the current snapshot, then emits updates. |
+
 ## State Machine
 
 The event pipeline produces a deterministic state machine:
