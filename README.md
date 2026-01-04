@@ -2,38 +2,16 @@
 
 Kronical is a local activity-tracking service. The daemon (`kronid`) observes
 system hooks, derives higher-level signals, and writes activity records that
-other clients (current CLI, future Kronii UI agent) can consume over HTTP/gRPC.
+clients can consume over HTTP/gRPC.
 
 This repository focuses on the service side: hook ingestion, signal-driven
-state machine, compression, and storage backends. The UI layer is being built
-separately and links to the public crates exposed here.
+state machine, compression, and storage backends. UI layers can build on the
+snapshot endpoints described below.
 
-## Architecture Snapshot
+## Architecture Notes
 
-- **Coordinator (`src/daemon/coordinator.rs`)** - runs on the macOS main thread
-  and owns global hook handlers. It converts raw inputs into `KronicalEvent`
-  messages and pushes them into the pipeline channels.
-- **Pipeline (`src/daemon/pipeline/`)** - staged workers linked with
-  `crossbeam_channel` queues: `ingest` batches hook output and emits ticks,
-  `envelope` adapts events into envelopes, `hints` drives record generation,
-  `compression` produces compact summaries, `snapshot_stage` publishes to the
-  bus, and `storage` drains persistence commands. The layout keeps the
-  signal-driven state machine deterministic without shared locks.
-- **Core crate (`crates/core/`)** - domain types and logic: event envelopes,
-  signal and hint derivation, record aggregation, compression, and the snapshot
-  bus.
-- **Common crate (`crates/common/`)** - shared helpers (config loader, path
-  utilities, LRU caches, string interning).
-- **Storage crate (`crates/storage/`)** - storage facade plus DuckDB and
-  SQLite writer threads that drain persistence commands and publish health
-  metrics via the snapshot bus.
-- **Binaries (`src/bin/`)** - `kronid` wires everything together; `kronictl`
-  offers CLI access for lifecycle and data inspection.
-
-When onboarding, start with the coordinator to understand how hooks are
-normalized. From there follow the channel hand-offs into `crates/core::events`
-for derivation, `crates/core::records` for aggregation, and the storage crate to
-see how data lands on disk.
+See `docs/arch.md` for the current pipeline topology, signal/hint derivation,
+and storage hydration details.
 
 ## Repository Layout
 
@@ -44,7 +22,7 @@ see how data lands on disk.
 - `src/daemon/` - runtime wiring: coordinator, pipeline, compressors, API
   surfaces, trackers.
 - `src/bin/` - service binaries (`kronid`, `kronictl`).
-- `docs/` - design notes (including Kronii orchestration TODOs).
+- `docs/` - architecture notes and design documents.
 
 ## Getting Started
 
@@ -67,19 +45,41 @@ return empty focus data.
 - `kronictl tracker show [--watch]` - inspect system-tracker metrics when the
   tracker is enabled in config.
 
-## State Machine & Signals
+## Snapshot Endpoints
 
-The event pipeline produces a deterministic state machine driven by signals:
+HTTP (Unix socket):
+
+- `GET /v1/snapshot` -> JSON snapshot
+- `GET /v1/stream` -> SSE stream of snapshots
+
+gRPC (Unix socket):
+
+- `Snapshot` -> snapshot payload
+- `Watch` -> streaming snapshots
+- `GetSystemMetrics` -> system tracker metrics
+
+Snapshot payloads include current state, focus, cadence, counts, `run_id`,
+recent transitions, aggregated app/window durations, and the full in-memory
+`records` list for the same run ID within the retention window.
+
+## State Machine
+
+The event pipeline produces a deterministic state machine:
 
 - States: `Active`, `Passive`, `Inactive`, `Locked`.
-- Signals: keyboard/mouse input, focus/title changes, lock/unlock, periodic
-  pulses.
 - Transitions respect `active_grace_secs` (default 30s) and
-  `idle_threshold_secs` (default 300s) to move between states. While the system
-  is locked we keep emitting lock/unlock signals but suppress raw input writes.
+  `idle_threshold_secs` (default 300s).
+- While locked, we emit lock/unlock signals and suppress raw input persistence.
 
-Hints derived from signals (`FocusChanged`, `TitleChanged`, `StateChanged`,
-`ActivityPulse`, ...) drive record generation and downstream snapshots.
+State transition table:
+
+| From             | Trigger                         | Guard/Condition                    | To                      |
+|------------------|---------------------------------|------------------------------------|-------------------------|
+| Any              | LockStart                       | —                                  | Locked                  |
+| Locked           | LockEnd                         | Determine post-unlock state        | Active/Passive/Inactive |
+| Inactive/Passive | Keyboard/Mouse/App/Window/Pulse | —                                  | Active                  |
+| Active           | Tick                            | no input for `active_grace_secs`   | Passive                 |
+| Passive          | Tick                            | no input for `idle_threshold_secs` | Inactive                |
 
 ## Configuration
 
@@ -132,6 +132,5 @@ the daemon.
 
 ## Support & Next Steps
 
-Active work targets the service pipeline and storage coverage. Kronii (the UI
-agent) will depend on the crates surfaced here once the API stabilises. Track
-ongoing refactor plans in `docs/todo`.
+Active work targets pipeline coverage, storage verification, and UI consumers
+of the snapshot endpoints. See `docs/arch.md` for internals.
