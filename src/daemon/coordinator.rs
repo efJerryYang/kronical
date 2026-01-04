@@ -89,11 +89,11 @@ impl Drop for CoordinatorShutdownGuard<'_> {
 #[derive(Clone)]
 pub struct KronicalEventHandler {
     sender: Sender<KronicalEvent>,
-    focus_wrapper: FocusEventWrapper,
+    focus_wrapper: Option<FocusEventWrapper>,
 }
 
 impl KronicalEventHandler {
-    fn new(
+    fn new_with_focus(
         sender: Sender<KronicalEvent>,
         caps: FocusCacheCaps,
         poll_handle: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -113,8 +113,15 @@ impl KronicalEventHandler {
 
         Ok(Self {
             sender,
-            focus_wrapper,
+            focus_wrapper: Some(focus_wrapper),
         })
+    }
+
+    fn new_input_only(sender: Sender<KronicalEvent>) -> Self {
+        Self {
+            sender,
+            focus_wrapper: None,
+        }
     }
 }
 
@@ -190,12 +197,16 @@ impl EventHandler for KronicalEventHandler {
 impl FocusChangeHandler for KronicalEventHandler {
     fn on_app_change(&self, pid: i32, app_name: String) {
         debug!("App changed: {} (PID: {})", app_name, pid);
-        self.focus_wrapper.handle_app_change(pid, app_name);
+        if let Some(focus_wrapper) = &self.focus_wrapper {
+            focus_wrapper.handle_app_change(pid, app_name);
+        }
     }
 
     fn on_window_change(&self, window_title: String) {
         debug!("Window changed: {}", window_title);
-        self.focus_wrapper.handle_window_change(window_title);
+        if let Some(focus_wrapper) = &self.focus_wrapper {
+            focus_wrapper.handle_window_change(window_title);
+        }
     }
 
     fn on_app_change_info(&self, info: ActiveWindowInfo) {
@@ -203,12 +214,16 @@ impl FocusChangeHandler for KronicalEventHandler {
             "App+Info: {} pid={} wid={}",
             info.app_name, info.process_id, info.window_id
         );
-        self.focus_wrapper.handle_app_change_info(info);
+        if let Some(focus_wrapper) = &self.focus_wrapper {
+            focus_wrapper.handle_app_change_info(info);
+        }
     }
 
     fn on_window_change_info(&self, info: ActiveWindowInfo) {
         debug!("Win+Info: '{}' wid={}", info.title, info.window_id);
-        self.focus_wrapper.handle_window_change_info(info);
+        if let Some(focus_wrapper) = &self.focus_wrapper {
+            focus_wrapper.handle_window_change_info(info);
+        }
     }
 }
 
@@ -225,6 +240,8 @@ pub struct EventCoordinator {
     title_cache_capacity: usize,
     title_cache_ttl_secs: u64,
     focus_interner_max_strings: usize,
+    focus_window_coalesce_ms: u64,
+    focus_allow_zero_window_id: bool,
     persist_raw_events: bool,
     tracker_enabled: bool,
     tracker_interval_secs: f64,
@@ -248,6 +265,8 @@ impl EventCoordinator {
         title_cache_capacity: usize,
         title_cache_ttl_secs: u64,
         focus_interner_max_strings: usize,
+        focus_window_coalesce_ms: u64,
+        focus_allow_zero_window_id: bool,
         persist_raw_events: bool,
         tracker_enabled: bool,
         tracker_interval_secs: f64,
@@ -278,6 +297,8 @@ impl EventCoordinator {
             title_cache_capacity,
             title_cache_ttl_secs,
             focus_interner_max_strings,
+            focus_window_coalesce_ms,
+            focus_allow_zero_window_id,
             persist_raw_events,
             tracker_enabled,
             tracker_interval_secs,
@@ -301,6 +322,8 @@ impl EventCoordinator {
             config.title_cache_capacity,
             config.title_cache_ttl_secs,
             config.focus_interner_max_strings,
+            config.focus_window_coalesce_ms,
+            config.focus_allow_zero_window_id,
             config.persist_raw_events,
             config.tracker_enabled,
             config.tracker_interval_secs,
@@ -416,22 +439,9 @@ impl EventCoordinator {
         Ok(pipeline_handles)
     }
 
-    pub fn run_uiohook(
-        &self,
-        sender: Sender<KronicalEvent>,
-        poll_handle: Arc<AtomicU64>,
-    ) -> Result<Uiohook> {
+    pub fn run_uiohook(&self, sender: Sender<KronicalEvent>) -> Result<Uiohook> {
         info!("Setting up UIohook on main thread");
-        let handler = KronicalEventHandler::new(
-            sender,
-            FocusCacheCaps {
-                pid_cache_capacity: self.pid_cache_capacity,
-                title_cache_capacity: self.title_cache_capacity,
-                title_cache_ttl_secs: self.title_cache_ttl_secs,
-            },
-            Arc::clone(&poll_handle),
-            self.thread_registry(),
-        )?;
+        let handler = KronicalEventHandler::new_input_only(sender);
 
         let uiohook = Uiohook::new(handler);
         if let Err(e) = uiohook.run() {
@@ -448,12 +458,14 @@ impl EventCoordinator {
         poll_handle: Arc<AtomicU64>,
     ) -> Result<Arc<WindowFocusHook>> {
         info!("Setting up focus hook on main thread");
-        let handler = KronicalEventHandler::new(
+        let handler = KronicalEventHandler::new_with_focus(
             sender,
             FocusCacheCaps {
                 pid_cache_capacity: self.pid_cache_capacity,
                 title_cache_capacity: self.title_cache_capacity,
                 title_cache_ttl_secs: self.title_cache_ttl_secs,
+                focus_window_coalesce_ms: self.focus_window_coalesce_ms,
+                focus_allow_zero_window_id: self.focus_allow_zero_window_id,
             },
             Arc::clone(&poll_handle),
             self.thread_registry(),
@@ -534,7 +546,7 @@ impl EventCoordinator {
         let focus_hook = self.build_focus_hook(sender.clone(), Arc::clone(&poll_handle_arc))?;
         shutdown_guard.focus_hook = Some(Arc::clone(&focus_hook));
         self.setup_shutdown_handler(sender.clone(), Some(Arc::clone(&focus_hook)))?;
-        let uiohook = self.run_uiohook(sender.clone(), Arc::clone(&poll_handle_arc))?;
+        let uiohook = self.run_uiohook(sender.clone())?;
         shutdown_guard.uiohook = Some(uiohook);
         self.run_focus_hook(Arc::clone(&focus_hook))?;
 

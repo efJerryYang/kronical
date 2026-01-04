@@ -22,6 +22,8 @@ pub struct FocusCacheCaps {
     pub pid_cache_capacity: usize,
     pub title_cache_capacity: usize,
     pub title_cache_ttl_secs: u64,
+    pub focus_window_coalesce_ms: u64,
+    pub focus_allow_zero_window_id: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -183,6 +185,23 @@ fn run_focus_worker(
         LruCache::with_capacity(caps.title_cache_capacity)
     };
     let mut interner = StringInterner::new();
+    let mut poll_lock_active = false;
+    let mut poll_lock_since: Option<Instant> = None;
+    let mut coalesce_until: Option<Instant> = None;
+    let mut pending_window_title: Option<String> = None;
+    let mut last_app_window: LruCache<String, (String, u32)> =
+        LruCache::with_capacity(caps.title_cache_capacity);
+    let mut last_app_before_change: Option<String> = None;
+    let mut awaiting_poll_reconcile = false;
+    let coalesce_ms = caps.focus_window_coalesce_ms;
+    let allow_zero_window_id = caps.focus_allow_zero_window_id;
+    let can_emit = |state: &FocusState| {
+        !state.app_name.is_empty()
+            && !state.window_title.is_empty()
+            && state.pid > 0
+            && state.process_start_time > 0
+            && (allow_zero_window_id || state.window_id > 0)
+    };
 
     // Optional delayed emit scheduling
     let mut scheduled_emit_at: Option<Instant> = None;
@@ -206,12 +225,70 @@ fn run_focus_worker(
         }
     };
 
+    let emit_loginwindow_focus = |interner: &mut StringInterner| {
+        let now = Utc::now();
+        let focus_info = WindowFocusInfo {
+            pid: 0,
+            process_start_time: now.timestamp_millis() as u64,
+            app_name: interner.intern(LOGINWINDOW_APP),
+            window_title: interner.intern("Login"),
+            window_id: LOGINWINDOW_WINDOW_ID,
+            window_instance_start: now,
+            window_position: None,
+            window_size: None,
+        };
+        callback.on_focus_change(focus_info);
+    };
+
     let schedule_emit = |target: &mut Option<Instant>, delay_ms: u64| {
         let when = Instant::now() + Duration::from_millis(delay_ms);
         *target = Some(match *target {
             Some(existing) if existing < when => when,
             _ => when,
         });
+    };
+
+    let record_last_app_window =
+        |state: &FocusState, cache: &mut LruCache<String, (String, u32)>| {
+            if !state.app_name.is_empty() && !state.window_title.is_empty() {
+                cache.put(
+                    state.app_name.clone(),
+                    (state.window_title.clone(), state.window_id),
+                );
+            }
+        };
+
+    let reconcile_window_title = |app_name: &String,
+                                  pending: &str,
+                                  cache: &mut LruCache<String, (String, u32)>,
+                                  last_app: Option<&String>|
+     -> Option<String> {
+        if let Some((cached_title, _cached_id)) = cache.get_cloned(app_name) {
+            if cached_title == pending {
+                return Some(pending.to_string());
+            }
+            if let Some(prev_app) = last_app {
+                if let Some((prev_title, _)) = cache.get_cloned(prev_app) {
+                    if prev_title == pending {
+                        warn!(
+                            "Focus worker: reconciling window title for app {} using cached '{}' (pending='{}')",
+                            app_name, cached_title, pending
+                        );
+                        return Some(cached_title);
+                    }
+                }
+            }
+            warn!(
+                "Focus worker: dropping suspect window title '{}' for app {} (cached='{}')",
+                pending, app_name, cached_title
+            );
+            return Some(cached_title);
+        }
+        warn!(
+            "Focus worker: dropping suspect window title '{}' for app {} (no history)",
+            pending, app_name
+        );
+        None
     };
 
     loop {
@@ -231,9 +308,57 @@ fn run_focus_worker(
                     if state.app_name == app_name && state.pid == pid {
                         debug!("Focus worker: duplicate app change ignored");
                     } else {
+                        if !state.app_name.is_empty() {
+                            last_app_before_change = Some(state.app_name.clone());
+                        } else {
+                            last_app_before_change = None;
+                        }
+                        if coalesce_until.is_some() {
+                            let pending_title = pending_window_title.take();
+                            if pending_title.is_some() || !state.window_title.is_empty() {
+                                if let Some(title) = pending_title {
+                                    if let Some(reconciled) = reconcile_window_title(
+                                        &state.app_name,
+                                        &title,
+                                        &mut last_app_window,
+                                        last_app_before_change.as_ref(),
+                                    ) {
+                                        state.window_title = reconciled;
+                                    }
+                                }
+                                if state.app_name.eq_ignore_ascii_case(LOGINWINDOW_APP)
+                                    && state.window_id == 0
+                                {
+                                    state.window_id = LOGINWINDOW_WINDOW_ID;
+                                }
+                                state.last_window_update = Instant::now();
+                                if can_emit(&state) {
+                                    let focus_info = state.to_window_focus_info(&mut interner);
+                                    info!(
+                                        "Focus worker: Emitting consolidated focus change: {} -> {}",
+                                        focus_info.app_name, focus_info.window_title
+                                    );
+                                    callback.on_focus_change(focus_info);
+                                    record_last_app_window(&state, &mut last_app_window);
+                                }
+                            }
+                        }
                         let is_login = app_name.eq_ignore_ascii_case(LOGINWINDOW_APP);
+                        if !is_login {
+                            poll_lock_active = false;
+                            poll_lock_since = None;
+                        }
+                        if coalesce_ms > 0 {
+                            coalesce_until =
+                                Some(Instant::now() + Duration::from_millis(coalesce_ms));
+                        } else {
+                            coalesce_until = None;
+                        }
+                        pending_window_title = None;
                         state.app_name = app_name;
                         state.pid = pid;
+                        state.window_title.clear();
+                        state.window_id = 0;
                         state.process_start_time = get_process_start_time(pid);
                         if state.process_start_time == 0 {
                             state.process_start_time = Utc::now().timestamp_millis() as u64;
@@ -243,6 +368,7 @@ fn run_focus_worker(
                         }
                         state.window_instance_start = Utc::now();
                         state.last_app_update = Instant::now();
+                        awaiting_poll_reconcile = true;
                         // Defer emission to allow window info to arrive
                         if is_login {
                             schedule_emit(&mut scheduled_emit_at, 50);
@@ -257,7 +383,20 @@ fn run_focus_worker(
                     } else if state.window_title == window_title {
                         debug!("Focus worker: duplicate window change ignored");
                     } else {
-                        state.window_title = window_title;
+                        if let Some(until) = coalesce_until {
+                            if Instant::now() < until {
+                                pending_window_title = Some(window_title);
+                                continue;
+                            }
+                        }
+                        if let Some(reconciled) = reconcile_window_title(
+                            &state.app_name,
+                            &window_title,
+                            &mut last_app_window,
+                            last_app_before_change.as_ref(),
+                        ) {
+                            state.window_title = reconciled;
+                        }
                         if state.app_name.eq_ignore_ascii_case(LOGINWINDOW_APP)
                             && state.window_id == 0
                         {
@@ -276,7 +415,13 @@ fn run_focus_worker(
                     }
                 }
                 FocusMsg::AppChangeInfo(info) => {
+                    coalesce_until = None;
+                    pending_window_title = None;
                     state.app_name = info.app_name.clone();
+                    if !state.app_name.eq_ignore_ascii_case(LOGINWINDOW_APP) {
+                        poll_lock_active = false;
+                        poll_lock_since = None;
+                    }
                     state.pid = info.process_id;
                     state.process_start_time = get_process_start_time(info.process_id);
                     if state.process_start_time == 0 {
@@ -293,14 +438,21 @@ fn run_focus_worker(
                     state.window_instance_start = Utc::now();
                     state.last_app_update = Instant::now();
                     state.last_window_update = state.last_app_update;
+                    awaiting_poll_reconcile = false;
                     if state.is_complete() {
                         schedule_emit(&mut scheduled_emit_at, 0);
                     }
                 }
                 FocusMsg::WindowChangeInfo(info) => {
+                    coalesce_until = None;
+                    pending_window_title = None;
                     if state.pid != info.process_id {
                         state.pid = info.process_id;
                         state.app_name = info.app_name.clone();
+                        if !state.app_name.eq_ignore_ascii_case(LOGINWINDOW_APP) {
+                            poll_lock_active = false;
+                            poll_lock_since = None;
+                        }
                         state.process_start_time = get_process_start_time(info.process_id);
                         if state.process_start_time == 0 {
                             state.process_start_time = Utc::now().timestamp_millis() as u64;
@@ -315,6 +467,7 @@ fn run_focus_worker(
                         info.window_id
                     };
                     state.last_window_update = Instant::now();
+                    awaiting_poll_reconcile = false;
                     if state.is_complete() {
                         schedule_emit(&mut scheduled_emit_at, 0);
                     }
@@ -328,6 +481,55 @@ fn run_focus_worker(
                 // Polling tick
                 match get_active_window_info() {
                     Ok(info) => {
+                        if poll_lock_active {
+                            let elapsed_ms = poll_lock_since
+                                .map(|since| since.elapsed().as_millis())
+                                .unwrap_or(0);
+                            info!(
+                                "Focus worker: Polling recovered from lock-like error after {}ms (previous_app='{}' app='{}' title='{}' pid={} wid={})",
+                                elapsed_ms,
+                                state.app_name,
+                                info.app_name,
+                                info.title,
+                                info.process_id,
+                                info.window_id
+                            );
+                            poll_lock_active = false;
+                            poll_lock_since = None;
+                            state.app_name = info.app_name.clone();
+                            state.pid = info.process_id;
+                            state.process_start_time = get_process_start_time(info.process_id);
+                            if state.process_start_time == 0 {
+                                state.process_start_time = Utc::now().timestamp_millis() as u64;
+                            }
+                            state.window_title = info.title.clone();
+                            state.window_id = info.window_id;
+                            state.window_instance_start = Utc::now();
+                            state.last_app_update = Instant::now();
+                            state.last_window_update = state.last_app_update;
+                            awaiting_poll_reconcile = false;
+                            schedule_emit(&mut scheduled_emit_at, 0);
+                        }
+                        if awaiting_poll_reconcile && state.app_name == info.app_name {
+                            state.pid = info.process_id;
+                            state.process_start_time = get_process_start_time(info.process_id);
+                            if state.process_start_time == 0 {
+                                state.process_start_time = Utc::now().timestamp_millis() as u64;
+                            }
+                            state.window_title = info.title.clone();
+                            state.window_id =
+                                if state.app_name.eq_ignore_ascii_case(LOGINWINDOW_APP)
+                                    && info.window_id == 0
+                                {
+                                    LOGINWINDOW_WINDOW_ID
+                                } else {
+                                    info.window_id
+                                };
+                            state.window_instance_start = Utc::now();
+                            state.last_window_update = Instant::now();
+                            awaiting_poll_reconcile = false;
+                            schedule_emit(&mut scheduled_emit_at, 0);
+                        }
                         let window_id = info.window_id;
                         let current_title = info.title.clone();
                         if let Some(last_title) = last_titles.get_cloned(&window_id) {
@@ -352,20 +554,81 @@ fn run_focus_worker(
                         }
                         last_titles.put(window_id, current_title);
                     }
-                    Err(e) => error!("Failed to get active window during polling: {:?}", e),
+                    Err(e) => {
+                        let err_text = format!("{:?}", e);
+                        let is_lock_error = err_text.contains("No qualifying window found");
+                        if is_lock_error {
+                            if !poll_lock_active {
+                                poll_lock_active = true;
+                                poll_lock_since = Some(Instant::now());
+                                if state.app_name.eq_ignore_ascii_case(LOGINWINDOW_APP) {
+                                    info!(
+                                        "Focus worker: Polling returned lock-like error while app=loginwindow; synthesizing focus (app='{}' title='{}' pid={} wid={})",
+                                        state.app_name,
+                                        state.window_title,
+                                        state.pid,
+                                        state.window_id
+                                    );
+                                    emit_loginwindow_focus(&mut interner);
+                                } else {
+                                    warn!(
+                                        "Focus worker: Polling returned lock-like error but app is not loginwindow; skipping lock synthesis (app='{}' title='{}' pid={} wid={})",
+                                        state.app_name,
+                                        state.window_title,
+                                        state.pid,
+                                        state.window_id
+                                    );
+                                }
+                            } else {
+                                debug!("Polling failed while locked: {:?}", e);
+                            }
+                        } else {
+                            error!("Failed to get active window during polling: {:?}", e);
+                        }
+                    }
                 }
             }
             Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
         }
 
+        if let Some(until) = coalesce_until {
+            if Instant::now() >= until {
+                if let Some(title) = pending_window_title.take() {
+                    if let Some(reconciled) = reconcile_window_title(
+                        &state.app_name,
+                        &title,
+                        &mut last_app_window,
+                        last_app_before_change.as_ref(),
+                    ) {
+                        state.window_title = reconciled;
+                        if state.app_name.eq_ignore_ascii_case(LOGINWINDOW_APP)
+                            && state.window_id == 0
+                        {
+                            state.window_id = LOGINWINDOW_WINDOW_ID;
+                        }
+                        state.last_window_update = Instant::now();
+                        awaiting_poll_reconcile = true;
+                    } else {
+                        state.window_title.clear();
+                        awaiting_poll_reconcile = true;
+                    }
+                }
+                coalesce_until = None;
+                if can_emit(&state) {
+                    schedule_emit(&mut scheduled_emit_at, 0);
+                }
+            }
+        }
+
         if let Some(when) = scheduled_emit_at {
-            if Instant::now() >= when && state.is_complete() {
+            if Instant::now() >= when && can_emit(&state) {
                 let focus_info = state.to_window_focus_info(&mut interner);
                 info!(
                     "Focus worker: Emitting consolidated focus change: {} -> {}",
                     focus_info.app_name, focus_info.window_title
                 );
                 callback.on_focus_change(focus_info);
+                record_last_app_window(&state, &mut last_app_window);
                 scheduled_emit_at = None;
             }
         }

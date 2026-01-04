@@ -174,6 +174,7 @@ mod tests {
             ActivityState::Active,
             Some(focus),
             None,
+            Vec::new(),
             SnapshotCounts {
                 signals_seen: 1,
                 hints_seen: 2,

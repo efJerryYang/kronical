@@ -284,7 +284,11 @@ fn start_daemon(data_file: PathBuf, _app_config: AppConfig, run_id: Option<Strin
             let _ = std::fs::remove_file(&pid_file);
         }
     }
-    println!("Starting Kronical daemon in background...");
+    let run_id_str = run_id.as_deref().unwrap_or("null");
+    println!(
+        "Starting Kronical daemon in background (run_id: {})...",
+        run_id_str
+    );
     spawn_kronid(run_id.as_deref())?;
     Ok(())
 }
@@ -1065,6 +1069,21 @@ fn map_pb_snapshot(
             window_position: None,
             window_size: None,
         });
+    let map_record_focus = |f: kronical::kroni_api::kroni::v1::snapshot_reply::Focus| {
+        kronical::daemon::events::WindowFocusInfo {
+            pid: f.pid,
+            process_start_time: 0,
+            app_name: Arc::new(f.app),
+            window_title: Arc::new(f.title),
+            window_id: f.window_id.parse().unwrap_or(0),
+            window_instance_start: f
+                .since
+                .and_then(|ts| chrono::DateTime::<Utc>::from_timestamp(ts.seconds, ts.nanos as u32))
+                .unwrap_or_else(Utc::now),
+            window_position: None,
+            window_size: None,
+        }
+    };
     let last_transition = reply
         .last_transition
         .map(|t| kronical::daemon::snapshot::Transition {
@@ -1087,7 +1106,11 @@ fn map_pb_snapshot(
                 .and_then(|ts| chrono::DateTime::<Utc>::from_timestamp(ts.seconds, ts.nanos as u32))
                 .unwrap_or_else(Utc::now),
             by_signal: None,
-            run_id: None,
+            run_id: if t.run_id.is_empty() {
+                None
+            } else {
+                Some(t.run_id)
+            },
         });
     let counts = reply
         .counts
@@ -1191,14 +1214,48 @@ fn map_pb_snapshot(
             }
         })
         .collect();
+    let records = reply
+        .records
+        .into_iter()
+        .map(|r| kronical::daemon::records::ActivityRecord {
+            record_id: r.record_id,
+            run_id: if r.run_id.is_empty() {
+                None
+            } else {
+                Some(r.run_id)
+            },
+            start_time: r
+                .start_time
+                .and_then(|ts| chrono::DateTime::<Utc>::from_timestamp(ts.seconds, ts.nanos as u32))
+                .unwrap_or_else(Utc::now),
+            end_time: r.end_time.and_then(|ts| {
+                chrono::DateTime::<Utc>::from_timestamp(ts.seconds, ts.nanos as u32)
+            }),
+            state: match r.state {
+                1 => kronical::daemon::records::ActivityState::Active,
+                2 => kronical::daemon::records::ActivityState::Passive,
+                3 => kronical::daemon::records::ActivityState::Inactive,
+                4 => kronical::daemon::records::ActivityState::Locked,
+                _ => kronical::daemon::records::ActivityState::Inactive,
+            },
+            focus_info: r.focus.map(map_record_focus),
+            event_count: r.event_count,
+            triggering_events: r.triggering_events,
+        })
+        .collect();
     kronical::daemon::snapshot::Snapshot {
         seq: reply.seq,
         mono_ns: reply.mono_ns,
-        run_id: None,
+        run_id: if reply.run_id.is_empty() {
+            None
+        } else {
+            Some(reply.run_id)
+        },
         activity_state: state,
         focus,
         last_transition,
         transitions_recent: Vec::new(),
+        records,
         counts,
         cadence_ms,
         cadence_reason,
@@ -1328,6 +1385,37 @@ fn print_snapshot_pretty(s: &kronical::daemon::snapshot::Snapshot) {
             }
         } else {
             println!("    windows: -");
+        }
+    }
+    println!("- records ({}):", s.records.len());
+    for record in &s.records {
+        let end = record
+            .end_time
+            .map(|t| t.to_rfc3339())
+            .unwrap_or_else(|| "-".to_string());
+        let duration_s = record
+            .end_time
+            .map(|t| (t - record.start_time).num_seconds().max(0))
+            .map(|d| d.to_string())
+            .unwrap_or_else(|| "-".to_string());
+        let focus = record.focus_info.as_ref().map(|f| {
+            format!(
+                "{} [{}] - {} (wid={})",
+                f.app_name, f.pid, f.window_title, f.window_id
+            )
+        });
+        println!(
+            "  - id={} state={:?} start={} end={} dur={}s events={} triggers={}",
+            record.record_id,
+            record.state,
+            record.start_time.to_rfc3339(),
+            end,
+            duration_s,
+            record.event_count,
+            record.triggering_events.len()
+        );
+        if let Some(info) = focus {
+            println!("    focus: {}", info);
         }
     }
 }

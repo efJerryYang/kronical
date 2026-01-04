@@ -1,5 +1,5 @@
 use crate::events::WindowFocusInfo;
-use crate::records::ActivityState;
+use crate::records::{ActivityRecord, ActivityState};
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 use std::sync::{
@@ -19,6 +19,8 @@ pub struct Snapshot {
     pub last_transition: Option<Transition>,
     #[serde(default)]
     pub transitions_recent: Vec<Transition>,
+    #[serde(default)]
+    pub records: Vec<ActivityRecord>,
     pub counts: Counts,
     pub cadence_ms: u32,
     pub cadence_reason: String,
@@ -57,6 +59,7 @@ impl Snapshot {
             focus: None,
             last_transition: None,
             transitions_recent: Vec::new(),
+            records: Vec::new(),
             counts: Counts::default(),
             cadence_ms: 0,
             cadence_reason: String::new(),
@@ -115,6 +118,7 @@ impl SnapshotBus {
         state: ActivityState,
         focus: Option<WindowFocusInfo>,
         last_transition: Option<Transition>,
+        records: Vec<ActivityRecord>,
         counts: Counts,
         cadence_ms: u32,
         cadence_reason: String,
@@ -134,6 +138,7 @@ impl SnapshotBus {
             focus,
             last_transition,
             transitions_recent,
+            records,
             counts,
             cadence_ms,
             cadence_reason,
@@ -298,6 +303,7 @@ mod tests {
             ActivityState::Active,
             Some(sample_focus(1)),
             Some(transition.clone()),
+            Vec::new(),
             counts,
             1_000,
             "timer".to_string(),
@@ -325,6 +331,7 @@ mod tests {
             ActivityState::Passive,
             None,
             None,
+            Vec::new(),
             Counts::default(),
             500,
             "idle".to_string(),

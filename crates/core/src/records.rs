@@ -18,6 +18,7 @@ pub enum ActivityState {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ActivityRecord {
     pub record_id: u64,
+    pub run_id: Option<String>,
     pub start_time: DateTime<Utc>,
     pub end_time: Option<DateTime<Utc>>,
     pub state: ActivityState,
@@ -150,6 +151,7 @@ impl RecordBuilder {
         let now_utc = Utc::now();
         self.current_record = Some(ActivityRecord {
             record_id: self.next_record_id,
+            run_id: None,
             start_time: now_utc,
             end_time: None,
             state: self.current_state,
@@ -491,6 +493,7 @@ mod tests {
     ) -> ActivityRecord {
         ActivityRecord {
             record_id,
+            run_id: None,
             start_time: start,
             end_time: Some(start + Duration::seconds(duration_secs)),
             state: ActivityState::Active,

@@ -98,7 +98,8 @@ impl SqliteStorage {
                 start_time TEXT NOT NULL,
                 end_time TEXT,
                 state TEXT NOT NULL,
-                focus_info TEXT
+                focus_info TEXT,
+                run_id TEXT
             );
             CREATE TABLE IF NOT EXISTS compact_events (
                 start_time TEXT NOT NULL,
@@ -120,6 +121,7 @@ impl SqliteStorage {
             CREATE INDEX IF NOT EXISTS idx_recent_transitions_at ON recent_transitions(at);"
         )?;
         let _ = conn.execute("ALTER TABLE recent_transitions ADD COLUMN run_id TEXT", []);
+        let _ = conn.execute("ALTER TABLE activity_records ADD COLUMN run_id TEXT", []);
         Ok(())
     }
 
@@ -150,7 +152,16 @@ impl SqliteStorage {
                         .focus_info
                         .as_ref()
                         .map(|fi| serde_json::to_string(fi).unwrap());
-                    tx.execute("INSERT INTO activity_records (start_time, end_time, state, focus_info) VALUES (?, ?, ?, ?)", params![record.start_time.to_rfc3339(), record.end_time.map(|t| t.to_rfc3339()), format!("{:?}", record.state), focus_info_json])
+                    tx.execute(
+                        "INSERT INTO activity_records (start_time, end_time, state, focus_info, run_id) VALUES (?, ?, ?, ?, ?)",
+                        params![
+                            record.start_time.to_rfc3339(),
+                            record.end_time.map(|t| t.to_rfc3339()),
+                            format!("{:?}", record.state),
+                            focus_info_json,
+                            record.run_id,
+                        ],
+                    )
                 }
                 StorageCommand::Envelope(env) => {
                     let source = match env.source {
@@ -345,17 +356,33 @@ impl StorageBackend for SqliteStorage {
         Ok(())
     }
 
-    fn fetch_records_since(&mut self, since: DateTime<Utc>) -> Result<Vec<ActivityRecord>> {
+    fn fetch_records_since(
+        &mut self,
+        since: DateTime<Utc>,
+        run_id: Option<&str>,
+    ) -> Result<Vec<ActivityRecord>> {
         let conn = Connection::open(&self.db_path)?;
         // Include records that have not ended or ended after 'since'.
-        let mut stmt = conn.prepare(
-            "SELECT id, start_time, end_time, state, focus_info
-             FROM activity_records
-             WHERE (end_time IS NULL OR end_time >= ?1)
-             ORDER BY start_time ASC",
-        )?;
+        let mut stmt = match run_id {
+            Some(_) => conn.prepare(
+                "SELECT id, start_time, end_time, state, focus_info, run_id
+                 FROM activity_records
+                 WHERE (end_time IS NULL OR end_time >= ?1)
+                   AND run_id = ?2
+                 ORDER BY start_time ASC",
+            )?,
+            None => conn.prepare(
+                "SELECT id, start_time, end_time, state, focus_info, run_id
+                 FROM activity_records
+                 WHERE (end_time IS NULL OR end_time >= ?1)
+                 ORDER BY start_time ASC",
+            )?,
+        };
 
-        let mut rows = stmt.query([since.to_rfc3339()])?;
+        let mut rows = match run_id {
+            Some(id) => stmt.query([since.to_rfc3339(), id.to_string()])?,
+            None => stmt.query([since.to_rfc3339()])?,
+        };
         let mut out: Vec<ActivityRecord> = Vec::new();
 
         while let Some(row) = rows.next()? {
@@ -364,6 +391,7 @@ impl StorageBackend for SqliteStorage {
             let end_s: Option<String> = row.get(2)?;
             let state_s: String = row.get(3)?;
             let focus_json: Option<String> = row.get(4)?;
+            let row_run_id: Option<String> = row.get(5)?;
 
             let start_time = DateTime::parse_from_rfc3339(&start_s)
                 .map(|dt| dt.with_timezone(&Utc))
@@ -386,6 +414,7 @@ impl StorageBackend for SqliteStorage {
 
             out.push(ActivityRecord {
                 record_id: id as u64,
+                run_id: row_run_id,
                 start_time,
                 end_time,
                 state,
@@ -523,21 +552,31 @@ impl StorageBackend for SqliteStorage {
 
     fn fetch_recent_transitions(
         &mut self,
+        since: DateTime<Utc>,
         run_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<snapshot::Transition>> {
         let conn = Connection::open(&self.db_path)?;
         let mut stmt = match run_id {
             Some(_) => conn.prepare(
-                "SELECT at, from_state, to_state, by_signal, run_id FROM recent_transitions WHERE run_id = ? ORDER BY at DESC LIMIT ?",
+                "SELECT at, from_state, to_state, by_signal, run_id
+                 FROM recent_transitions
+                 WHERE at >= ?1
+                   AND run_id = ?2
+                 ORDER BY at DESC
+                 LIMIT ?3",
             )?,
             None => conn.prepare(
-                "SELECT at, from_state, to_state, by_signal, run_id FROM recent_transitions ORDER BY at DESC LIMIT ?",
+                "SELECT at, from_state, to_state, by_signal, run_id
+                 FROM recent_transitions
+                 WHERE at >= ?1
+                 ORDER BY at DESC
+                 LIMIT ?2",
             )?,
         };
         let mut rows = match run_id {
-            Some(id) => stmt.query(params![id, limit as i64])?,
-            None => stmt.query([limit as i64])?,
+            Some(id) => stmt.query(params![since.to_rfc3339(), id, limit as i64])?,
+            None => stmt.query(params![since.to_rfc3339(), limit as i64])?,
         };
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {

@@ -139,7 +139,8 @@ impl DuckDbStorage {
                 start_time TIMESTAMPTZ NOT NULL,
                 end_time TIMESTAMPTZ,
                 state TEXT NOT NULL,
-                focus_info TEXT
+                focus_info TEXT,
+                run_id TEXT
             );
             CREATE TABLE IF NOT EXISTS compact_events (
                 start_time TIMESTAMPTZ NOT NULL,
@@ -161,6 +162,7 @@ impl DuckDbStorage {
             ",
         )?;
         let _ = conn.execute("ALTER TABLE recent_transitions ADD COLUMN run_id TEXT", []);
+        let _ = conn.execute("ALTER TABLE activity_records ADD COLUMN run_id TEXT", []);
         Ok(())
     }
 
@@ -203,13 +205,14 @@ impl DuckDbStorage {
                         .as_ref()
                         .map(|fi| serde_json::to_string(fi).unwrap());
                     let mut stmt = conn
-                        .prepare("INSERT INTO activity_records (start_time, end_time, state, focus_info) VALUES (?, ?, ?, ?)")
+                        .prepare("INSERT INTO activity_records (start_time, end_time, state, focus_info, run_id) VALUES (?, ?, ?, ?, ?)")
                         .expect("prepare failed");
                     stmt.execute(params![
                         record.start_time,
                         record.end_time,
                         format!("{:?}", record.state),
-                        focus_info_json
+                        focus_info_json,
+                        record.run_id
                     ])
                 }
                 Ok(StorageCommand::Envelope(env)) => {
@@ -421,7 +424,11 @@ impl StorageBackend for DuckDbStorage {
         Ok(())
     }
 
-    fn fetch_records_since(&mut self, since: DateTime<Utc>) -> Result<Vec<ActivityRecord>> {
+    fn fetch_records_since(
+        &mut self,
+        since: DateTime<Utc>,
+        run_id: Option<&str>,
+    ) -> Result<Vec<ActivityRecord>> {
         let conn = Connection::open(&self.db_path)?;
         if let Some(mb) = self.memory_limit_mb {
             let _ = conn.execute_batch(&format!(
@@ -429,14 +436,26 @@ impl StorageBackend for DuckDbStorage {
                 mb
             ));
         }
-        let mut stmt = conn.prepare(
-            "SELECT id, start_time, end_time, state, focus_info
-             FROM activity_records
-             WHERE (end_time IS NULL OR end_time >= ?)
-             ORDER BY start_time ASC",
-        )?;
+        let mut stmt = match run_id {
+            Some(_) => conn.prepare(
+                "SELECT id, start_time, end_time, state, focus_info, run_id
+                 FROM activity_records
+                 WHERE (end_time IS NULL OR end_time >= ?)
+                   AND run_id = ?
+                 ORDER BY start_time ASC",
+            )?,
+            None => conn.prepare(
+                "SELECT id, start_time, end_time, state, focus_info, run_id
+                 FROM activity_records
+                 WHERE (end_time IS NULL OR end_time >= ?)
+                 ORDER BY start_time ASC",
+            )?,
+        };
 
-        let mut rows = stmt.query([since])?;
+        let mut rows = match run_id {
+            Some(id) => stmt.query(params![since, id])?,
+            None => stmt.query(params![since])?,
+        };
         let mut out: Vec<ActivityRecord> = Vec::new();
 
         while let Some(row) = rows.next()? {
@@ -445,6 +464,7 @@ impl StorageBackend for DuckDbStorage {
             let end_time: Option<DateTime<Utc>> = row.get(2)?;
             let state_s: String = row.get(3)?;
             let focus_json: Option<String> = row.get(4)?;
+            let row_run_id: Option<String> = row.get(5)?;
 
             let state = parse_state_label(&state_s);
 
@@ -455,6 +475,7 @@ impl StorageBackend for DuckDbStorage {
 
             out.push(ActivityRecord {
                 record_id: id.unwrap_or_default() as u64,
+                run_id: row_run_id,
                 start_time,
                 end_time,
                 state,
@@ -592,6 +613,7 @@ impl StorageBackend for DuckDbStorage {
 
     fn fetch_recent_transitions(
         &mut self,
+        since: DateTime<Utc>,
         run_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<snapshot::Transition>> {
@@ -604,15 +626,24 @@ impl StorageBackend for DuckDbStorage {
         }
         let mut stmt = match run_id {
             Some(_) => conn.prepare(
-                "SELECT at, from_state, to_state, by_signal, run_id FROM recent_transitions WHERE run_id = ? ORDER BY at DESC LIMIT ?",
+                "SELECT at, from_state, to_state, by_signal, run_id
+                 FROM recent_transitions
+                 WHERE at >= ?
+                   AND run_id = ?
+                 ORDER BY at DESC
+                 LIMIT ?",
             )?,
             None => conn.prepare(
-                "SELECT at, from_state, to_state, by_signal, run_id FROM recent_transitions ORDER BY at DESC LIMIT ?",
+                "SELECT at, from_state, to_state, by_signal, run_id
+                 FROM recent_transitions
+                 WHERE at >= ?
+                 ORDER BY at DESC
+                 LIMIT ?",
             )?,
         };
         let mut rows = match run_id {
-            Some(id) => stmt.query(params![id, limit as i64])?,
-            None => stmt.query([limit as i64])?,
+            Some(id) => stmt.query(params![since, id, limit as i64])?,
+            None => stmt.query(params![since, limit as i64])?,
         };
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {

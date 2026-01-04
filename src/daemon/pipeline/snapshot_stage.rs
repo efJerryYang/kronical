@@ -393,11 +393,16 @@ fn publish_snapshot(
         backlog_count: storage_metrics.backlog_count,
         last_flush_at: storage_metrics.last_flush_at,
     };
+    let records = recent_records
+        .iter()
+        .cloned()
+        .collect::<Vec<ActivityRecord>>();
 
     snapshot_bus.publish_basic(
         *current_state,
         current_focus.clone(),
         last_transition.clone(),
+        records,
         counts.clone(),
         ms as u32,
         reason.to_string(),
@@ -645,6 +650,7 @@ mod tests {
 
         let record = ActivityRecord {
             record_id: 1,
+            run_id: None,
             start_time: Utc::now(),
             end_time: Some(Utc::now()),
             state: ActivityState::Active,
