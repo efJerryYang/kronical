@@ -3,10 +3,10 @@ use crate::daemon::snapshot;
 use crate::kroni_api::kroni::v1::kroni_server::{Kroni, KroniServer};
 use crate::kroni_api::kroni::v1::{
     SnapshotReply, SnapshotRequest, SystemMetric, SystemMetricsReply, SystemMetricsRequest,
-    WatchRequest, snapshot_reply::ActivityState as PbState, snapshot_reply::Cadence,
-    snapshot_reply::Config, snapshot_reply::Counts, snapshot_reply::Focus,
-    snapshot_reply::SnapshotApp as PbApp, snapshot_reply::SnapshotWindow as PbWin,
-    snapshot_reply::Storage, snapshot_reply::Transition,
+    WatchRequest, snapshot_reply::ActivityRecord as PbRecord,
+    snapshot_reply::ActivityState as PbState, snapshot_reply::Cadence, snapshot_reply::Config,
+    snapshot_reply::Counts, snapshot_reply::Focus, snapshot_reply::SnapshotApp as PbApp,
+    snapshot_reply::SnapshotWindow as PbWin, snapshot_reply::Storage, snapshot_reply::Transition,
 };
 use crate::util::logging::{info, warn};
 use anyhow::{Context, Result};
@@ -283,33 +283,26 @@ fn utc_to_ts(dt: DateTime<Utc>) -> Timestamp {
 }
 
 pub fn to_pb(s: &snapshot::Snapshot) -> SnapshotReply {
-    let state = match s.activity_state {
+    let map_state = |state: crate::daemon::records::ActivityState| match state {
         crate::daemon::records::ActivityState::Active => PbState::Active,
         crate::daemon::records::ActivityState::Passive => PbState::Passive,
         crate::daemon::records::ActivityState::Inactive => PbState::Inactive,
         crate::daemon::records::ActivityState::Locked => PbState::Locked,
     } as i32;
-    let focus = s.focus.as_ref().map(|f| Focus {
+    let map_focus = |f: &crate::daemon::events::WindowFocusInfo| Focus {
         app: (*f.app_name).clone(),
         pid: f.pid,
         window_id: f.window_id.to_string(),
         title: (*f.window_title).clone(),
         since: Some(utc_to_ts(f.window_instance_start)),
-    });
+    };
+    let state = map_state(s.activity_state);
+    let focus = s.focus.as_ref().map(map_focus);
     let last_transition = s.last_transition.as_ref().map(|t| Transition {
-        from: match t.from {
-            crate::daemon::records::ActivityState::Active => PbState::Active as i32,
-            crate::daemon::records::ActivityState::Passive => PbState::Passive as i32,
-            crate::daemon::records::ActivityState::Inactive => PbState::Inactive as i32,
-            crate::daemon::records::ActivityState::Locked => PbState::Locked as i32,
-        },
-        to: match t.to {
-            crate::daemon::records::ActivityState::Active => PbState::Active as i32,
-            crate::daemon::records::ActivityState::Passive => PbState::Passive as i32,
-            crate::daemon::records::ActivityState::Inactive => PbState::Inactive as i32,
-            crate::daemon::records::ActivityState::Locked => PbState::Locked as i32,
-        },
+        from: map_state(t.from),
+        to: map_state(t.to),
         at: Some(utc_to_ts(t.at)),
+        run_id: t.run_id.clone().unwrap_or_default(),
     });
     let counts = Some(Counts {
         signals_seen: s.counts.signals_seen,
@@ -356,9 +349,24 @@ pub fn to_pb(s: &snapshot::Snapshot) -> SnapshotReply {
             total_duration_pretty: a.total_duration_pretty.clone(),
         })
         .collect();
+    let records = s
+        .records
+        .iter()
+        .map(|r| PbRecord {
+            record_id: r.record_id,
+            run_id: r.run_id.clone().unwrap_or_default(),
+            start_time: Some(utc_to_ts(r.start_time)),
+            end_time: r.end_time.map(utc_to_ts),
+            state: map_state(r.state),
+            focus: r.focus_info.as_ref().map(map_focus),
+            event_count: r.event_count,
+            triggering_events: r.triggering_events.clone(),
+        })
+        .collect();
     SnapshotReply {
         seq: s.seq,
         mono_ns: s.mono_ns,
+        run_id: s.run_id.clone().unwrap_or_default(),
         activity_state: state,
         focus,
         last_transition,
@@ -369,6 +377,7 @@ pub fn to_pb(s: &snapshot::Snapshot) -> SnapshotReply {
         config,
         health: s.health.clone(),
         aggregated_apps,
+        records,
     }
 }
 
@@ -601,6 +610,7 @@ mod tests {
             ActivityState::Active,
             Some(sample_focus()),
             None,
+            Vec::new(),
             SnapshotCounts {
                 signals_seen: 4,
                 hints_seen: 2,
@@ -654,6 +664,7 @@ mod tests {
             ActivityState::Active,
             Some(sample_focus()),
             None,
+            Vec::new(),
             SnapshotCounts::default(),
             250,
             "hook".into(),
@@ -682,6 +693,7 @@ mod tests {
             ActivityState::Active,
             Some(sample_focus()),
             None,
+            Vec::new(),
             SnapshotCounts {
                 signals_seen: 5,
                 hints_seen: 4,

@@ -9,10 +9,12 @@ fn parses_single_sse_event_into_snapshot() {
     let snap = Snapshot {
         seq: 1,
         mono_ns: 0,
+        run_id: None,
         activity_state: kronical::daemon::records::ActivityState::Inactive,
         focus: None,
         last_transition: None,
         transitions_recent: vec![],
+        records: vec![],
         counts: Default::default(),
         cadence_ms: 0,
         cadence_reason: String::new(),

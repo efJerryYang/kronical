@@ -28,6 +28,7 @@ pub trait StorageBackend: Send + Sync {
     ) -> Result<Vec<EventEnvelope>>;
     fn fetch_recent_transitions(
         &mut self,
+        since: DateTime<Utc>,
         run_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<snapshot::Transition>>;

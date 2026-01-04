@@ -613,6 +613,7 @@ impl StorageBackend for DuckDbStorage {
 
     fn fetch_recent_transitions(
         &mut self,
+        since: DateTime<Utc>,
         run_id: Option<&str>,
         limit: usize,
     ) -> Result<Vec<snapshot::Transition>> {
@@ -625,15 +626,24 @@ impl StorageBackend for DuckDbStorage {
         }
         let mut stmt = match run_id {
             Some(_) => conn.prepare(
-                "SELECT at, from_state, to_state, by_signal, run_id FROM recent_transitions WHERE run_id = ? ORDER BY at DESC LIMIT ?",
+                "SELECT at, from_state, to_state, by_signal, run_id
+                 FROM recent_transitions
+                 WHERE at >= ?
+                   AND run_id = ?
+                 ORDER BY at DESC
+                 LIMIT ?",
             )?,
             None => conn.prepare(
-                "SELECT at, from_state, to_state, by_signal, run_id FROM recent_transitions ORDER BY at DESC LIMIT ?",
+                "SELECT at, from_state, to_state, by_signal, run_id
+                 FROM recent_transitions
+                 WHERE at >= ?
+                 ORDER BY at DESC
+                 LIMIT ?",
             )?,
         };
         let mut rows = match run_id {
-            Some(id) => stmt.query(params![id, limit as i64])?,
-            None => stmt.query([limit as i64])?,
+            Some(id) => stmt.query(params![since, id, limit as i64])?,
+            None => stmt.query(params![since, limit as i64])?,
         };
         let mut out = Vec::new();
         while let Some(row) = rows.next()? {

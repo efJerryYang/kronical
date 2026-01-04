@@ -244,8 +244,16 @@ impl RollupStats {
         if self.batches == 0 {
             return;
         }
-        let timeout = self.by_reason.get(&super::types::FlushReason::Timeout).copied().unwrap_or(0);
-        let shutdown = self.by_reason.get(&super::types::FlushReason::Shutdown).copied().unwrap_or(0);
+        let timeout = self
+            .by_reason
+            .get(&super::types::FlushReason::Timeout)
+            .copied()
+            .unwrap_or(0);
+        let shutdown = self
+            .by_reason
+            .get(&super::types::FlushReason::Shutdown)
+            .copied()
+            .unwrap_or(0);
         info!(
             "Compression rollup ({} batches, timeout={}, shutdown={}): Raw (keyboard/mouse/focus): {}/{}/{}; Compact (scroll/move/keyboard/focus): {}/{}/{}/{}",
             self.batches,

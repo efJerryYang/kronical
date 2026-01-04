@@ -12,6 +12,7 @@ message SnapshotRequest {
 message SnapshotReply {
   uint64 seq = 1;
   uint64 mono_ns = 2;
+  string run_id = 14;
   enum ActivityState {
     UNKNOWN = 0;
     ACTIVE = 1;
@@ -32,6 +33,7 @@ message SnapshotReply {
     ActivityState from = 1;
     ActivityState to = 2;
     google.protobuf.Timestamp at = 3;
+    string run_id = 4;
   }
   Transition last_transition = 5;
   message Counts {
@@ -79,6 +81,17 @@ message SnapshotReply {
     string total_duration_pretty = 6;
   }
   repeated SnapshotApp aggregated_apps = 13;
+  message ActivityRecord {
+    uint64 record_id = 1;
+    string run_id = 2;
+    google.protobuf.Timestamp start_time = 3;
+    google.protobuf.Timestamp end_time = 4;
+    ActivityState state = 5;
+    Focus focus = 6;
+    uint32 event_count = 7;
+    repeated uint64 triggering_events = 8;
+  }
+  repeated ActivityRecord records = 15;
 }
 
 message WatchRequest {
