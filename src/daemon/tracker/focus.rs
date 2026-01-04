@@ -6,6 +6,7 @@ use anyhow::Result;
 use chrono::{DateTime, Utc};
 use crossbeam_channel::{Receiver, Sender};
 use kronical_common::threading::{ThreadHandle, ThreadRegistry};
+use std::borrow::Cow;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -76,6 +77,17 @@ impl FocusState {
 
 pub trait FocusChangeCallback {
     fn on_focus_change(&self, focus_info: WindowFocusInfo);
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReconcileSource {
+    Pending,
+    Cached,
+}
+
+enum ReconcileDecision {
+    Accept(String, ReconcileSource),
+    Hold(String),
 }
 
 #[derive(Clone)]
@@ -193,6 +205,7 @@ fn run_focus_worker(
         LruCache::with_capacity(caps.title_cache_capacity);
     let mut last_app_before_change: Option<String> = None;
     let mut awaiting_poll_reconcile = false;
+    let mut reconcile_active = false;
     let coalesce_ms = caps.focus_window_coalesce_ms;
     let allow_zero_window_id = caps.focus_allow_zero_window_id;
     let can_emit = |state: &FocusState| {
@@ -240,6 +253,23 @@ fn run_focus_worker(
         callback.on_focus_change(focus_info);
     };
 
+    fn escape_log_value(value: &str) -> Cow<'_, str> {
+        if !value.contains('\n') && !value.contains('\r') && !value.contains('\t') {
+            Cow::Borrowed(value)
+        } else {
+            let mut escaped = String::with_capacity(value.len());
+            for ch in value.chars() {
+                match ch {
+                    '\n' => escaped.push_str("\\n"),
+                    '\r' => escaped.push_str("\\r"),
+                    '\t' => escaped.push_str("\\t"),
+                    _ => escaped.push(ch),
+                }
+            }
+            Cow::Owned(escaped)
+        }
+    }
+
     let schedule_emit = |target: &mut Option<Instant>, delay_ms: u64| {
         let when = Instant::now() + Duration::from_millis(delay_ms);
         *target = Some(match *target {
@@ -262,33 +292,30 @@ fn run_focus_worker(
                                   pending: &str,
                                   cache: &mut LruCache<String, (String, u32)>,
                                   last_app: Option<&String>|
-     -> Option<String> {
+     -> ReconcileDecision {
+        if app_name.eq_ignore_ascii_case(LOGINWINDOW_APP) && pending == "Login" {
+            return ReconcileDecision::Accept(pending.to_string(), ReconcileSource::Pending);
+        }
         if let Some((cached_title, _cached_id)) = cache.get_cloned(app_name) {
             if cached_title == pending {
-                return Some(pending.to_string());
+                return ReconcileDecision::Accept(pending.to_string(), ReconcileSource::Pending);
             }
             if let Some(prev_app) = last_app {
                 if let Some((prev_title, _)) = cache.get_cloned(prev_app) {
                     if prev_title == pending {
                         warn!(
                             "Focus worker: reconciling window title for app {} using cached '{}' (pending='{}')",
-                            app_name, cached_title, pending
+                            app_name,
+                            escape_log_value(&cached_title),
+                            escape_log_value(pending)
                         );
-                        return Some(cached_title);
+                        return ReconcileDecision::Accept(cached_title, ReconcileSource::Cached);
                     }
                 }
             }
-            warn!(
-                "Focus worker: dropping suspect window title '{}' for app {} (cached='{}')",
-                pending, app_name, cached_title
-            );
-            return Some(cached_title);
+            return ReconcileDecision::Hold(pending.to_string());
         }
-        warn!(
-            "Focus worker: dropping suspect window title '{}' for app {} (no history)",
-            pending, app_name
-        );
-        None
+        ReconcileDecision::Hold(pending.to_string())
     };
 
     loop {
@@ -317,13 +344,23 @@ fn run_focus_worker(
                             let pending_title = pending_window_title.take();
                             if pending_title.is_some() || !state.window_title.is_empty() {
                                 if let Some(title) = pending_title {
-                                    if let Some(reconciled) = reconcile_window_title(
+                                    match reconcile_window_title(
                                         &state.app_name,
                                         &title,
                                         &mut last_app_window,
                                         last_app_before_change.as_ref(),
                                     ) {
-                                        state.window_title = reconciled;
+                                        ReconcileDecision::Accept(value, _) => {
+                                            state.window_title = value;
+                                        }
+                                        ReconcileDecision::Hold(value) => {
+                                            state.window_title = value;
+                                            warn!(
+                                                "Focus worker: accepting unverified window title '{}' for app {} after reconcile timeout (flush)",
+                                                escape_log_value(&state.window_title),
+                                                state.app_name
+                                            );
+                                        }
                                     }
                                 }
                                 if state.app_name.eq_ignore_ascii_case(LOGINWINDOW_APP)
@@ -335,8 +372,9 @@ fn run_focus_worker(
                                 if can_emit(&state) {
                                     let focus_info = state.to_window_focus_info(&mut interner);
                                     info!(
-                                        "Focus worker: Emitting consolidated focus change: {} -> {}",
-                                        focus_info.app_name, focus_info.window_title
+                                        "Focus worker: Emitting consolidated focus change: {} -> {} (reason=app_change_flush)",
+                                        focus_info.app_name,
+                                        escape_log_value(&focus_info.window_title)
                                     );
                                     callback.on_focus_change(focus_info);
                                     record_last_app_window(&state, &mut last_app_window);
@@ -355,6 +393,7 @@ fn run_focus_worker(
                             coalesce_until = None;
                         }
                         pending_window_title = None;
+                        reconcile_active = true;
                         state.app_name = app_name;
                         state.pid = pid;
                         state.window_title.clear();
@@ -383,19 +422,47 @@ fn run_focus_worker(
                     } else if state.window_title == window_title {
                         debug!("Focus worker: duplicate window change ignored");
                     } else {
-                        if let Some(until) = coalesce_until {
-                            if Instant::now() < until {
-                                pending_window_title = Some(window_title);
-                                continue;
+                        if reconcile_active {
+                            if let Some(until) = coalesce_until {
+                                if Instant::now() < until {
+                                    pending_window_title = Some(window_title);
+                                    continue;
+                                }
                             }
-                        }
-                        if let Some(reconciled) = reconcile_window_title(
-                            &state.app_name,
-                            &window_title,
-                            &mut last_app_window,
-                            last_app_before_change.as_ref(),
-                        ) {
-                            state.window_title = reconciled;
+                            match reconcile_window_title(
+                                &state.app_name,
+                                &window_title,
+                                &mut last_app_window,
+                                last_app_before_change.as_ref(),
+                            ) {
+                                ReconcileDecision::Accept(value, source) => {
+                                    if source == ReconcileSource::Cached {
+                                        warn!(
+                                            "Focus worker: using cached window title '{}' for app {} during reconcile",
+                                            escape_log_value(&value),
+                                            state.app_name
+                                        );
+                                    }
+                                    state.window_title = value;
+                                    reconcile_active = false;
+                                }
+                                ReconcileDecision::Hold(value) => {
+                                    if coalesce_until.is_none() {
+                                        state.window_title = value;
+                                        warn!(
+                                            "Focus worker: accepting unverified window title '{}' for app {} (no coalesce window)",
+                                            escape_log_value(&state.window_title),
+                                            state.app_name
+                                        );
+                                        reconcile_active = false;
+                                    } else {
+                                        pending_window_title = Some(value);
+                                        continue;
+                                    }
+                                }
+                            }
+                        } else {
+                            state.window_title = window_title;
                         }
                         if state.app_name.eq_ignore_ascii_case(LOGINWINDOW_APP)
                             && state.window_id == 0
@@ -406,10 +473,13 @@ fn run_focus_worker(
                         if state.is_complete() {
                             // small settle delay
                             schedule_emit(&mut scheduled_emit_at, 100);
+                            reconcile_active = false;
                         } else {
                             warn!(
                                 "Focus worker: window change but state incomplete: app={}, pid={}, window={}",
-                                state.app_name, state.pid, state.window_title
+                                state.app_name,
+                                state.pid,
+                                escape_log_value(&state.window_title)
                             );
                         }
                     }
@@ -439,6 +509,7 @@ fn run_focus_worker(
                     state.last_app_update = Instant::now();
                     state.last_window_update = state.last_app_update;
                     awaiting_poll_reconcile = false;
+                    reconcile_active = false;
                     if state.is_complete() {
                         schedule_emit(&mut scheduled_emit_at, 0);
                     }
@@ -468,6 +539,7 @@ fn run_focus_worker(
                     };
                     state.last_window_update = Instant::now();
                     awaiting_poll_reconcile = false;
+                    reconcile_active = false;
                     if state.is_complete() {
                         schedule_emit(&mut scheduled_emit_at, 0);
                     }
@@ -490,7 +562,7 @@ fn run_focus_worker(
                                 elapsed_ms,
                                 state.app_name,
                                 info.app_name,
-                                info.title,
+                                escape_log_value(&info.title),
                                 info.process_id,
                                 info.window_id
                             );
@@ -508,6 +580,7 @@ fn run_focus_worker(
                             state.last_app_update = Instant::now();
                             state.last_window_update = state.last_app_update;
                             awaiting_poll_reconcile = false;
+                            reconcile_active = false;
                             schedule_emit(&mut scheduled_emit_at, 0);
                         }
                         if awaiting_poll_reconcile && state.app_name == info.app_name {
@@ -528,6 +601,7 @@ fn run_focus_worker(
                             state.window_instance_start = Utc::now();
                             state.last_window_update = Instant::now();
                             awaiting_poll_reconcile = false;
+                            reconcile_active = false;
                             schedule_emit(&mut scheduled_emit_at, 0);
                         }
                         let window_id = info.window_id;
@@ -536,7 +610,9 @@ fn run_focus_worker(
                             if last_title != current_title {
                                 debug!(
                                     "Polling detected title change for window {}: '{}' -> '{}'",
-                                    window_id, last_title, current_title
+                                    window_id,
+                                    escape_log_value(&last_title),
+                                    escape_log_value(&current_title)
                                 );
                                 if state.pid != info.process_id {
                                     state.pid = info.process_id;
@@ -565,7 +641,7 @@ fn run_focus_worker(
                                     info!(
                                         "Focus worker: Polling returned lock-like error while app=loginwindow; synthesizing focus (app='{}' title='{}' pid={} wid={})",
                                         state.app_name,
-                                        state.window_title,
+                                        escape_log_value(&state.window_title),
                                         state.pid,
                                         state.window_id
                                     );
@@ -574,7 +650,7 @@ fn run_focus_worker(
                                     warn!(
                                         "Focus worker: Polling returned lock-like error but app is not loginwindow; skipping lock synthesis (app='{}' title='{}' pid={} wid={})",
                                         state.app_name,
-                                        state.window_title,
+                                        escape_log_value(&state.window_title),
                                         state.pid,
                                         state.window_id
                                     );
@@ -594,26 +670,40 @@ fn run_focus_worker(
         if let Some(until) = coalesce_until {
             if Instant::now() >= until {
                 if let Some(title) = pending_window_title.take() {
-                    if let Some(reconciled) = reconcile_window_title(
+                    match reconcile_window_title(
                         &state.app_name,
                         &title,
                         &mut last_app_window,
                         last_app_before_change.as_ref(),
                     ) {
-                        state.window_title = reconciled;
-                        if state.app_name.eq_ignore_ascii_case(LOGINWINDOW_APP)
-                            && state.window_id == 0
-                        {
-                            state.window_id = LOGINWINDOW_WINDOW_ID;
+                        ReconcileDecision::Accept(value, source) => {
+                            if source == ReconcileSource::Cached {
+                                warn!(
+                                    "Focus worker: using cached window title '{}' for app {} during reconcile",
+                                    escape_log_value(&value),
+                                    state.app_name
+                                );
+                            }
+                            state.window_title = value;
                         }
-                        state.last_window_update = Instant::now();
-                        awaiting_poll_reconcile = true;
-                    } else {
-                        state.window_title.clear();
-                        awaiting_poll_reconcile = true;
+                        ReconcileDecision::Hold(value) => {
+                            state.window_title = value;
+                            warn!(
+                                "Focus worker: accepting unverified window title '{}' for app {} after reconcile timeout",
+                                escape_log_value(&state.window_title),
+                                state.app_name
+                            );
+                        }
                     }
+                    if state.app_name.eq_ignore_ascii_case(LOGINWINDOW_APP) && state.window_id == 0
+                    {
+                        state.window_id = LOGINWINDOW_WINDOW_ID;
+                    }
+                    state.last_window_update = Instant::now();
+                    awaiting_poll_reconcile = true;
                 }
                 coalesce_until = None;
+                reconcile_active = false;
                 if can_emit(&state) {
                     schedule_emit(&mut scheduled_emit_at, 0);
                 }
@@ -625,7 +715,8 @@ fn run_focus_worker(
                 let focus_info = state.to_window_focus_info(&mut interner);
                 info!(
                     "Focus worker: Emitting consolidated focus change: {} -> {}",
-                    focus_info.app_name, focus_info.window_title
+                    focus_info.app_name,
+                    escape_log_value(&focus_info.window_title)
                 );
                 callback.on_focus_change(focus_info);
                 record_last_app_window(&state, &mut last_app_window);
