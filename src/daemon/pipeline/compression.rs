@@ -34,7 +34,7 @@ pub fn spawn_compression_stage(
     threads.spawn("pipeline-compression", move || {
         info!("Pipeline compression stage started");
         let mut engine = CompressionEngine::with_focus_cap(focus_interner_max_strings);
-        let mut rollup = RollupStats::new(Duration::from_secs(10));
+        let mut rollup = RollupStats::new(Duration::from_secs(60));
         while let Ok(cmd) = receiver.recv() {
             match cmd {
                 CompressionCommand::Process { batch, envelopes } => {
@@ -54,15 +54,15 @@ pub fn spawn_compression_stage(
                             rollup.add_batch(reason, &raw_stats, &compact_stats);
                             rollup.maybe_flush();
                             debug!(
-                                "Compression batch stats (reason={:?}): Raw (keyboard/mouse/focus): {}/{}/{}; Compact (scroll/move/keyboard/focus): {}/{}/{}/{}",
+                                "Compression batch stats (reason={:?}): Raw (focus/keyboard/mouse): {}/{}/{}; Compact (focus/keyboard/scroll/move): {}/{}/{}/{}",
                                 reason,
+                                raw_stats.focus,
                                 raw_stats.keyboard,
                                 raw_stats.mouse,
-                                raw_stats.focus,
+                                compact_stats.focus,
+                                compact_stats.keyboard,
                                 compact_stats.scroll,
                                 compact_stats.mouse_traj,
-                                compact_stats.keyboard,
-                                compact_stats.focus,
                             );
                             if persist_raw_events {
                                 forward_raw_events(&storage_tx, &envelopes, processed_events);
@@ -255,17 +255,17 @@ impl RollupStats {
             .copied()
             .unwrap_or(0);
         info!(
-            "Compression rollup ({} batches, timeout={}, shutdown={}): Raw (keyboard/mouse/focus): {}/{}/{}; Compact (scroll/move/keyboard/focus): {}/{}/{}/{}",
+            "Compression rollup ({} batches, timeout={}, shutdown={}): Raw (focus/keyboard/mouse): {}/{}/{}; Compact (focus/keyboard/scroll/move): {}/{}/{}/{}",
             self.batches,
             timeout,
             shutdown,
+            self.raw.focus,
             self.raw.keyboard,
             self.raw.mouse,
-            self.raw.focus,
+            self.compact.focus,
+            self.compact.keyboard,
             self.compact.scroll,
             self.compact.mouse_traj,
-            self.compact.keyboard,
-            self.compact.focus,
         );
         self.batches = 0;
         self.raw = RawEventStats::default();
