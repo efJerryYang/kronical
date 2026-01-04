@@ -206,6 +206,7 @@ fn run_focus_worker(
     let mut last_app_before_change: Option<String> = None;
     let mut awaiting_poll_reconcile = false;
     let mut reconcile_active = false;
+    let mut emit_seq: u64 = 0;
     let coalesce_ms = caps.focus_window_coalesce_ms;
     let allow_zero_window_id = caps.focus_allow_zero_window_id;
     let can_emit = |state: &FocusState| {
@@ -371,10 +372,17 @@ fn run_focus_worker(
                                 state.last_window_update = Instant::now();
                                 if can_emit(&state) {
                                     let focus_info = state.to_window_focus_info(&mut interner);
+                                    emit_seq = emit_seq.wrapping_add(1);
                                     info!(
-                                        "Focus worker: Emitting consolidated focus change: {} -> {} (reason=app_change_flush)",
+                                        "Focus worker: Emitting consolidated focus change: {} -> {} (reason=app_change_flush seq={} pid={} wid={} reconcile_active={} awaiting_poll_reconcile={})",
                                         focus_info.app_name,
                                         escape_log_value(&focus_info.window_title)
+                                        ,
+                                        emit_seq,
+                                        state.pid,
+                                        state.window_id,
+                                        reconcile_active,
+                                        awaiting_poll_reconcile
                                     );
                                     callback.on_focus_change(focus_info);
                                     record_last_app_window(&state, &mut last_app_window);
@@ -713,10 +721,16 @@ fn run_focus_worker(
         if let Some(when) = scheduled_emit_at {
             if Instant::now() >= when && can_emit(&state) {
                 let focus_info = state.to_window_focus_info(&mut interner);
+                emit_seq = emit_seq.wrapping_add(1);
                 info!(
-                    "Focus worker: Emitting consolidated focus change: {} -> {}",
+                    "Focus worker: Emitting consolidated focus change: {} -> {} (reason=scheduled_emit seq={} pid={} wid={} reconcile_active={} awaiting_poll_reconcile={})",
                     focus_info.app_name,
-                    escape_log_value(&focus_info.window_title)
+                    escape_log_value(&focus_info.window_title),
+                    emit_seq,
+                    state.pid,
+                    state.window_id,
+                    reconcile_active,
+                    awaiting_poll_reconcile
                 );
                 callback.on_focus_change(focus_info);
                 record_last_app_window(&state, &mut last_app_window);
