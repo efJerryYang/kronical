@@ -26,15 +26,45 @@ and storage hydration details.
 
 ## Getting Started
 
+Install it from source (`kronictl`, `kronid`):
+
 ```bash
-cargo build --release
-./target/release/kronid         # launches the daemon
-./target/release/kronictl help  # CLI overview
+cargo install --path .
+kronictl start   # launches the daemon, can optionally pass `--run <run_id>`
+kronictl status
+kronictl restart # restarts the daemon with same run_id
+kronictl stop    # stops the daemon
 ```
+
+All configs, logs and databases are stored under `~/.kronical`, you can simply delete that folder to reset the state.
 
 `kronid` requires macOS Accessibility + Screen Recording permissions to capture
 input events and window titles. Without them the daemon will exit early or
 return empty focus data.
+
+### Example Outputs
+
+```txt
+❯ kronictl status
+Kronical Status Snapshot - 2026-01-03 20:14:40 -08:00
+═════════════════════════════════════════════════════════════
+
+Kronical Daemon:
+  State: Active
+  Run: PFgwShVsR5OM1HacwuD4jw
+  Focus: iTerm2 [2159] - jerry@Jerrys-MacBook-Pro:~
+  Cadence: 2000ms (Active)
+  Counts: signals=37833 hints=106 records=105
+  Next timeout: 2026-01-04 04:14:42.507038 UTC
+  Storage: backlog=3 last_flush=2026-01-04T04:14:36+00:00
+
+Tip: Use 'kronictl monitor' for real-time updates
+```
+
+<!-- insert a screenshot of monitor -->
+![kronictl monitor demo](docs/images/demo-monitor.png)
+
+See [docs/demo-snapshot.md](docs/demo-snapshot.md) for an example snapshot captures.
 
 ### Useful `kronictl` commands
 
