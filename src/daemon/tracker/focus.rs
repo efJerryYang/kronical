@@ -186,6 +186,7 @@ fn run_focus_worker(
     };
     let mut interner = StringInterner::new();
     let mut poll_lock_active = false;
+    let mut poll_lock_since: Option<Instant> = None;
     let mut coalesce_until: Option<Instant> = None;
     let mut pending_window_title: Option<String> = None;
     let mut last_app_window: LruCache<String, (String, u32)> =
@@ -236,7 +237,6 @@ fn run_focus_worker(
             window_position: None,
             window_size: None,
         };
-        info!("Focus worker: Emitting synthesized loginwindow focus (poll error)");
         callback.on_focus_change(focus_info);
     };
 
@@ -346,6 +346,7 @@ fn run_focus_worker(
                         let is_login = app_name.eq_ignore_ascii_case(LOGINWINDOW_APP);
                         if !is_login {
                             poll_lock_active = false;
+                            poll_lock_since = None;
                         }
                         if coalesce_ms > 0 {
                             coalesce_until =
@@ -419,6 +420,7 @@ fn run_focus_worker(
                     state.app_name = info.app_name.clone();
                     if !state.app_name.eq_ignore_ascii_case(LOGINWINDOW_APP) {
                         poll_lock_active = false;
+                        poll_lock_since = None;
                     }
                     state.pid = info.process_id;
                     state.process_start_time = get_process_start_time(info.process_id);
@@ -449,6 +451,7 @@ fn run_focus_worker(
                         state.app_name = info.app_name.clone();
                         if !state.app_name.eq_ignore_ascii_case(LOGINWINDOW_APP) {
                             poll_lock_active = false;
+                            poll_lock_since = None;
                         }
                         state.process_start_time = get_process_start_time(info.process_id);
                         if state.process_start_time == 0 {
@@ -479,7 +482,20 @@ fn run_focus_worker(
                 match get_active_window_info() {
                     Ok(info) => {
                         if poll_lock_active {
+                            let elapsed_ms = poll_lock_since
+                                .map(|since| since.elapsed().as_millis())
+                                .unwrap_or(0);
+                            info!(
+                                "Focus worker: Polling recovered from lock-like error after {}ms (previous_app='{}' app='{}' title='{}' pid={} wid={})",
+                                elapsed_ms,
+                                state.app_name,
+                                info.app_name,
+                                info.title,
+                                info.process_id,
+                                info.window_id
+                            );
                             poll_lock_active = false;
+                            poll_lock_since = None;
                             state.app_name = info.app_name.clone();
                             state.pid = info.process_id;
                             state.process_start_time = get_process_start_time(info.process_id);
@@ -544,7 +560,25 @@ fn run_focus_worker(
                         if is_lock_error {
                             if !poll_lock_active {
                                 poll_lock_active = true;
-                                emit_loginwindow_focus(&mut interner);
+                                poll_lock_since = Some(Instant::now());
+                                if state.app_name.eq_ignore_ascii_case(LOGINWINDOW_APP) {
+                                    info!(
+                                        "Focus worker: Polling returned lock-like error while app=loginwindow; synthesizing focus (app='{}' title='{}' pid={} wid={})",
+                                        state.app_name,
+                                        state.window_title,
+                                        state.pid,
+                                        state.window_id
+                                    );
+                                    emit_loginwindow_focus(&mut interner);
+                                } else {
+                                    warn!(
+                                        "Focus worker: Polling returned lock-like error but app is not loginwindow; skipping lock synthesis (app='{}' title='{}' pid={} wid={})",
+                                        state.app_name,
+                                        state.window_title,
+                                        state.pid,
+                                        state.window_id
+                                    );
+                                }
                             } else {
                                 debug!("Polling failed while locked: {:?}", e);
                             }
