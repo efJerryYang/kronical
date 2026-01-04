@@ -1,17 +1,29 @@
 use anyhow::{Context, Result};
+use base64::alphabet::Alphabet;
+use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig};
 use base64::Engine;
+use once_cell::sync::Lazy;
 use uuid::Uuid;
 
 const RUN_ID_LEN_BYTES: usize = 16;
+const RUN_ID_ALPHABET: &str =
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._";
+
+static RUN_ID_ENGINE: Lazy<GeneralPurpose> = Lazy::new(|| {
+    let alphabet = Alphabet::new(RUN_ID_ALPHABET).expect("valid run id alphabet");
+    GeneralPurpose::new(&alphabet, GeneralPurposeConfig::new().with_encode_padding(false))
+});
 
 pub fn encode_uuid(uuid: Uuid) -> String {
-    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(uuid.as_bytes())
+    RUN_ID_ENGINE.encode(uuid.as_bytes())
 }
 
 pub fn parse_run_id(input: &str) -> Result<String> {
-    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(input)
-        .with_context(|| format!("invalid base64 run id '{input}'"))?;
+    let decoded = RUN_ID_ENGINE.decode(input).or_else(|_| {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .decode(input)
+            .with_context(|| format!("invalid base64 run id '{input}'"))
+    })?;
     if decoded.len() != RUN_ID_LEN_BYTES {
         return Err(anyhow::anyhow!(
             "invalid run id length: expected {} bytes, got {}",
@@ -19,5 +31,5 @@ pub fn parse_run_id(input: &str) -> Result<String> {
             decoded.len()
         ));
     }
-    Ok(base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(decoded))
+    Ok(RUN_ID_ENGINE.encode(decoded))
 }
