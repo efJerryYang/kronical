@@ -284,7 +284,8 @@ fn start_daemon(data_file: PathBuf, _app_config: AppConfig, run_id: Option<Strin
             let _ = std::fs::remove_file(&pid_file);
         }
     }
-    println!("Starting Kronical daemon in background...");
+    let run_id_str = run_id.as_deref().unwrap_or("null");
+    println!("Starting Kronical daemon in background (run_id: {})...", run_id_str);
     spawn_kronid(run_id.as_deref())?;
     Ok(())
 }
