@@ -333,6 +333,10 @@ fn run_focus_worker(
         match rx.recv_timeout(Duration::from_millis(timeout_ms)) {
             Ok(msg) => match msg {
                 FocusMsg::AppChange { pid, app_name } => {
+                    info!(
+                        "Focus worker: App change received: app='{}' pid={} (prev_app='{}' prev_pid={})",
+                        app_name, pid, state.app_name, state.pid
+                    );
                     if state.app_name == app_name && state.pid == pid {
                         debug!("Focus worker: duplicate app change ignored");
                     } else {
@@ -376,8 +380,7 @@ fn run_focus_worker(
                                     info!(
                                         "Focus worker: Emitting consolidated focus change: {} -> {} (reason=app_change_flush seq={} pid={} wid={} reconcile_active={} awaiting_poll_reconcile={})",
                                         focus_info.app_name,
-                                        escape_log_value(&focus_info.window_title)
-                                        ,
+                                        escape_log_value(&focus_info.window_title),
                                         emit_seq,
                                         state.pid,
                                         state.window_id,
@@ -422,9 +425,19 @@ fn run_focus_worker(
                         } else {
                             schedule_emit(&mut scheduled_emit_at, 150);
                         }
+                        info!(
+                            "Focus worker: App change applied: app='{}' pid={} reconcile_active={} awaiting_poll_reconcile={}",
+                            state.app_name, state.pid, reconcile_active, awaiting_poll_reconcile
+                        );
                     }
                 }
                 FocusMsg::WindowChange { window_title } => {
+                    info!(
+                        "Focus worker: Window change received: title='{}' app='{}' pid={}",
+                        escape_log_value(&window_title),
+                        state.app_name,
+                        state.pid
+                    );
                     if window_title.is_empty() {
                         info!("Focus worker: ignoring empty window title");
                     } else if state.window_title == window_title {
@@ -482,6 +495,13 @@ fn run_focus_worker(
                             // small settle delay
                             schedule_emit(&mut scheduled_emit_at, 100);
                             reconcile_active = false;
+                            info!(
+                                "Focus worker: Window change applied: app='{}' title='{}' pid={} wid={}",
+                                state.app_name,
+                                escape_log_value(&state.window_title),
+                                state.pid,
+                                state.window_id
+                            );
                         } else {
                             warn!(
                                 "Focus worker: window change but state incomplete: app={}, pid={}, window={}",
@@ -493,6 +513,16 @@ fn run_focus_worker(
                     }
                 }
                 FocusMsg::AppChangeInfo(info) => {
+                    if reconcile_active
+                        && !state.app_name.eq_ignore_ascii_case(&info.app_name)
+                        && !state.app_name.is_empty()
+                    {
+                        debug!(
+                            "Focus worker: ignoring app info while reconciling (app='{}' info_app='{}')",
+                            state.app_name, info.app_name
+                        );
+                        continue;
+                    }
                     coalesce_until = None;
                     pending_window_title = None;
                     state.app_name = info.app_name.clone();
@@ -523,6 +553,16 @@ fn run_focus_worker(
                     }
                 }
                 FocusMsg::WindowChangeInfo(info) => {
+                    if reconcile_active
+                        && !state.app_name.eq_ignore_ascii_case(&info.app_name)
+                        && !state.app_name.is_empty()
+                    {
+                        debug!(
+                            "Focus worker: ignoring window info while reconciling (app='{}' info_app='{}')",
+                            state.app_name, info.app_name
+                        );
+                        continue;
+                    }
                     coalesce_until = None;
                     pending_window_title = None;
                     if state.pid != info.process_id {
@@ -561,6 +601,16 @@ fn run_focus_worker(
                 // Polling tick
                 match get_active_window_info() {
                     Ok(info) => {
+                        if reconcile_active
+                            && !state.app_name.eq_ignore_ascii_case(&info.app_name)
+                            && !state.app_name.is_empty()
+                        {
+                            debug!(
+                                "Focus worker: ignoring poll update while reconciling (app='{}' poll_app='{}')",
+                                state.app_name, info.app_name
+                            );
+                            continue;
+                        }
                         if poll_lock_active {
                             let elapsed_ms = poll_lock_since
                                 .map(|since| since.elapsed().as_millis())
@@ -592,6 +642,13 @@ fn run_focus_worker(
                             schedule_emit(&mut scheduled_emit_at, 0);
                         }
                         if awaiting_poll_reconcile && state.app_name == info.app_name {
+                            info!(
+                                "Focus worker: Poll reconcile updating app state: app='{}' pid={} title='{}' wid={}",
+                                info.app_name,
+                                info.process_id,
+                                escape_log_value(&info.title),
+                                info.window_id
+                            );
                             state.pid = info.process_id;
                             state.process_start_time = get_process_start_time(info.process_id);
                             if state.process_start_time == 0 {
@@ -623,6 +680,13 @@ fn run_focus_worker(
                                     escape_log_value(&current_title)
                                 );
                                 if state.pid != info.process_id {
+                                    info!(
+                                        "Focus worker: Poll title change updated app: app='{}' pid={} title='{}' wid={}",
+                                        info.app_name,
+                                        info.process_id,
+                                        escape_log_value(&info.title),
+                                        info.window_id
+                                    );
                                     state.pid = info.process_id;
                                     state.app_name = info.app_name.clone();
                                     state.process_start_time =
