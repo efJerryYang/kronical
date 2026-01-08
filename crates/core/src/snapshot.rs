@@ -19,8 +19,6 @@ pub struct Snapshot {
     pub last_transition: Option<Transition>,
     #[serde(default)]
     pub transitions_recent: Vec<Transition>,
-    #[serde(default)]
-    pub records: Vec<ActivityRecord>,
     pub counts: Counts,
     pub cadence_ms: u32,
     pub cadence_reason: String,
@@ -29,6 +27,8 @@ pub struct Snapshot {
     pub config: ConfigSummary,
     pub health: Vec<String>,
     pub aggregated_apps: Vec<SnapshotApp>,
+    #[serde(default)]
+    pub records: Vec<ActivityRecord>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,7 +59,6 @@ impl Snapshot {
             focus: None,
             last_transition: None,
             transitions_recent: Vec::new(),
-            records: Vec::new(),
             counts: Counts::default(),
             cadence_ms: 0,
             cadence_reason: String::new(),
@@ -71,6 +70,7 @@ impl Snapshot {
             config: ConfigSummary::default(),
             health: Vec::new(),
             aggregated_apps: Vec::new(),
+            records: Vec::new(),
         }
     }
 }
@@ -138,7 +138,6 @@ impl SnapshotBus {
             focus,
             last_transition,
             transitions_recent,
-            records,
             counts,
             cadence_ms,
             cadence_reason,
@@ -147,6 +146,7 @@ impl SnapshotBus {
             config,
             health,
             aggregated_apps,
+            records,
         };
         let _ = self.snapshot_tx.send(Arc::new(snap));
     }
