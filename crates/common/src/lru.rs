@@ -51,6 +51,29 @@ impl<K: Eq + Hash + Clone, V: Clone> LruCache<K, V> {
         self.evict_if_needed();
     }
 
+    pub fn any_entry_matches<F>(&mut self, mut predicate: F) -> bool
+    where
+        F: FnMut(&K, &V) -> bool,
+    {
+        let now = Instant::now();
+        let mut expired_keys: Vec<K> = Vec::new();
+        for (key, (value, ts)) in &self.map {
+            if let Some(ttl) = self.ttl {
+                if now.duration_since(*ts) > ttl {
+                    expired_keys.push(key.clone());
+                    continue;
+                }
+            }
+            if predicate(key, value) {
+                return true;
+            }
+        }
+        for key in expired_keys {
+            self.map.remove(&key);
+        }
+        false
+    }
+
     fn evict_if_needed(&mut self) {
         if self.map.len() <= self.capacity {
             return;

@@ -1,17 +1,19 @@
 use anyhow::{Context, Result};
+use base64::Engine;
 use base64::alphabet::Alphabet;
 use base64::engine::general_purpose::{GeneralPurpose, GeneralPurposeConfig};
-use base64::Engine;
 use once_cell::sync::Lazy;
 use uuid::Uuid;
 
 const RUN_ID_LEN_BYTES: usize = 16;
-const RUN_ID_ALPHABET: &str =
-    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._";
+const RUN_ID_ALPHABET: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789._";
 
 static RUN_ID_ENGINE: Lazy<GeneralPurpose> = Lazy::new(|| {
     let alphabet = Alphabet::new(RUN_ID_ALPHABET).expect("valid run id alphabet");
-    GeneralPurpose::new(&alphabet, GeneralPurposeConfig::new().with_encode_padding(false))
+    GeneralPurpose::new(
+        &alphabet,
+        GeneralPurposeConfig::new().with_encode_padding(false),
+    )
 });
 
 pub fn encode_uuid(uuid: Uuid) -> String {

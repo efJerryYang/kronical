@@ -17,6 +17,7 @@ use winshift::{ActiveWindowInfo, get_active_window_info};
 const LOGINWINDOW_APP: &str = "loginwindow";
 const LOGINWINDOW_WINDOW_ID: u32 = u32::MAX;
 const POLL_SUSPEND_MS: u64 = 0;
+const UNKNOWN_WINDOW_TITLE: &str = "-";
 
 #[derive(Debug, Clone, Copy)]
 pub struct FocusCacheCaps {
@@ -203,6 +204,8 @@ fn run_focus_worker(
     let mut pending_window_title: Option<String> = None;
     let mut last_app_window: LruCache<String, (String, u32)> =
         LruCache::with_capacity(caps.title_cache_capacity);
+    let mut weak_app_window: LruCache<String, (String, u32)> =
+        LruCache::with_capacity_and_ttl(caps.title_cache_capacity, Duration::from_secs(2));
     let mut last_app_before_change: Option<String> = None;
     let mut awaiting_poll_reconcile = false;
     let mut reconcile_active = false;
@@ -281,7 +284,10 @@ fn run_focus_worker(
 
     let record_last_app_window =
         |state: &FocusState, cache: &mut LruCache<String, (String, u32)>| {
-            if !state.app_name.is_empty() && !state.window_title.is_empty() {
+            if !state.app_name.is_empty()
+                && !state.window_title.is_empty()
+                && state.window_title != UNKNOWN_WINDOW_TITLE
+            {
                 cache.put(
                     state.app_name.clone(),
                     (state.window_title.clone(), state.window_id),
@@ -289,32 +295,110 @@ fn run_focus_worker(
             }
         };
 
+    let title_matches_other_app = |app_name: &String,
+                                   title: &str,
+                                   cache: &mut LruCache<String, (String, u32)>|
+     -> bool {
+        cache.any_entry_matches(|key, (cached_title, _)| !key.eq(app_name) && cached_title == title)
+    };
+
+    let title_matches_app =
+        |app_name: &String, title: &str, cache: &mut LruCache<String, (String, u32)>| -> bool {
+            cache
+                .get_cloned(app_name)
+                .map(|(cached_title, _)| cached_title == title)
+                .unwrap_or(false)
+        };
+
+    let record_weak_title =
+        |app_name: &String,
+         title: &str,
+         window_id: u32,
+         cache: &mut LruCache<String, (String, u32)>| {
+            if !app_name.is_empty() && !title.is_empty() && title != UNKNOWN_WINDOW_TITLE {
+                cache.put(app_name.clone(), (title.to_string(), window_id));
+            }
+        };
+
+    let validate_title_with_weak = |app_name: &String,
+                                    title: String,
+                                    strong: &mut LruCache<String, (String, u32)>,
+                                    weak: &mut LruCache<String, (String, u32)>|
+     -> String {
+        if title.is_empty() || title == UNKNOWN_WINDOW_TITLE {
+            return title;
+        }
+        if title_matches_app(app_name, &title, strong) {
+            return title;
+        }
+        if title_matches_other_app(app_name, &title, strong) {
+            warn!(
+                "Focus worker: title '{}' matches another app strong cache; using placeholder",
+                escape_log_value(&title)
+            );
+            return UNKNOWN_WINDOW_TITLE.to_string();
+        }
+        if title_matches_other_app(app_name, &title, weak) {
+            warn!(
+                "Focus worker: title '{}' matches another app weak cache; using placeholder",
+                escape_log_value(&title)
+            );
+            return UNKNOWN_WINDOW_TITLE.to_string();
+        }
+        if title_matches_app(app_name, &title, weak) {
+            return title;
+        }
+        title
+    };
+
     let reconcile_window_title = |app_name: &String,
                                   pending: &str,
-                                  cache: &mut LruCache<String, (String, u32)>,
+                                  strong: &mut LruCache<String, (String, u32)>,
+                                  weak: &mut LruCache<String, (String, u32)>,
                                   last_app: Option<&String>|
      -> ReconcileDecision {
         if app_name.eq_ignore_ascii_case(LOGINWINDOW_APP) && pending == "Login" {
             return ReconcileDecision::Accept(pending.to_string(), ReconcileSource::Pending);
         }
-        if let Some((cached_title, _cached_id)) = cache.get_cloned(app_name) {
-            if cached_title == pending {
-                return ReconcileDecision::Accept(pending.to_string(), ReconcileSource::Pending);
+        if let Some(prev_app) = last_app {
+            if title_matches_app(prev_app, pending, strong)
+                || title_matches_app(prev_app, pending, weak)
+            {
+                warn!(
+                    "Focus worker: pending window title '{}' matched previous app; using placeholder",
+                    escape_log_value(pending)
+                );
+                return ReconcileDecision::Accept(
+                    UNKNOWN_WINDOW_TITLE.to_string(),
+                    ReconcileSource::Cached,
+                );
             }
-            if let Some(prev_app) = last_app {
-                if let Some((prev_title, _)) = cache.get_cloned(prev_app) {
-                    if prev_title == pending {
-                        warn!(
-                            "Focus worker: reconciling window title for app {} using cached '{}' (pending='{}')",
-                            app_name,
-                            escape_log_value(&cached_title),
-                            escape_log_value(pending)
-                        );
-                        return ReconcileDecision::Accept(cached_title, ReconcileSource::Cached);
-                    }
-                }
-            }
-            return ReconcileDecision::Hold(pending.to_string());
+        }
+        if title_matches_app(app_name, pending, strong) {
+            return ReconcileDecision::Accept(pending.to_string(), ReconcileSource::Pending);
+        }
+        if title_matches_other_app(app_name, pending, strong) {
+            warn!(
+                "Focus worker: pending window title '{}' matches another app strong cache; using placeholder",
+                escape_log_value(pending)
+            );
+            return ReconcileDecision::Accept(
+                UNKNOWN_WINDOW_TITLE.to_string(),
+                ReconcileSource::Cached,
+            );
+        }
+        if title_matches_other_app(app_name, pending, weak) {
+            warn!(
+                "Focus worker: pending window title '{}' matches another app weak cache; using placeholder",
+                escape_log_value(pending)
+            );
+            return ReconcileDecision::Accept(
+                UNKNOWN_WINDOW_TITLE.to_string(),
+                ReconcileSource::Cached,
+            );
+        }
+        if title_matches_app(app_name, pending, weak) {
+            return ReconcileDecision::Accept(pending.to_string(), ReconcileSource::Pending);
         }
         ReconcileDecision::Hold(pending.to_string())
     };
@@ -353,6 +437,7 @@ fn run_focus_worker(
                                         &state.app_name,
                                         &title,
                                         &mut last_app_window,
+                                        &mut weak_app_window,
                                         last_app_before_change.as_ref(),
                                     ) {
                                         ReconcileDecision::Accept(value, _) => {
@@ -446,6 +531,12 @@ fn run_focus_worker(
                         if reconcile_active {
                             if let Some(until) = coalesce_until {
                                 if Instant::now() < until {
+                                    record_weak_title(
+                                        &state.app_name,
+                                        &window_title,
+                                        state.window_id,
+                                        &mut weak_app_window,
+                                    );
                                     pending_window_title = Some(window_title);
                                     continue;
                                 }
@@ -454,6 +545,7 @@ fn run_focus_worker(
                                 &state.app_name,
                                 &window_title,
                                 &mut last_app_window,
+                                &mut weak_app_window,
                                 last_app_before_change.as_ref(),
                             ) {
                                 ReconcileDecision::Accept(value, source) => {
@@ -464,12 +556,29 @@ fn run_focus_worker(
                                             state.app_name
                                         );
                                     }
+                                    record_weak_title(
+                                        &state.app_name,
+                                        &value,
+                                        state.window_id,
+                                        &mut weak_app_window,
+                                    );
                                     state.window_title = value;
                                     reconcile_active = false;
                                 }
                                 ReconcileDecision::Hold(value) => {
                                     if coalesce_until.is_none() {
-                                        state.window_title = value;
+                                        record_weak_title(
+                                            &state.app_name,
+                                            &value,
+                                            state.window_id,
+                                            &mut weak_app_window,
+                                        );
+                                        state.window_title = validate_title_with_weak(
+                                            &state.app_name,
+                                            value,
+                                            &mut last_app_window,
+                                            &mut weak_app_window,
+                                        );
                                         warn!(
                                             "Focus worker: accepting unverified window title '{}' for app {} (no coalesce window)",
                                             escape_log_value(&state.window_title),
@@ -477,13 +586,30 @@ fn run_focus_worker(
                                         );
                                         reconcile_active = false;
                                     } else {
+                                        record_weak_title(
+                                            &state.app_name,
+                                            &value,
+                                            state.window_id,
+                                            &mut weak_app_window,
+                                        );
                                         pending_window_title = Some(value);
                                         continue;
                                     }
                                 }
                             }
                         } else {
-                            state.window_title = window_title;
+                            record_weak_title(
+                                &state.app_name,
+                                &window_title,
+                                state.window_id,
+                                &mut weak_app_window,
+                            );
+                            state.window_title = validate_title_with_weak(
+                                &state.app_name,
+                                window_title,
+                                &mut last_app_window,
+                                &mut weak_app_window,
+                            );
                         }
                         if state.app_name.eq_ignore_ascii_case(LOGINWINDOW_APP)
                             && state.window_id == 0
@@ -535,7 +661,18 @@ fn run_focus_worker(
                     if state.process_start_time == 0 {
                         state.process_start_time = Utc::now().timestamp_millis() as u64;
                     }
-                    state.window_title = info.title.clone();
+                    record_weak_title(
+                        &state.app_name,
+                        &info.title,
+                        info.window_id,
+                        &mut weak_app_window,
+                    );
+                    state.window_title = validate_title_with_weak(
+                        &state.app_name,
+                        info.title.clone(),
+                        &mut last_app_window,
+                        &mut weak_app_window,
+                    );
                     state.window_id = if state.app_name.eq_ignore_ascii_case(LOGINWINDOW_APP)
                         && info.window_id == 0
                     {
@@ -577,7 +714,18 @@ fn run_focus_worker(
                             state.process_start_time = Utc::now().timestamp_millis() as u64;
                         }
                     }
-                    state.window_title = info.title.clone();
+                    record_weak_title(
+                        &state.app_name,
+                        &info.title,
+                        info.window_id,
+                        &mut weak_app_window,
+                    );
+                    state.window_title = validate_title_with_weak(
+                        &state.app_name,
+                        info.title.clone(),
+                        &mut last_app_window,
+                        &mut weak_app_window,
+                    );
                     state.window_id = if state.app_name.eq_ignore_ascii_case(LOGINWINDOW_APP)
                         && info.window_id == 0
                     {
@@ -632,13 +780,26 @@ fn run_focus_worker(
                             if state.process_start_time == 0 {
                                 state.process_start_time = Utc::now().timestamp_millis() as u64;
                             }
-                            state.window_title = info.title.clone();
+                            record_weak_title(
+                                &state.app_name,
+                                &info.title,
+                                info.window_id,
+                                &mut weak_app_window,
+                            );
+                            state.window_title = validate_title_with_weak(
+                                &state.app_name,
+                                info.title.clone(),
+                                &mut last_app_window,
+                                &mut weak_app_window,
+                            );
                             state.window_id = info.window_id;
                             state.window_instance_start = Utc::now();
                             state.last_app_update = Instant::now();
                             state.last_window_update = state.last_app_update;
                             awaiting_poll_reconcile = false;
                             reconcile_active = false;
+                            pending_window_title = None;
+                            coalesce_until = None;
                             schedule_emit(&mut scheduled_emit_at, 0);
                         }
                         if awaiting_poll_reconcile && state.app_name == info.app_name {
@@ -654,7 +815,18 @@ fn run_focus_worker(
                             if state.process_start_time == 0 {
                                 state.process_start_time = Utc::now().timestamp_millis() as u64;
                             }
-                            state.window_title = info.title.clone();
+                            record_weak_title(
+                                &state.app_name,
+                                &info.title,
+                                info.window_id,
+                                &mut weak_app_window,
+                            );
+                            state.window_title = validate_title_with_weak(
+                                &state.app_name,
+                                info.title.clone(),
+                                &mut last_app_window,
+                                &mut weak_app_window,
+                            );
                             state.window_id =
                                 if state.app_name.eq_ignore_ascii_case(LOGINWINDOW_APP)
                                     && info.window_id == 0
@@ -667,6 +839,8 @@ fn run_focus_worker(
                             state.last_window_update = Instant::now();
                             awaiting_poll_reconcile = false;
                             reconcile_active = false;
+                            pending_window_title = None;
+                            coalesce_until = None;
                             schedule_emit(&mut scheduled_emit_at, 0);
                         }
                         let window_id = info.window_id;
@@ -692,7 +866,18 @@ fn run_focus_worker(
                                     state.process_start_time =
                                         get_process_start_time(info.process_id);
                                 }
-                                state.window_title = info.title.clone();
+                                record_weak_title(
+                                    &state.app_name,
+                                    &info.title,
+                                    info.window_id,
+                                    &mut weak_app_window,
+                                );
+                                state.window_title = validate_title_with_weak(
+                                    &state.app_name,
+                                    info.title.clone(),
+                                    &mut last_app_window,
+                                    &mut weak_app_window,
+                                );
                                 state.window_id = info.window_id;
                                 state.last_window_update = Instant::now();
                                 if state.is_complete() {
@@ -746,6 +931,7 @@ fn run_focus_worker(
                         &state.app_name,
                         &title,
                         &mut last_app_window,
+                        &mut weak_app_window,
                         last_app_before_change.as_ref(),
                     ) {
                         ReconcileDecision::Accept(value, source) => {
@@ -756,10 +942,27 @@ fn run_focus_worker(
                                     state.app_name
                                 );
                             }
+                            record_weak_title(
+                                &state.app_name,
+                                &value,
+                                state.window_id,
+                                &mut weak_app_window,
+                            );
                             state.window_title = value;
                         }
                         ReconcileDecision::Hold(value) => {
-                            state.window_title = value;
+                            record_weak_title(
+                                &state.app_name,
+                                &value,
+                                state.window_id,
+                                &mut weak_app_window,
+                            );
+                            state.window_title = validate_title_with_weak(
+                                &state.app_name,
+                                value,
+                                &mut last_app_window,
+                                &mut weak_app_window,
+                            );
                             warn!(
                                 "Focus worker: accepting unverified window title '{}' for app {} after reconcile timeout",
                                 escape_log_value(&state.window_title),
