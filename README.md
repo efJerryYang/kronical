@@ -81,12 +81,20 @@ HTTP (Unix socket):
 
 - `GET /v1/snapshot` -> JSON snapshot
 - `GET /v1/stream` -> SSE stream of snapshots
+- Example (curl):
+  ```sh
+  curl --unix-socket ~/.kronical/kroni.http.sock http://localhost/v1/snapshot
+  ```
 
 gRPC (Unix socket):
 
 - `Snapshot` -> snapshot payload
 - `Watch` -> streaming snapshots
 - `GetSystemMetrics` -> system tracker metrics
+- Example (grpcurl):
+  ```sh
+  grpcurl -plaintext -import-path proto -proto proto/kroni.proto unix:///Users/jerry/.kronical/kroni.sock kroni.v1.Kroni/Snapshot
+  ```
 
 Snapshot payloads include current state, focus, cadence, counts, `run_id`,
 recent transitions, aggregated app/window durations, and the full in-memory

@@ -10,6 +10,7 @@ use hyper::server::conn::http1;
 use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
 use std::convert::Infallible;
+use std::error::Error;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -105,7 +106,18 @@ pub fn spawn_http_server(
                     {
                         // Treat client-initiated disconnects (e.g., quitting the monitor)
                         // as a normal shutdown; hyper reports these as IncompleteMessage.
-                        if err.is_incomplete_message() {
+                        let io_error_kind = err
+                            .source()
+                            .and_then(|source| source.downcast_ref::<std::io::Error>())
+                            .map(|io_err| io_err.kind());
+                        let is_client_disconnect = err.is_incomplete_message()
+                            || matches!(
+                                io_error_kind,
+                                Some(std::io::ErrorKind::NotConnected)
+                                    | Some(std::io::ErrorKind::BrokenPipe)
+                                    | Some(std::io::ErrorKind::ConnectionReset)
+                            );
+                        if is_client_disconnect {
                             debug!("Client disconnected while streaming (incomplete message) — normal exit");
                         } else {
                             eprintln!("Error serving connection: {:?}", err);
