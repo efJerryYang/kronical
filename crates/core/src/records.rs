@@ -82,11 +82,16 @@ pub struct RecordBuilder {
 
 impl RecordBuilder {
     pub fn new(initial_state: ActivityState) -> Self {
+        Self::with_next_record_id(initial_state, 1)
+    }
+
+    pub fn with_next_record_id(initial_state: ActivityState, next_record_id: u64) -> Self {
+        let next_record_id = next_record_id.max(1);
         Self {
             current_state: initial_state,
             current_record: None,
             current_focus: None,
-            next_record_id: 1,
+            next_record_id,
             string_interner: StringInterner::new(),
         }
     }
@@ -646,6 +651,22 @@ mod tests {
             .expect("transition back closes active slice");
         assert_eq!(active_slice.state, ActivityState::Active);
         assert_eq!(builder.current_state(), ActivityState::Inactive);
+    }
+
+    #[test]
+    fn record_builder_respects_next_record_id() {
+        let mut builder = RecordBuilder::with_next_record_id(ActivityState::Inactive, 42);
+        let now = Utc::now();
+        let focus_a = make_focus(1, 10, "Editor", 1, "A", now);
+        let focus_b = make_focus(1, 10, "Editor", 2, "B", now + Duration::milliseconds(10));
+
+        assert!(builder.on_hint(&focus_hint(1, focus_a, now)).is_none());
+
+        let record = builder
+            .on_hint(&focus_hint(2, focus_b, now + Duration::milliseconds(20)))
+            .expect("previous focus should close");
+
+        assert_eq!(record.record_id, 42);
     }
 
     #[test]

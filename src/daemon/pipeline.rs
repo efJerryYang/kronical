@@ -115,12 +115,20 @@ pub fn spawn_pipeline(
         .context("spawn pipeline storage stage")?;
     handles.push(storage_handle);
 
+    let next_record_id = snapshot_bus
+        .run_id()
+        .and_then(|_| initial_records.iter().map(|record| record.record_id).max())
+        .unwrap_or(0)
+        .saturating_add(1)
+        .max(1);
+
     let hints_handle = spawn_hints_stage(
         &threads,
         hints_rx,
         storage_tx.clone(),
         snapshot_tx.clone(),
         snapshot_bus.run_id().map(|id| id.to_string()),
+        next_record_id,
     )
     .context("spawn pipeline hints stage")?;
     handles.push(hints_handle);

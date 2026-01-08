@@ -14,11 +14,13 @@ pub fn spawn_hints_stage(
     storage_tx: Sender<StorageCommand>,
     snapshot_tx: Sender<SnapshotMessage>,
     run_id: Option<String>,
+    next_record_id: u64,
 ) -> Result<ThreadHandle> {
     let threads = threads.clone();
     threads.spawn("pipeline-hints", move || {
         info!("Pipeline hints stage started");
-        let mut record_builder = RecordBuilder::new(ActivityState::Inactive);
+        let mut record_builder =
+            RecordBuilder::with_next_record_id(ActivityState::Inactive, next_record_id);
 
         while let Ok(env) = hints_rx.recv() {
             if let Err(e) = storage_tx.send(StorageCommand::Envelope(env.clone())) {
