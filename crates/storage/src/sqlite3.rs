@@ -95,6 +95,7 @@ impl SqliteStorage {
             CREATE INDEX IF NOT EXISTS idx_raw_envelopes_timestamp ON raw_envelopes(timestamp);
             CREATE TABLE IF NOT EXISTS activity_records (
                 id INTEGER PRIMARY KEY,
+                record_id INTEGER,
                 start_time TEXT NOT NULL,
                 end_time TEXT,
                 state TEXT NOT NULL,
@@ -122,6 +123,10 @@ impl SqliteStorage {
         )?;
         let _ = conn.execute("ALTER TABLE recent_transitions ADD COLUMN run_id TEXT", []);
         let _ = conn.execute("ALTER TABLE activity_records ADD COLUMN run_id TEXT", []);
+        let _ = conn.execute(
+            "ALTER TABLE activity_records ADD COLUMN record_id INTEGER",
+            [],
+        );
         Ok(())
     }
 
@@ -153,8 +158,9 @@ impl SqliteStorage {
                         .as_ref()
                         .map(|fi| serde_json::to_string(fi).unwrap());
                     tx.execute(
-                        "INSERT INTO activity_records (start_time, end_time, state, focus_info, run_id) VALUES (?, ?, ?, ?, ?)",
+                        "INSERT INTO activity_records (record_id, start_time, end_time, state, focus_info, run_id) VALUES (?, ?, ?, ?, ?, ?)",
                         params![
+                            record.record_id as i64,
                             record.start_time.to_rfc3339(),
                             record.end_time.map(|t| t.to_rfc3339()),
                             format!("{:?}", record.state),
@@ -365,14 +371,14 @@ impl StorageBackend for SqliteStorage {
         // Include records that have not ended or ended after 'since'.
         let mut stmt = match run_id {
             Some(_) => conn.prepare(
-                "SELECT id, start_time, end_time, state, focus_info, run_id
+                "SELECT COALESCE(record_id, id) as record_id, start_time, end_time, state, focus_info, run_id
                  FROM activity_records
                  WHERE (end_time IS NULL OR end_time >= ?1)
                    AND run_id = ?2
                  ORDER BY start_time ASC",
             )?,
             None => conn.prepare(
-                "SELECT id, start_time, end_time, state, focus_info, run_id
+                "SELECT COALESCE(record_id, id) as record_id, start_time, end_time, state, focus_info, run_id
                  FROM activity_records
                  WHERE (end_time IS NULL OR end_time >= ?1)
                  ORDER BY start_time ASC",

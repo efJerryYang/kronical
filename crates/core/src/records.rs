@@ -82,11 +82,10 @@ pub struct RecordBuilder {
 
 impl RecordBuilder {
     pub fn new(initial_state: ActivityState) -> Self {
-        Self::with_next_record_id(initial_state, 1)
+        Self::with_next_record_id(initial_state, 0)
     }
 
     pub fn with_next_record_id(initial_state: ActivityState, next_record_id: u64) -> Self {
-        let next_record_id = next_record_id.max(1);
         Self {
             current_state: initial_state,
             current_record: None,

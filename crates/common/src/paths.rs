@@ -3,8 +3,8 @@ use std::path::{Path, PathBuf};
 
 const PID_FILE_NAME: &str = "kronid.pid";
 const RUN_ID_FILE_NAME: &str = "kronid.run_id";
-const GRPC_UDS_NAME: &str = "kroni.sock";
-const HTTP_UDS_NAME: &str = "kroni.http.sock";
+const GRPC_UDS_NAME: &str = "kronid.sock";
+const HTTP_UDS_NAME: &str = "kronid.http.sock";
 const DATA_DB_NAME_DUCKDB: &str = "data.duckdb";
 const DATA_DB_NAME_SQLITE: &str = "data.sqlite3";
 const TRACKER_DB_NAME_DUCKDB: &str = "system-tracker.duckdb";
@@ -52,8 +52,8 @@ mod tests {
         let base = Path::new("/tmp/workspace");
         assert_eq!(pid_file(base), base.join("kronid.pid"));
         assert_eq!(run_id_file(base), base.join("kronid.run_id"));
-        assert_eq!(grpc_uds(base), base.join("kroni.sock"));
-        assert_eq!(http_uds(base), base.join("kroni.http.sock"));
+        assert_eq!(grpc_uds(base), base.join("kronid.sock"));
+        assert_eq!(http_uds(base), base.join("kronid.http.sock"));
     }
 
     #[test]

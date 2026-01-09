@@ -118,9 +118,8 @@ pub fn spawn_pipeline(
     let next_record_id = snapshot_bus
         .run_id()
         .and_then(|_| initial_records.iter().map(|record| record.record_id).max())
-        .unwrap_or(0)
-        .saturating_add(1)
-        .max(1);
+        .map(|max_id| max_id.saturating_add(1))
+        .unwrap_or(0);
 
     let hints_handle = spawn_hints_stage(
         &threads,
