@@ -30,9 +30,9 @@ Install it from source (`kronictl`, `kronid`):
 
 ```bash
 cargo install --path .
-kronictl start   # launches the daemon, can optionally pass `--run <run_id>`
+kronictl start   # launches the daemon, can optionally pass `--run <runId>`
 kronictl status
-kronictl restart # restarts the daemon with same run_id
+kronictl restart # restarts the daemon with same runId
 kronictl stop    # stops the daemon
 ```
 
@@ -93,10 +93,10 @@ gRPC (Unix socket):
 - `GetSystemMetrics` -> system tracker metrics
 - Example (grpcurl):
   ```sh
-  grpcurl -plaintext -import-path proto -proto proto/kroni.proto unix:///Users/jerry/.kronical/kronid.sock kroni.v1.Kroni/Snapshot
+  grpcurl -plaintext -import-path proto -proto proto/kroni.proto unix:///Users/$USER/.kronical/kronid.sock kroni.v1.Kroni/Snapshot
   ```
 
-Snapshot payloads include current state, focus, cadence, counts, `run_id`,
+Snapshot payloads include current state, focus, cadence, counts, `runId`,
 recent transitions, aggregated app/window durations, and the full in-memory
 `records` list for the same run ID within the retention window.
 

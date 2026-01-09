@@ -46,7 +46,7 @@ Hints derived from signals (`FocusChanged`, `TitleChanged`, `StateChanged`,
 snapshots and transitions. Snapshot payloads include:
 
 - current activity state, focus, cadence, counts
-- `run_id`
+- `runId`
 - recent transitions (buffered)
 - aggregated app/window durations
 - **full in-memory `records` list** (same run ID, retention window)
@@ -68,6 +68,6 @@ gRPC (Unix socket):
 
 - `activity_records`, `compact_events`, and `recent_transitions` are persisted.
 - On startup, the pipeline hydrates records/transitions filtered by:
-  - same `run_id` (when present)
+  - same `runId` (when present)
   - retention window (`retention_minutes`) for records
   - retention window for transitions (plus a cap)

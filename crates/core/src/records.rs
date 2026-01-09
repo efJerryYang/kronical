@@ -16,12 +16,14 @@ pub enum ActivityState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ActivityRecord {
     pub record_id: u64,
     pub run_id: Option<String>,
     pub start_time: DateTime<Utc>,
     pub end_time: Option<DateTime<Utc>>,
     pub state: ActivityState,
+    #[serde(rename = "focus")]
     pub focus_info: Option<WindowFocusInfo>,
     pub event_count: u32,
     pub triggering_events: Vec<u64>,

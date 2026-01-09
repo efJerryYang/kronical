@@ -1058,30 +1058,34 @@ fn map_pb_snapshot(
         .focus
         .map(|f| kronical::daemon::events::WindowFocusInfo {
             pid: f.pid,
-            process_start_time: 0,
-            app_name: Arc::new(f.app),
-            window_title: Arc::new(f.title),
+            process_start_time: f.process_start_time,
+            app_name: Arc::new(f.app_name),
+            window_title: Arc::new(f.window_title),
             window_id: f.window_id.parse().unwrap_or(0),
             window_instance_start: f
-                .since
+                .window_instance_start
                 .and_then(|ts| chrono::DateTime::<Utc>::from_timestamp(ts.seconds, ts.nanos as u32))
                 .unwrap_or_else(Utc::now),
-            window_position: None,
-            window_size: None,
+            window_position: f
+                .window_position
+                .map(|pos| kronical::daemon::events::MousePosition { x: pos.x, y: pos.y }),
+            window_size: f.window_size.map(|size| (size.width, size.height)),
         });
     let map_record_focus = |f: kronical::kroni_api::kroni::v1::snapshot_reply::Focus| {
         kronical::daemon::events::WindowFocusInfo {
             pid: f.pid,
-            process_start_time: 0,
-            app_name: Arc::new(f.app),
-            window_title: Arc::new(f.title),
+            process_start_time: f.process_start_time,
+            app_name: Arc::new(f.app_name),
+            window_title: Arc::new(f.window_title),
             window_id: f.window_id.parse().unwrap_or(0),
             window_instance_start: f
-                .since
+                .window_instance_start
                 .and_then(|ts| chrono::DateTime::<Utc>::from_timestamp(ts.seconds, ts.nanos as u32))
                 .unwrap_or_else(Utc::now),
-            window_position: None,
-            window_size: None,
+            window_position: f
+                .window_position
+                .map(|pos| kronical::daemon::events::MousePosition { x: pos.x, y: pos.y }),
+            window_size: f.window_size.map(|size| (size.width, size.height)),
         }
     };
     let last_transition = reply
@@ -1324,8 +1328,8 @@ fn grpc_watch(_uds_http_sock: &PathBuf, pretty: bool) -> Result<()> {
 fn print_snapshot_pretty(s: &kronical::daemon::snapshot::Snapshot) {
     println!("Kronical Snapshot");
     println!("- seq: {}", s.seq);
-    println!("- mono_ns: {}", s.mono_ns);
-    println!("- run_id: {}", s.run_id.as_deref().unwrap_or("-"));
+    println!("- monoNs: {}", s.mono_ns);
+    println!("- runId: {}", s.run_id.as_deref().unwrap_or("-"));
     println!("- state: {:?}", s.activity_state);
     if let Some(f) = &s.focus {
         println!("- focus: {} [{}] - {}", f.app_name, f.pid, f.window_title);
@@ -1333,18 +1337,18 @@ fn print_snapshot_pretty(s: &kronical::daemon::snapshot::Snapshot) {
         println!("- focus: -");
     }
     if let Some(t) = &s.last_transition {
-        println!("- last_transition: {:?} -> {:?} at {}", t.from, t.to, t.at);
+        println!("- lastTransition: {:?} -> {:?} at {}", t.from, t.to, t.at);
     }
     println!("- cadence: {}ms ({})", s.cadence_ms, s.cadence_reason);
     if let Some(nt) = &s.next_timeout {
-        println!("- next_timeout: {}", nt);
+        println!("- nextTimeout: {}", nt);
     }
     println!(
         "- counts: signals={} hints={} records={}",
         s.counts.signals_seen, s.counts.hints_seen, s.counts.records_emitted
     );
     println!(
-        "- storage: backlog={} last_flush={}",
+        "- storage: backlog={} lastFlushAt={}",
         s.storage.backlog_count,
         s.storage
             .last_flush_at

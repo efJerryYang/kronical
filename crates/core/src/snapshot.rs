@@ -9,6 +9,7 @@ use std::sync::{
 use tokio::sync::watch;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Snapshot {
     pub seq: u64,
     pub mono_ns: u64,
@@ -32,6 +33,7 @@ pub struct Snapshot {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Transition {
     pub from: ActivityState,
     pub to: ActivityState,
@@ -43,6 +45,7 @@ pub struct Transition {
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct Counts {
     pub signals_seen: u64,
     pub hints_seen: u64,
@@ -204,12 +207,14 @@ fn monotonic_ns() -> u64 {
 }
 
 #[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct StorageInfo {
     pub backlog_count: u64,
     pub last_flush_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct ConfigSummary {
     pub active_grace_secs: u64,
     pub idle_threshold_secs: u64,
@@ -221,6 +226,7 @@ pub struct ConfigSummary {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SnapshotWindow {
     pub window_id: String,
     pub window_title: String,
@@ -231,6 +237,7 @@ pub struct SnapshotWindow {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct SnapshotApp {
     pub app_name: String,
     pub pid: i32,

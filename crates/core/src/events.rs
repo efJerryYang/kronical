@@ -66,6 +66,7 @@ pub enum WheelScrollType {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct WindowFocusInfo {
     pub pid: i32,
     pub process_start_time: u64,

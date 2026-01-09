@@ -3,10 +3,18 @@ use crate::daemon::snapshot;
 use crate::kroni_api::kroni::v1::kroni_server::{Kroni, KroniServer};
 use crate::kroni_api::kroni::v1::{
     SnapshotReply, SnapshotRequest, SystemMetric, SystemMetricsReply, SystemMetricsRequest,
-    WatchRequest, snapshot_reply::ActivityRecord as PbRecord,
-    snapshot_reply::ActivityState as PbState, snapshot_reply::Cadence, snapshot_reply::Config,
-    snapshot_reply::Counts, snapshot_reply::Focus, snapshot_reply::SnapshotApp as PbApp,
-    snapshot_reply::SnapshotWindow as PbWin, snapshot_reply::Storage, snapshot_reply::Transition,
+    WatchRequest,
+    snapshot_reply::ActivityRecord as PbRecord,
+    snapshot_reply::ActivityState as PbState,
+    snapshot_reply::Cadence,
+    snapshot_reply::Config,
+    snapshot_reply::Counts,
+    snapshot_reply::Focus,
+    snapshot_reply::SnapshotApp as PbApp,
+    snapshot_reply::SnapshotWindow as PbWin,
+    snapshot_reply::Storage,
+    snapshot_reply::Transition,
+    snapshot_reply::focus::{Position as PbPosition, Size as PbSize},
 };
 use crate::util::logging::{info, warn};
 use anyhow::{Context, Result};
@@ -290,11 +298,19 @@ pub fn to_pb(s: &snapshot::Snapshot) -> SnapshotReply {
         crate::daemon::records::ActivityState::Locked => PbState::Locked,
     } as i32;
     let map_focus = |f: &crate::daemon::events::WindowFocusInfo| Focus {
-        app: (*f.app_name).clone(),
+        app_name: (*f.app_name).clone(),
         pid: f.pid,
         window_id: f.window_id.to_string(),
-        title: (*f.window_title).clone(),
-        since: Some(utc_to_ts(f.window_instance_start)),
+        window_title: (*f.window_title).clone(),
+        window_instance_start: Some(utc_to_ts(f.window_instance_start)),
+        process_start_time: f.process_start_time,
+        window_position: f
+            .window_position
+            .as_ref()
+            .map(|pos| PbPosition { x: pos.x, y: pos.y }),
+        window_size: f
+            .window_size
+            .map(|(width, height)| PbSize { width, height }),
     };
     let state = map_state(s.activity_state);
     let focus = s.focus.as_ref().map(map_focus);
@@ -531,6 +547,7 @@ mod tests {
             to: ActivityState::Active,
             at: Utc.with_ymd_and_hms(2024, 5, 1, 12, 29, 0).unwrap(),
             by_signal: Some("keyboard".to_string()),
+            run_id: None,
         });
         snapshot.counts = SnapshotCounts {
             signals_seen: 12,
@@ -575,9 +592,9 @@ mod tests {
         assert_eq!(reply.seq, 42);
         assert_eq!(reply.activity_state, PbState::Active as i32);
         let focus = reply.focus.expect("focus converted");
-        assert_eq!(focus.app, "Terminal");
+        assert_eq!(focus.app_name, "Terminal");
         assert_eq!(focus.window_id, "7");
-        assert!(focus.since.is_some());
+        assert!(focus.window_instance_start.is_some());
 
         let transition = reply.last_transition.expect("transition converted");
         assert_eq!(transition.from, PbState::Inactive as i32);
@@ -680,7 +697,7 @@ mod tests {
 
         let second = stream.next().await.expect("second item").expect("ok");
         assert_eq!(second.activity_state, PbState::Active as i32);
-        assert_eq!(second.focus.unwrap().title, "Build log");
+        assert_eq!(second.focus.unwrap().window_title, "Build log");
     }
 
     #[test]

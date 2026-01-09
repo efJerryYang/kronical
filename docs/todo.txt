@@ -3,7 +3,7 @@ Context
 - Focus: Clear state transition tables, plugin system (including ScreenCapture), redaction pipeline, multi-LLM roles, scheduling, and security to keep screenshots private.
 
 Inputs and goals (summary)
-- Base input source: daemon snapshot (activity_state, focus app/window, last_transition, etc.).
+- Base input source: daemon snapshot (activityState, focus app/window, lastTransition, etc.).
 - Optional plugin inputs: per-app integrations that provide extra context (browser tab, IDE file, meeting info, etc.).
 - Sensitive info filter: mandatory local redaction before any LLM call.
 - Multi-LLM roles: Router, Extractor(s), Synthesizer, Planner, Notifier.
