@@ -14,7 +14,6 @@ fn parses_single_sse_event_into_snapshot() {
         focus: None,
         last_transition: None,
         transitions_recent: vec![],
-        records: vec![],
         counts: Default::default(),
         cadence_ms: 0,
         cadence_reason: String::new(),
@@ -23,6 +22,7 @@ fn parses_single_sse_event_into_snapshot() {
         config: Default::default(),
         health: vec![],
         aggregated_apps: vec![],
+        records: vec![],
     };
     let json = serde_json::to_string(&snap).unwrap();
     let sse = assemble_sse_payload(&json);

@@ -20,7 +20,6 @@ fn maps_aggregated_apps_in_grpc_snapshot_reply() {
             run_id: None,
         }),
         transitions_recent: vec![],
-        records: Vec::new(),
         counts: Counts {
             signals_seen: 1,
             hints_seen: 2,
@@ -59,6 +58,7 @@ fn maps_aggregated_apps_in_grpc_snapshot_reply() {
             total_duration_secs: 300,
             total_duration_pretty: "5m".into(),
         }],
+        records: Vec::new(),
     };
 
     let reply = kronical::daemon::server::grpc::to_pb(&s);

@@ -1255,7 +1255,6 @@ fn map_pb_snapshot(
         focus,
         last_transition,
         transitions_recent: Vec::new(),
-        records,
         counts,
         cadence_ms,
         cadence_reason,
@@ -1264,6 +1263,7 @@ fn map_pb_snapshot(
         config,
         health,
         aggregated_apps,
+        records,
     }
 }
 
