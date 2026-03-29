@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use chrono::Utc;
+use chrono::{DateTime, Local, TimeZone, Timelike, Utc};
 use clap::{Parser, Subcommand};
 use crossterm::{
     event as crossterm_event, execute,
@@ -14,6 +14,7 @@ use kronical::kroni_api::kroni::v1::{
 };
 use kronical::util::config::AppConfig;
 use kronical::util::logging::error;
+use kronical_core::records::{AggregatedActivity, ActivityRecord, aggregate_activities_since};
 use ratatui::{
     Terminal,
     prelude::{Backend, Constraint, CrosstermBackend, Direction, Layout},
@@ -60,6 +61,384 @@ fn pretty_duration(seconds: u64) -> String {
         result.push_str(&format!("{}s", secs));
     }
     result
+}
+
+const LOGINWINDOW_APP: &str = "loginwindow";
+const MONITOR_SLEEP_MIN_SECS: i64 = 4 * 60 * 60;
+const MONITOR_SLEEP_MERGE_GAP_SECS: i64 = 60 * 60;
+const MONITOR_SLEEP_WINDOW_START_HOUR: u32 = 21;
+const MONITOR_SLEEP_TARGET_HOUR: u32 = 4;
+const MONITOR_SLEEP_NIGHT_START_HOUR: u32 = 22;
+const MONITOR_SLEEP_NIGHT_END_HOUR: u32 = 10;
+const MONITOR_SLEEP_MIDPOINT_MAX_DIFF_SECS: i64 = 6 * 60 * 60;
+
+struct AppsPeriod {
+    since_utc: DateTime<Utc>,
+    title: String,
+    line: String,
+}
+
+fn local_midnight(now_local: DateTime<Local>) -> DateTime<Local> {
+    let naive_midnight = now_local.date_naive().and_hms_opt(0, 0, 0).unwrap();
+    Local
+        .from_local_datetime(&naive_midnight)
+        .earliest()
+        .or_else(|| Local.from_local_datetime(&naive_midnight).latest())
+        .unwrap_or(now_local)
+}
+
+fn sleep_window_bounds(now_local: DateTime<Local>) -> (DateTime<Local>, DateTime<Local>) {
+    let today = now_local.date_naive();
+    let start_today = today
+        .and_hms_opt(MONITOR_SLEEP_WINDOW_START_HOUR, 0, 0)
+        .unwrap();
+    let start_today = Local
+        .from_local_datetime(&start_today)
+        .earliest()
+        .unwrap_or(now_local);
+    if now_local.hour() >= MONITOR_SLEEP_WINDOW_START_HOUR {
+        let end = start_today + chrono::Duration::hours(24);
+        (start_today, end)
+    } else {
+        let start = start_today - chrono::Duration::hours(24);
+        (start, start_today)
+    }
+}
+
+fn midpoint_score(midpoint_local: DateTime<Local>) -> f64 {
+    let secs = midpoint_local.num_seconds_from_midnight() as i64;
+    let target_secs = (MONITOR_SLEEP_TARGET_HOUR as i64) * 3600;
+    let diff = (secs - target_secs).abs();
+    let diff = diff.min(MONITOR_SLEEP_MIDPOINT_MAX_DIFF_SECS);
+    1.0 - (diff as f64 / MONITOR_SLEEP_MIDPOINT_MAX_DIFF_SECS as f64)
+}
+
+fn overlap_seconds(
+    start: DateTime<Local>,
+    end: DateTime<Local>,
+    window_start: DateTime<Local>,
+    window_end: DateTime<Local>,
+) -> i64 {
+    let s = start.max(window_start);
+    let e = end.min(window_end);
+    (e - s).num_seconds().max(0)
+}
+
+fn night_band_overlap_seconds(start: DateTime<Local>, end: DateTime<Local>) -> i64 {
+    let midpoint = start + (end - start) / 2;
+    let base = midpoint.date_naive();
+    let band_start = base
+        .and_hms_opt(MONITOR_SLEEP_NIGHT_START_HOUR, 0, 0)
+        .unwrap();
+    let band_start = Local
+        .from_local_datetime(&band_start)
+        .earliest()
+        .unwrap_or(midpoint);
+    let band_end = band_start
+        + chrono::Duration::hours(
+            (24 - MONITOR_SLEEP_NIGHT_START_HOUR + MONITOR_SLEEP_NIGHT_END_HOUR) as i64,
+        );
+    overlap_seconds(start, end, band_start, band_end)
+}
+
+fn find_sleep_period_with_window(
+    records: &[ActivityRecord],
+    now: DateTime<Utc>,
+    window_start_local: DateTime<Local>,
+    window_end_local: DateTime<Local>,
+    min_duration_secs: i64,
+) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+    let mut segments: Vec<(DateTime<Utc>, DateTime<Utc>)> = Vec::new();
+    let mut current_start: Option<DateTime<Utc>> = None;
+    let mut current_end: Option<DateTime<Utc>> = None;
+
+    for record in records {
+        let is_loginwindow = record
+            .focus_info
+            .as_ref()
+            .map(|f| f.app_name.eq_ignore_ascii_case(LOGINWINDOW_APP))
+            .unwrap_or(false);
+        let rec_end = record.end_time.unwrap_or(now);
+
+        if is_loginwindow {
+            if current_start.is_none() {
+                current_start = Some(record.start_time);
+                current_end = Some(rec_end);
+            } else if let Some(end) = current_end.as_mut() {
+                if rec_end > *end {
+                    *end = rec_end;
+                }
+            }
+        } else if let (Some(start), Some(end)) = (current_start.take(), current_end.take()) {
+            segments.push((start, end));
+        }
+    }
+
+    if let (Some(start), Some(end)) = (current_start.take(), current_end.take()) {
+        segments.push((start, end));
+    }
+
+    if segments.is_empty() {
+        return None;
+    }
+
+    segments.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut merged: Vec<(DateTime<Utc>, DateTime<Utc>)> = Vec::new();
+    for (start, end) in segments {
+        if let Some(last) = merged.last_mut() {
+            let gap = (start - last.1).num_seconds();
+            if gap >= 0 && gap <= MONITOR_SLEEP_MERGE_GAP_SECS {
+                if end > last.1 {
+                    last.1 = end;
+                }
+                continue;
+            }
+        }
+        merged.push((start, end));
+    }
+
+    let mut best: Option<(f64, (DateTime<Utc>, DateTime<Utc>))> = None;
+    for (start_utc, end_utc) in merged {
+        let start_local = start_utc.with_timezone(&Local);
+        let end_local = end_utc.with_timezone(&Local);
+        let overlap = overlap_seconds(start_local, end_local, window_start_local, window_end_local);
+        if overlap <= 0 {
+            continue;
+        }
+        let clipped_start = start_local.max(window_start_local);
+        let clipped_end = end_local.min(window_end_local);
+        let duration_secs = (clipped_end - clipped_start).num_seconds();
+        if duration_secs < min_duration_secs {
+            continue;
+        }
+
+        let midpoint = clipped_start + (clipped_end - clipped_start) / 2;
+        let duration_hours = duration_secs as f64 / 3600.0;
+        let duration_score = duration_hours.min(12.0) / 12.0;
+        let midpoint_score = midpoint_score(midpoint);
+        let night_overlap = night_band_overlap_seconds(clipped_start, clipped_end);
+        let night_score = if duration_secs > 0 {
+            night_overlap as f64 / duration_secs as f64
+        } else {
+            0.0
+        };
+        let score = 0.5 * duration_score + 0.3 * midpoint_score + 0.2 * night_score;
+
+        let clipped_start_utc = clipped_start.with_timezone(&Utc);
+        let clipped_end_utc = clipped_end.with_timezone(&Utc);
+        if best
+            .as_ref()
+            .map(|(best_score, _)| score > *best_score)
+            .unwrap_or(true)
+        {
+            best = Some((score, (clipped_start_utc, clipped_end_utc)));
+        }
+    }
+
+    best.map(|(_, period)| period)
+}
+
+fn find_sleep_period(
+    records: &[ActivityRecord],
+    now: DateTime<Utc>,
+    min_duration_secs: i64,
+) -> Option<(DateTime<Utc>, DateTime<Utc>)> {
+    let now_local = Local::now();
+    let (window_start_local, window_end_local) = sleep_window_bounds(now_local);
+    find_sleep_period_with_window(
+        records,
+        now,
+        window_start_local,
+        window_end_local,
+        min_duration_secs,
+    )
+}
+
+fn select_apps_period(records: &[ActivityRecord]) -> AppsPeriod {
+    let now_utc = Utc::now();
+    let now_local = Local::now();
+    if let Some((start, end)) = find_sleep_period(records, now_utc, MONITOR_SLEEP_MIN_SECS)
+    {
+        let local_start = start.with_timezone(&Local);
+        let local_end = end.with_timezone(&Local);
+        let duration_secs = (end - start).num_seconds().max(0) as u64;
+        let title = format!(
+            "Apps (since {})",
+            local_start.format("%H:%M")
+        );
+        let line = format!(
+            "Period: last loginwindow {}–{} ({})",
+            local_start.format("%H:%M"),
+            local_end.format("%H:%M"),
+            pretty_duration(duration_secs)
+        );
+        AppsPeriod {
+            since_utc: start,
+            title,
+            line,
+        }
+    } else {
+        let midnight_local = local_midnight(now_local);
+        let title = format!("Apps (since {})", midnight_local.format("%H:%M"));
+        let line = format!(
+            "Period: since {} (fallback: local midnight)",
+            midnight_local.format("%H:%M")
+        );
+        AppsPeriod {
+            since_utc: midnight_local.with_timezone(&Utc),
+            title,
+            line,
+        }
+    }
+}
+
+fn build_app_tree(
+    aggregated_activities: &[AggregatedActivity],
+    app_short_max_duration_secs: u64,
+    app_short_min_distinct: usize,
+) -> Vec<kronical::daemon::snapshot::SnapshotApp> {
+    use kronical::daemon::snapshot::{SnapshotApp, SnapshotWindow};
+    use std::collections::HashMap as StdHashMap;
+
+    let mut short_per_name: StdHashMap<&str, Vec<&AggregatedActivity>> =
+        StdHashMap::with_capacity(16);
+    let mut normal: Vec<&AggregatedActivity> = Vec::with_capacity(aggregated_activities.len());
+    for agg in aggregated_activities.iter() {
+        if agg.total_duration_seconds <= app_short_max_duration_secs {
+            short_per_name.entry(&agg.app_name).or_default().push(agg);
+        } else {
+            normal.push(agg);
+        }
+    }
+
+    let mut items: Vec<SnapshotApp> = Vec::with_capacity(normal.len() + short_per_name.len());
+    for agg in normal {
+        let mut windows: Vec<SnapshotWindow> = Vec::with_capacity(agg.windows.len());
+        for w in agg.windows.values() {
+            windows.push(SnapshotWindow {
+                window_id: w.window_id.to_string(),
+                window_title: (*w.window_title).clone(),
+                first_seen: w.first_seen,
+                last_seen: w.last_seen,
+                duration_seconds: w.duration_seconds,
+                is_group: false,
+            });
+        }
+        let mut groups: Vec<SnapshotWindow> = Vec::with_capacity(agg.ephemeral_groups.len());
+        for g in agg.ephemeral_groups.values() {
+            let avg = if g.occurrence_count > 0 {
+                g.total_duration_seconds / g.occurrence_count as u64
+            } else {
+                0
+            };
+            let title = format!(
+                "(short-lived) ×{} avg {}",
+                g.distinct_ids.len(),
+                pretty_duration(avg)
+            );
+            groups.push(SnapshotWindow {
+                window_id: format!("group:{}", g.title_key),
+                window_title: title,
+                first_seen: g.first_seen,
+                last_seen: g.last_seen,
+                duration_seconds: g.total_duration_seconds,
+                is_group: true,
+            });
+        }
+        let mut temporal: Vec<SnapshotWindow> = Vec::with_capacity(agg.temporal_groups.len());
+        for (idx, g) in agg.temporal_groups.iter().enumerate() {
+            let avg = if g.occurrence_count > 0 {
+                g.total_duration_seconds / g.occurrence_count as u64
+            } else {
+                0
+            };
+            let title = format!(
+                "(temporal locality) ×{} avg {} max {}",
+                g.occurrence_count,
+                pretty_duration(avg),
+                pretty_duration(g.max_duration_seconds),
+            );
+            let window_id = format!(
+                "group-temporal:{}:{}:{}",
+                g.title_key,
+                g.anchor_last_seen.timestamp(),
+                idx
+            );
+            temporal.push(SnapshotWindow {
+                window_id,
+                window_title: title,
+                first_seen: g.first_seen,
+                last_seen: g.last_seen,
+                duration_seconds: g.total_duration_seconds,
+                is_group: true,
+            });
+        }
+        windows.append(&mut groups);
+        windows.append(&mut temporal);
+        windows.sort_by(|a, b| b.last_seen.cmp(&a.last_seen));
+        items.push(SnapshotApp {
+            app_name: (*agg.app_name).clone(),
+            pid: agg.pid,
+            process_start_time: agg.process_start_time,
+            windows,
+            total_duration_secs: agg.total_duration_seconds,
+            total_duration_pretty: pretty_duration(agg.total_duration_seconds),
+        });
+    }
+
+    for (name, v) in short_per_name.into_iter() {
+        if v.len() >= app_short_min_distinct {
+            let mut total = 0u64;
+            let mut first_seen = chrono::Utc::now();
+            let mut last_seen = chrono::Utc::now();
+            let mut rep_pid = 0;
+            let mut rep_start = 0u64;
+            let mut max_dur = 0u64;
+            for agg in v.iter() {
+                total = total.saturating_add(agg.total_duration_seconds);
+                if agg.first_seen < first_seen {
+                    first_seen = agg.first_seen;
+                }
+                if agg.last_seen > last_seen {
+                    last_seen = agg.last_seen;
+                }
+                if agg.total_duration_seconds > max_dur {
+                    max_dur = agg.total_duration_seconds;
+                    rep_pid = agg.pid;
+                    rep_start = agg.process_start_time;
+                }
+            }
+            let count = v.len();
+            let avg = if count > 0 { total / count as u64 } else { 0 };
+            let windows = vec![SnapshotWindow {
+                window_id: format!("app-group:{}", name),
+                window_title: format!("×{} avg {}", count, pretty_duration(avg)),
+                first_seen,
+                last_seen,
+                duration_seconds: total,
+                is_group: true,
+            }];
+            items.push(SnapshotApp {
+                app_name: name.to_string(),
+                pid: rep_pid,
+                process_start_time: rep_start,
+                windows,
+                total_duration_secs: total,
+                total_duration_pretty: pretty_duration(total),
+            });
+        }
+    }
+
+    items.sort_by(|a, b| {
+        let a_last = a.windows.first().map(|w| w.last_seen).unwrap_or_else(|| {
+            chrono::DateTime::<chrono::Utc>::from(std::time::SystemTime::UNIX_EPOCH)
+        });
+        let b_last = b.windows.first().map(|w| w.last_seen).unwrap_or_else(|| {
+            chrono::DateTime::<chrono::Utc>::from(std::time::SystemTime::UNIX_EPOCH)
+        });
+        b_last.cmp(&a_last)
+    });
+    items
 }
 
 fn group_label_for_display(window_id: &str, window_title: &str) -> String {
@@ -345,7 +724,7 @@ fn get_status(data_file: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn monitor_realtime(data_file: PathBuf) -> Result<()> {
+fn monitor_realtime(data_file: PathBuf, config: AppConfig) -> Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(stdout, EnterAlternateScreen)?;
@@ -355,7 +734,7 @@ fn monitor_realtime(data_file: PathBuf) -> Result<()> {
         terminal.backend_mut(),
         crossterm::event::DisableMouseCapture
     )?;
-    let res = run_monitor_loop(&mut terminal, data_file);
+    let res = run_monitor_loop(&mut terminal, data_file, &config);
     disable_raw_mode()?;
     execute!(
         terminal.backend_mut(),
@@ -369,7 +748,11 @@ fn monitor_realtime(data_file: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn run_monitor_loop<B: Backend>(terminal: &mut Terminal<B>, data_file: PathBuf) -> io::Result<()> {
+fn run_monitor_loop<B: Backend>(
+    terminal: &mut Terminal<B>,
+    data_file: PathBuf,
+    config: &AppConfig,
+) -> io::Result<()> {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream as StdUnixStream;
     let uds_http = kronical::util::paths::http_uds(data_file.parent().unwrap());
@@ -508,10 +891,37 @@ fn run_monitor_loop<B: Backend>(terminal: &mut Terminal<B>, data_file: PathBuf) 
                                     let p = Paragraph::new(lines).block(top);
                                     f.render_widget(p, layout[0]);
                                     // Middle: Details (moved above Apps)
+                                    let (apps, apps_period) =
+                                        if config.monitor_apps_sleep_filter_enabled {
+                                            let period = select_apps_period(&snap.records);
+                                            let aggregated = aggregate_activities_since(
+                                                &snap.records,
+                                                period.since_utc,
+                                                Utc::now(),
+                                                config.ephemeral_max_duration_secs,
+                                                config.ephemeral_min_distinct_ids,
+                                                config.max_windows_per_app,
+                                            );
+                                            let apps = build_app_tree(
+                                                &aggregated,
+                                                config.ephemeral_app_max_duration_secs,
+                                                config.ephemeral_app_min_distinct_procs,
+                                            );
+                                            (apps, Some(period))
+                                        } else {
+                                            (snap.aggregated_apps.clone(), None)
+                                        };
+
                                     let mut app_lines: Vec<Line> = Vec::new();
-                                    if !snap.aggregated_apps.is_empty() {
+                                    if let Some(period) = &apps_period {
+                                        app_lines.push(Line::from(Span::styled(
+                                            period.line.clone(),
+                                            Style::default().fg(Color::Gray),
+                                        )));
+                                    }
+                                    if !apps.is_empty() {
                                         let mut shown = 0usize;
-                                        for app in &snap.aggregated_apps {
+                                        for app in &apps {
                                             // Header: [pid] AppName • Total
                                             let header = vec![
                                                 Span::styled(
@@ -662,6 +1072,10 @@ fn run_monitor_loop<B: Backend>(terminal: &mut Terminal<B>, data_file: PathBuf) 
                                                 break;
                                             }
                                         }
+                                    } else if apps_period.is_some() {
+                                        app_lines.push(Line::from(
+                                            "Apps: (no activity in this period)",
+                                        ));
                                     } else {
                                         app_lines.push(Line::from("Apps: (no recent activity)"));
                                     }
@@ -801,8 +1215,15 @@ fn run_monitor_loop<B: Backend>(terminal: &mut Terminal<B>, data_file: PathBuf) 
                                     f.render_widget(p2, layout[1]);
 
                                     // Bottom: Aggregated apps summary (moved below Details)
-                                    let p_apps = Paragraph::new(app_lines)
-                                        .block(Block::default().title("Apps").borders(Borders::ALL))
+                                    let apps_title = apps_period
+                                        .as_ref()
+                                        .map(|p| p.title.as_str())
+                                        .unwrap_or("Apps");
+                                    let p_apps = Paragraph::new(app_lines).block(
+                                        Block::default()
+                                            .title(apps_title)
+                                            .borders(Borders::ALL),
+                                    )
                                         .wrap(Wrap { trim: true });
                                     f.render_widget(p_apps, layout[2]);
                                 })?;
@@ -881,7 +1302,7 @@ fn main() {
             &kronical::util::paths::http_uds(&config.workspace_dir),
             pretty,
         ),
-        Commands::Monitor => monitor_realtime(data_file),
+        Commands::Monitor => monitor_realtime(data_file, config.clone()),
         Commands::Log { action } => log_cli::execute(action, &config.workspace_dir),
         Commands::Tracker { action } => match action {
             TrackerAction::Show { count, watch } => tracker_show(
@@ -917,6 +1338,116 @@ fn snapshot_autoselect(uds_http: &PathBuf, pretty: bool) -> Result<()> {
         println!("{}", serde_json::to_string_pretty(&snap)?);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{LOGINWINDOW_APP, find_sleep_period_with_window, local_midnight};
+    use chrono::{Local, TimeZone, Timelike, Utc};
+    use kronical_core::events::{MousePosition, WindowFocusInfo};
+    use kronical_core::records::{ActivityRecord, ActivityState};
+    use std::sync::Arc;
+
+    fn record_with_focus(
+        app_name: &str,
+        start: chrono::DateTime<Utc>,
+        end: chrono::DateTime<Utc>,
+    ) -> ActivityRecord {
+        ActivityRecord {
+            record_id: 0,
+            run_id: None,
+            start_time: start,
+            end_time: Some(end),
+            state: ActivityState::Active,
+            focus_info: Some(WindowFocusInfo {
+                pid: 1,
+                process_start_time: 0,
+                app_name: Arc::new(app_name.to_string()),
+                window_title: Arc::new("title".to_string()),
+                window_id: 1,
+                window_instance_start: start,
+                window_position: Some(MousePosition { x: 0, y: 0 }),
+                window_size: Some((1, 1)),
+            }),
+            event_count: 0,
+            triggering_events: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn find_sleep_period_prefers_best_midnight_window() {
+        let base_local = Local.with_ymd_and_hms(2024, 1, 1, 21, 0, 0).unwrap();
+        let t0 = base_local.with_timezone(&Utc);
+        let records = vec![
+            record_with_focus(LOGINWINDOW_APP, t0 + chrono::Duration::hours(1), t0 + chrono::Duration::hours(3)),
+            record_with_focus("Terminal", t0 + chrono::Duration::hours(3), t0 + chrono::Duration::hours(4)),
+            record_with_focus(LOGINWINDOW_APP, t0 + chrono::Duration::hours(5), t0 + chrono::Duration::hours(10)),
+            record_with_focus("Browser", t0 + chrono::Duration::hours(10), t0 + chrono::Duration::hours(11)),
+            record_with_focus(LOGINWINDOW_APP, t0 + chrono::Duration::hours(12), t0 + chrono::Duration::hours(15)),
+        ];
+
+        let window_start = base_local
+            .date_naive()
+            .and_hms_opt(21, 0, 0)
+            .unwrap();
+        let window_start = Local
+            .from_local_datetime(&window_start)
+            .earliest()
+            .unwrap_or(base_local);
+        let window_end = window_start + chrono::Duration::hours(24);
+        let period = find_sleep_period_with_window(
+            &records,
+            t0 + chrono::Duration::hours(24),
+            window_start,
+            window_end,
+            4 * 60 * 60,
+        )
+        .expect("expected long loginwindow period");
+
+        assert_eq!(period.0, t0 + chrono::Duration::hours(5));
+        assert_eq!(period.1, t0 + chrono::Duration::hours(10));
+    }
+
+    #[test]
+    fn find_sleep_period_merges_consecutive_records() {
+        let base_local = Local.with_ymd_and_hms(2024, 1, 2, 21, 0, 0).unwrap();
+        let t0 = base_local.with_timezone(&Utc);
+        let records = vec![
+            record_with_focus(LOGINWINDOW_APP, t0 + chrono::Duration::hours(1), t0 + chrono::Duration::hours(2)),
+            record_with_focus(LOGINWINDOW_APP, t0 + chrono::Duration::hours(2), t0 + chrono::Duration::hours(4)),
+            record_with_focus("Terminal", t0 + chrono::Duration::hours(4), t0 + chrono::Duration::hours(5)),
+        ];
+
+        let window_start = base_local
+            .date_naive()
+            .and_hms_opt(21, 0, 0)
+            .unwrap();
+        let window_start = Local
+            .from_local_datetime(&window_start)
+            .earliest()
+            .unwrap_or(base_local);
+        let window_end = window_start + chrono::Duration::hours(24);
+        let period = find_sleep_period_with_window(
+            &records,
+            t0 + chrono::Duration::hours(6),
+            window_start,
+            window_end,
+            2 * 60 * 60,
+        )
+        .expect("expected merged loginwindow period");
+
+        assert_eq!(period.0, t0 + chrono::Duration::hours(1));
+        assert_eq!(period.1, t0 + chrono::Duration::hours(4));
+    }
+
+    #[test]
+    fn local_midnight_returns_start_of_day() {
+        let local_now = chrono::Local.with_ymd_and_hms(2024, 6, 1, 13, 45, 0).unwrap();
+        let midnight = local_midnight(local_now);
+        assert_eq!(midnight.hour(), 0);
+        assert_eq!(midnight.minute(), 0);
+        assert_eq!(midnight.second(), 0);
+    }
 }
 
 fn watch_via_http(uds_path: &PathBuf, pretty: bool) -> Result<()> {
@@ -1444,43 +1975,9 @@ fn print_snapshot_line(s: &kronical::daemon::snapshot::Snapshot) {
 fn tracker_status(config: &AppConfig) -> Result<()> {
     println!("System Tracker Status");
     println!("════════════════════");
-
-    if !config.tracker_enabled {
-        println!("Status: DISABLED");
-        println!("To enable: Set tracker_enabled = true in config.toml and restart daemon");
-        return Ok(());
-    }
-
-    let daemon_pid_file = kronical::util::paths::pid_file(&config.workspace_dir);
-    if let Ok(Some(pid)) = read_pid_file(&daemon_pid_file) {
-        if is_process_running(pid) {
-            println!("Status: ENABLED and running with daemon (PID: {})", pid);
-            println!("Interval: {} seconds", config.tracker_interval_secs);
-            println!("Batch size: {}", config.tracker_batch_size);
-
-            let db_path = kronical::util::paths::tracker_db_with_backend(
-                &config.workspace_dir,
-                &config.tracker_db_backend,
-            );
-            if db_path.exists() {
-                let metadata = std::fs::metadata(&db_path)?;
-                println!(
-                    "Data file: {} ({} bytes)",
-                    db_path.display(),
-                    metadata.len()
-                );
-                let modified = metadata.modified()?;
-                println!("Last modified: {:?}", modified);
-            } else {
-                println!("Data file: Not yet created");
-            }
-        } else {
-            println!("Status: ENABLED but daemon not running");
-        }
-    } else {
-        println!("Status: ENABLED but daemon not running (no PID file)");
-    }
-
+    let _ = config;
+    println!("Status: DISABLED");
+    println!("Reason: tracker runtime is intentionally disabled to avoid adding memory and CPU noise");
     Ok(())
 }
 
@@ -1494,45 +1991,17 @@ fn cleanup_stale_tracker_pid(workspace_dir: &PathBuf) {
 
 fn tracker_show(
     workspace_dir: &PathBuf,
-    count: Option<usize>,
-    watch: bool,
-    refresh_interval_secs: f64,
+    _count: Option<usize>,
+    _watch: bool,
+    _refresh_interval_secs: f64,
 ) -> Result<()> {
     cleanup_stale_tracker_pid(workspace_dir);
-
-    let show_data = || -> Result<()> {
-        let daemon_pid_file = kronical::util::paths::pid_file(workspace_dir);
-        let pid = if let Ok(Some(pid)) = read_pid_file(&daemon_pid_file) {
-            if !is_process_running(pid) {
-                return Err(anyhow::anyhow!(
-                    "Daemon not running. Start the daemon first with 'kronictl start'"
-                ));
-            }
-            pid
-        } else {
-            return Err(anyhow::anyhow!(
-                "Daemon not running. Start the daemon first with 'kronictl start'"
-            ));
-        };
-
-        show_tracker_data_grpc(workspace_dir, count, pid)
-    };
-
-    if watch {
-        println!("Watching tracker data (press Ctrl+C to exit)...");
-        let refresh_duration = Duration::from_secs_f64(refresh_interval_secs);
-
-        loop {
-            show_data()?;
-            std::thread::sleep(refresh_duration);
-        }
-    } else {
-        show_data()?;
-    }
-
+    println!("System tracker output is unavailable.");
+    println!("Reason: tracker runtime is intentionally disabled to avoid adding memory and CPU noise.");
     Ok(())
 }
 
+#[allow(dead_code)]
 fn show_tracker_data_grpc(
     workspace_dir: &PathBuf,
     count: Option<usize>,

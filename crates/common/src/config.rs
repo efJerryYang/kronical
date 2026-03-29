@@ -35,6 +35,7 @@ pub struct AppConfig {
     pub tracker_interval_secs: f64,
     pub tracker_batch_size: usize,
     pub tracker_refresh_secs: f64,
+    pub monitor_apps_sleep_filter_enabled: bool,
     // DuckDB memory caps (MB). Applied when DuckDB is used.
     pub duckdb_memory_limit_mb_main: u64,
     pub duckdb_memory_limit_mb_tracker: u64,
@@ -71,6 +72,7 @@ impl Default for AppConfig {
             tracker_interval_secs: 1.0,
             tracker_batch_size: 60,
             tracker_refresh_secs: 1.0,
+            monitor_apps_sleep_filter_enabled: false,
             duckdb_memory_limit_mb_main: 10,
             duckdb_memory_limit_mb_tracker: 10,
         }
@@ -105,6 +107,7 @@ impl AppConfig {
             .set_default("tracker_interval_secs", 1.0)?
             .set_default("tracker_batch_size", 60)?
             .set_default("tracker_refresh_secs", 1.0)?
+            .set_default("monitor_apps_sleep_filter_enabled", false)?
             .set_default("duckdb_memory_limit_mb_main", 10)?
             .set_default("duckdb_memory_limit_mb_tracker", 10)?;
 
@@ -164,6 +167,7 @@ mod tests {
             assert!(cfg.focus_allow_zero_window_id);
             assert!(!cfg.tracker_enabled);
             assert_eq!(cfg.tracker_batch_size, 60);
+            assert!(!cfg.monitor_apps_sleep_filter_enabled);
             assert_eq!(cfg.duckdb_memory_limit_mb_main, 10);
             assert_eq!(cfg.duckdb_memory_limit_mb_tracker, 10);
         });

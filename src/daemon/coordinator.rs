@@ -3,7 +3,6 @@ use crate::daemon::events::WindowFocusInfo;
 use crate::daemon::events::{MouseButton, MouseEventKind, WheelAxis, WheelScrollType};
 use crate::daemon::pipeline::PipelineHandles;
 use crate::daemon::runtime::ThreadRegistry;
-use crate::daemon::tracker::SystemTracker;
 use crate::daemon::tracker::{FocusCacheCaps, FocusChangeCallback, FocusEventWrapper};
 use crate::storage::StorageBackend;
 use crate::util::logging::{debug, error, info, trace};
@@ -243,10 +242,15 @@ pub struct EventCoordinator {
     focus_window_coalesce_ms: u64,
     focus_allow_zero_window_id: bool,
     persist_raw_events: bool,
+    #[allow(dead_code)]
     tracker_enabled: bool,
+    #[allow(dead_code)]
     tracker_interval_secs: f64,
+    #[allow(dead_code)]
     tracker_batch_size: usize,
+    #[allow(dead_code)]
     tracker_db_backend: crate::util::config::DatabaseBackendConfig,
+    #[allow(dead_code)]
     duckdb_memory_limit_mb_tracker: u64,
     threads: ThreadRegistry,
 }
@@ -339,42 +343,12 @@ impl EventCoordinator {
 
     pub fn spawn_tracker(
         &self,
-        workspace_dir: &Path,
-        thread_registry: ThreadRegistry,
+        _workspace_dir: &Path,
+        _thread_registry: ThreadRegistry,
     ) -> Result<()> {
-        if !self.tracker_enabled {
-            info!("System tracker disabled in configuration");
-            return Ok(());
-        }
-
-        let current_pid = std::process::id();
-        let tracker_db_path =
-            crate::util::paths::tracker_db_with_backend(workspace_dir, &self.tracker_db_backend);
-
-        let mut tracker = SystemTracker::new(
-            current_pid,
-            self.tracker_interval_secs,
-            self.tracker_batch_size,
-            tracker_db_path.clone(),
-            self.tracker_db_backend.clone(),
-            self.duckdb_memory_limit_mb_tracker,
-        );
-
-        if let Err(e) = tracker.start_with_registry(thread_registry) {
-            error!("Failed to start system tracker: {}", e);
-            return Err(anyhow!("Failed to start system tracker: {}", e));
-        }
-
         info!(
-            "System tracker started successfully for PID {}",
-            current_pid
+            "System tracker runtime is disabled; skipping startup to avoid self-observation overhead"
         );
-        crate::daemon::api::set_system_tracker_db_path(tracker_db_path.clone());
-        info!(
-            "System tracker DB path set for gRPC API: {:?}",
-            tracker_db_path
-        );
-
         Ok(())
     }
 
