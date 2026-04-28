@@ -109,7 +109,6 @@ pub enum StorageCommand {
 
 pub mod duckdb;
 pub mod sqlite3;
-pub mod system_metrics;
 
 #[cfg(test)]
 mod tests {

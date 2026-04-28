@@ -12,10 +12,16 @@ use crossbeam_channel::{Receiver, Sender};
 use std::collections::{HashMap as StdHashMap, VecDeque};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use super::types::{SnapshotMessage, SnapshotUpdate};
 
 pub const POLL_SUSPEND_MS: u64 = 0;
+
+struct SnapshotDiagnosticsState {
+    interval: Duration,
+    last_logged_at: Option<Instant>,
+}
 
 pub struct SnapshotStageConfig {
     pub receiver: Receiver<SnapshotMessage>,
@@ -69,6 +75,10 @@ pub fn spawn_snapshot_stage(
         let mut last_transition: Option<snapshot::Transition> = None;
         let mut state_hist: VecDeque<char> = VecDeque::new();
         let retention = chrono::Duration::minutes(retention_minutes as i64);
+        let mut diagnostics = SnapshotDiagnosticsState {
+            interval: crate::util::logging::diagnostics_interval(),
+            last_logged_at: None,
+        };
 
         let mut shutdown_requested = false;
         let mut hints_complete = false;
@@ -94,6 +104,8 @@ pub fn spawn_snapshot_stage(
             &cfg_summary,
             &poll_handle,
             retention,
+            &state_hist,
+            &mut diagnostics,
             ephemeral_max_duration_secs,
             ephemeral_min_distinct_ids,
             max_windows_per_app,
@@ -129,6 +141,8 @@ pub fn spawn_snapshot_stage(
                         &cfg_summary,
                         &poll_handle,
                         retention,
+                        &state_hist,
+                        &mut diagnostics,
                         ephemeral_max_duration_secs,
                         ephemeral_min_distinct_ids,
                         max_windows_per_app,
@@ -153,6 +167,8 @@ pub fn spawn_snapshot_stage(
                         &poll_handle,
                         &storage_tx,
                         retention,
+                        &state_hist,
+                        &mut diagnostics,
                         ephemeral_max_duration_secs,
                         ephemeral_min_distinct_ids,
                         max_windows_per_app,
@@ -179,6 +195,8 @@ pub fn spawn_snapshot_stage(
                         &poll_handle,
                         &storage_tx,
                         retention,
+                        &state_hist,
+                        &mut diagnostics,
                         ephemeral_max_duration_secs,
                         ephemeral_min_distinct_ids,
                         max_windows_per_app,
@@ -207,6 +225,8 @@ pub fn spawn_snapshot_stage(
                 &poll_handle,
                 &storage_tx,
                 retention,
+                &state_hist,
+                &mut diagnostics,
                 ephemeral_max_duration_secs,
                 ephemeral_min_distinct_ids,
                 max_windows_per_app,
@@ -302,6 +322,8 @@ fn maybe_finalize(
     poll_handle: &Arc<AtomicU64>,
     storage_tx: &Sender<StorageCommand>,
     retention: chrono::Duration,
+    state_hist: &VecDeque<char>,
+    diagnostics: &mut SnapshotDiagnosticsState,
     eph_max: u64,
     eph_min: usize,
     max_windows: usize,
@@ -323,6 +345,8 @@ fn maybe_finalize(
         cfg_summary,
         poll_handle,
         retention,
+        state_hist,
+        diagnostics,
         eph_max,
         eph_min,
         max_windows,
@@ -346,6 +370,8 @@ fn publish_snapshot(
     cfg_summary: &snapshot::ConfigSummary,
     poll_handle: &Arc<AtomicU64>,
     retention: chrono::Duration,
+    state_hist: &VecDeque<char>,
+    diagnostics: &mut SnapshotDiagnosticsState,
     eph_max: u64,
     eph_min: usize,
     max_windows: usize,
@@ -393,6 +419,17 @@ fn publish_snapshot(
         backlog_count: storage_metrics.backlog_count,
         last_flush_at: storage_metrics.last_flush_at,
     };
+    let health = snapshot_bus.current_health();
+    maybe_log_snapshot_diagnostics(
+        snapshot_bus,
+        recent_records,
+        &aggregated,
+        &aggregated_apps,
+        state_hist,
+        counts,
+        &storage_metrics,
+        diagnostics,
+    );
     let records = recent_records
         .iter()
         .cloned()
@@ -409,8 +446,72 @@ fn publish_snapshot(
         next_timeout,
         storage_info,
         cfg_summary.clone(),
-        snapshot_bus.current_health(),
+        health,
         aggregated_apps,
+    );
+}
+
+fn maybe_log_snapshot_diagnostics(
+    snapshot_bus: &snapshot::SnapshotBus,
+    recent_records: &VecDeque<ActivityRecord>,
+    aggregated: &[AggregatedActivity],
+    aggregated_apps: &[snapshot::SnapshotApp],
+    state_hist: &VecDeque<char>,
+    counts: &snapshot::Counts,
+    storage_metrics: &StorageMetrics,
+    diagnostics: &mut SnapshotDiagnosticsState,
+) {
+    let now = Instant::now();
+    if let Some(last_logged_at) = diagnostics.last_logged_at {
+        if now.duration_since(last_logged_at) < diagnostics.interval {
+            return;
+        }
+    }
+    diagnostics.last_logged_at = Some(now);
+
+    let recent_records_with_focus = recent_records
+        .iter()
+        .filter(|record| record.focus_info.is_some())
+        .count();
+    let retained_triggering_events = recent_records
+        .iter()
+        .map(|record| record.triggering_events.len())
+        .sum::<usize>();
+    let aggregated_windows_len = aggregated
+        .iter()
+        .map(|activity| activity.windows.len())
+        .sum::<usize>();
+    let aggregated_ephemeral_groups_len = aggregated
+        .iter()
+        .map(|activity| activity.ephemeral_groups.len())
+        .sum::<usize>();
+    let aggregated_temporal_groups_len = aggregated
+        .iter()
+        .map(|activity| activity.temporal_groups.len())
+        .sum::<usize>();
+    let snapshot_windows_len = aggregated_apps
+        .iter()
+        .map(|app| app.windows.len())
+        .sum::<usize>();
+
+    info!(
+        "Snapshot stage len stats: recent_records_len={} recent_records_with_focus={} retained_triggering_events_len={} state_hist_len={} aggregated_apps_len={} aggregated_windows_len={} aggregated_ephemeral_groups_len={} aggregated_temporal_groups_len={} snapshot_apps_len={} snapshot_windows_len={} transitions_buffer_len={} health_buffer_len={} counts_signals_seen={} counts_hints_seen={} counts_records_emitted={} storage_backlog_count={}",
+        recent_records.len(),
+        recent_records_with_focus,
+        retained_triggering_events,
+        state_hist.len(),
+        aggregated.len(),
+        aggregated_windows_len,
+        aggregated_ephemeral_groups_len,
+        aggregated_temporal_groups_len,
+        aggregated_apps.len(),
+        snapshot_windows_len,
+        snapshot_bus.recent_transitions(64).len(),
+        snapshot_bus.current_health().len(),
+        counts.signals_seen,
+        counts.hints_seen,
+        counts.records_emitted,
+        storage_metrics.backlog_count
     );
 }
 

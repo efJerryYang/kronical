@@ -114,3 +114,7 @@ members = [
 [[bin]]
 name = "bench-mouse-traj"
 path = "benchmarks/compressor/mouse_traj.rs"
+
+[[bin]]
+name = "winshift-repro"
+path = "src/bin/winshift_repro.rs"

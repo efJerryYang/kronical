@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>kronid.rss.hourly</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string>env RUN_ONCE=1 OUT_FILE=/Users/jerry/Projects/Utilities/chronicle/kronical/target/monitoring/kronid-rss-hourly-live.csv LOCK_DIR=/Users/jerry/Projects/Utilities/chronicle/kronical/target/monitoring/kronid-rss-hourly-live.lock /Users/jerry/Projects/Utilities/chronicle/kronical/scripts/kronid_rss_hourly.sh</string>
+  </array>
+
+  <key>StartInterval</key>
+  <integer>3600</integer>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>StandardOutPath</key>
+  <string>/Users/jerry/Projects/Utilities/chronicle/kronical/target/monitoring/kronid-rss-hourly-live.out</string>
+
+  <key>StandardErrorPath</key>
+  <string>/Users/jerry/Projects/Utilities/chronicle/kronical/target/monitoring/kronid-rss-hourly-live.err</string>
+</dict>
+</plist>

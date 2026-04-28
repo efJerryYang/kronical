@@ -7,8 +7,6 @@ const GRPC_UDS_NAME: &str = "kronid.sock";
 const HTTP_UDS_NAME: &str = "kronid.http.sock";
 const DATA_DB_NAME_DUCKDB: &str = "data.duckdb";
 const DATA_DB_NAME_SQLITE: &str = "data.sqlite3";
-const TRACKER_DB_NAME_DUCKDB: &str = "system-tracker.duckdb";
-const TRACKER_DB_NAME_SQLITE: &str = "system-tracker.sqlite3";
 
 pub fn pid_file(workspace_dir: &Path) -> PathBuf {
     workspace_dir.join(PID_FILE_NAME)
@@ -27,21 +25,6 @@ pub fn http_uds(workspace_dir: &Path) -> PathBuf {
     workspace_dir.join(HTTP_UDS_NAME)
 }
 
-pub fn tracker_db_with_backend(
-    workspace_dir: &Path,
-    backend: &crate::config::DatabaseBackendConfig,
-) -> PathBuf {
-    match backend {
-        crate::config::DatabaseBackendConfig::Duckdb => workspace_dir.join(TRACKER_DB_NAME_DUCKDB),
-        crate::config::DatabaseBackendConfig::Sqlite3 => workspace_dir.join(TRACKER_DB_NAME_SQLITE),
-    }
-}
-
-// Backward-compat helper: default to DuckDB if not specified
-pub fn tracker_db(workspace_dir: &Path) -> PathBuf {
-    tracker_db_with_backend(workspace_dir, &crate::config::DatabaseBackendConfig::Duckdb)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -54,25 +37,5 @@ mod tests {
         assert_eq!(run_id_file(base), base.join("kronid.run_id"));
         assert_eq!(grpc_uds(base), base.join("kronid.sock"));
         assert_eq!(http_uds(base), base.join("kronid.http.sock"));
-    }
-
-    #[test]
-    fn tracker_db_resolves_per_backend() {
-        let base = Path::new("/opt/kronical");
-        use crate::config::DatabaseBackendConfig::{Duckdb, Sqlite3};
-        assert_eq!(
-            tracker_db_with_backend(base, &Duckdb),
-            base.join("system-tracker.duckdb")
-        );
-        assert_eq!(
-            tracker_db_with_backend(base, &Sqlite3),
-            base.join("system-tracker.sqlite3")
-        );
-    }
-
-    #[test]
-    fn tracker_db_defaults_to_duckdb_variant() {
-        let base = Path::new("/tmp/kronical");
-        assert_eq!(tracker_db(base), base.join("system-tracker.duckdb"));
     }
 }

@@ -110,27 +110,7 @@ message WatchRequest {
   string detail = 2;
 }
 
-message SystemMetricsRequest {
-  uint32 pid = 1; // PID to query metrics for
-  google.protobuf.Timestamp start_time = 2; // Start time for range query
-  google.protobuf.Timestamp end_time = 3; // End time for range query
-  uint32 limit = 4; // Optional limit on number of results
-}
-
-message SystemMetric {
-  google.protobuf.Timestamp timestamp = 1;
-  double cpu_percent = 2;
-  uint64 memory_bytes = 3;
-  uint64 disk_io_bytes = 4;
-}
-
-message SystemMetricsReply {
-  repeated SystemMetric metrics = 1;
-  uint32 total_count = 2;
-}
-
 service Kroni {
   rpc Snapshot (SnapshotRequest) returns (SnapshotReply);
   rpc Watch (WatchRequest) returns (stream SnapshotReply);
-  rpc GetSystemMetrics (SystemMetricsRequest) returns (SystemMetricsReply);
 }

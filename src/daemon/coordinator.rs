@@ -242,16 +242,6 @@ pub struct EventCoordinator {
     focus_window_coalesce_ms: u64,
     focus_allow_zero_window_id: bool,
     persist_raw_events: bool,
-    #[allow(dead_code)]
-    tracker_enabled: bool,
-    #[allow(dead_code)]
-    tracker_interval_secs: f64,
-    #[allow(dead_code)]
-    tracker_batch_size: usize,
-    #[allow(dead_code)]
-    tracker_db_backend: crate::util::config::DatabaseBackendConfig,
-    #[allow(dead_code)]
-    duckdb_memory_limit_mb_tracker: u64,
     threads: ThreadRegistry,
 }
 
@@ -272,16 +262,10 @@ impl EventCoordinator {
         focus_window_coalesce_ms: u64,
         focus_allow_zero_window_id: bool,
         persist_raw_events: bool,
-        tracker_enabled: bool,
-        tracker_interval_secs: f64,
-        tracker_batch_size: usize,
-        tracker_db_backend: crate::util::config::DatabaseBackendConfig,
-        duckdb_memory_limit_mb_tracker: u64,
     ) -> Self {
         let threads = ThreadRegistry::with_slots([
             "api-grpc",
             "api-http",
-            "system-tracker",
             "pipeline-data",
             "pipeline-storage",
             "pipeline-hints",
@@ -304,11 +288,6 @@ impl EventCoordinator {
             focus_window_coalesce_ms,
             focus_allow_zero_window_id,
             persist_raw_events,
-            tracker_enabled,
-            tracker_interval_secs,
-            tracker_batch_size,
-            tracker_db_backend,
-            duckdb_memory_limit_mb_tracker,
             threads,
         }
     }
@@ -329,27 +308,11 @@ impl EventCoordinator {
             config.focus_window_coalesce_ms,
             config.focus_allow_zero_window_id,
             config.persist_raw_events,
-            config.tracker_enabled,
-            config.tracker_interval_secs,
-            config.tracker_batch_size,
-            config.tracker_db_backend.clone(),
-            config.duckdb_memory_limit_mb_tracker,
         )
     }
 
     pub fn thread_registry(&self) -> ThreadRegistry {
         self.threads.clone()
-    }
-
-    pub fn spawn_tracker(
-        &self,
-        _workspace_dir: &Path,
-        _thread_registry: ThreadRegistry,
-    ) -> Result<()> {
-        info!(
-            "System tracker runtime is disabled; skipping startup to avoid self-observation overhead"
-        );
-        Ok(())
     }
 
     pub fn spawn_api_servers(
@@ -507,7 +470,6 @@ impl EventCoordinator {
         )?;
         shutdown_guard.api_handles = Some(api_handles);
 
-        self.spawn_tracker(workspace_path, thread_registry.clone())?;
         let pipeline_handles = self.spawn_pipeline(
             data_store,
             receiver,

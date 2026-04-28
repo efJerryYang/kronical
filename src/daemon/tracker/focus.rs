@@ -212,6 +212,8 @@ fn run_focus_worker(
     let mut emit_seq: u64 = 0;
     let coalesce_ms = caps.focus_window_coalesce_ms;
     let allow_zero_window_id = caps.focus_allow_zero_window_id;
+    let diagnostics_interval = crate::util::logging::diagnostics_interval();
+    let mut last_diagnostics_at: Option<Instant> = None;
     let can_emit = |state: &FocusState| {
         !state.app_name.is_empty()
             && !state.window_title.is_empty()
@@ -223,7 +225,7 @@ fn run_focus_worker(
     // Optional delayed emit scheduling
     let mut scheduled_emit_at: Option<Instant> = None;
 
-    let mut get_process_start_time = |pid: i32| -> u64 {
+    fn get_process_start_time(pid_cache: &mut LruCache<i32, u64>, pid: i32) -> u64 {
         if let Some(start_time) = pid_cache.get_cloned(&pid) {
             return start_time;
         }
@@ -240,7 +242,7 @@ fn run_focus_worker(
         } else {
             0
         }
-    };
+    }
 
     let emit_loginwindow_focus = |interner: &mut StringInterner| {
         let now = Utc::now();
@@ -494,7 +496,7 @@ fn run_focus_worker(
                         state.pid = pid;
                         state.window_title.clear();
                         state.window_id = 0;
-                        state.process_start_time = get_process_start_time(pid);
+                        state.process_start_time = get_process_start_time(&mut pid_cache, pid);
                         if state.process_start_time == 0 {
                             state.process_start_time = Utc::now().timestamp_millis() as u64;
                         }
@@ -657,7 +659,8 @@ fn run_focus_worker(
                         poll_lock_since = None;
                     }
                     state.pid = info.process_id;
-                    state.process_start_time = get_process_start_time(info.process_id);
+                    state.process_start_time =
+                        get_process_start_time(&mut pid_cache, info.process_id);
                     if state.process_start_time == 0 {
                         state.process_start_time = Utc::now().timestamp_millis() as u64;
                     }
@@ -709,7 +712,8 @@ fn run_focus_worker(
                             poll_lock_active = false;
                             poll_lock_since = None;
                         }
-                        state.process_start_time = get_process_start_time(info.process_id);
+                        state.process_start_time =
+                            get_process_start_time(&mut pid_cache, info.process_id);
                         if state.process_start_time == 0 {
                             state.process_start_time = Utc::now().timestamp_millis() as u64;
                         }
@@ -776,7 +780,8 @@ fn run_focus_worker(
                             poll_lock_since = None;
                             state.app_name = info.app_name.clone();
                             state.pid = info.process_id;
-                            state.process_start_time = get_process_start_time(info.process_id);
+                            state.process_start_time =
+                                get_process_start_time(&mut pid_cache, info.process_id);
                             if state.process_start_time == 0 {
                                 state.process_start_time = Utc::now().timestamp_millis() as u64;
                             }
@@ -811,7 +816,8 @@ fn run_focus_worker(
                                 info.window_id
                             );
                             state.pid = info.process_id;
-                            state.process_start_time = get_process_start_time(info.process_id);
+                            state.process_start_time =
+                                get_process_start_time(&mut pid_cache, info.process_id);
                             if state.process_start_time == 0 {
                                 state.process_start_time = Utc::now().timestamp_millis() as u64;
                             }
@@ -864,7 +870,7 @@ fn run_focus_worker(
                                     state.pid = info.process_id;
                                     state.app_name = info.app_name.clone();
                                     state.process_start_time =
-                                        get_process_start_time(info.process_id);
+                                        get_process_start_time(&mut pid_cache, info.process_id);
                                 }
                                 record_weak_title(
                                     &state.app_name,
@@ -1004,7 +1010,75 @@ fn run_focus_worker(
                 scheduled_emit_at = None;
             }
         }
+
+        maybe_log_focus_diagnostics(
+            &rx,
+            &pid_cache,
+            &last_titles,
+            &interner,
+            &last_app_window,
+            &weak_app_window,
+            &state,
+            pending_window_title.as_ref(),
+            scheduled_emit_at,
+            poll_value,
+            poll_lock_active,
+            awaiting_poll_reconcile,
+            reconcile_active,
+            emit_seq,
+            diagnostics_interval,
+            &mut last_diagnostics_at,
+        );
     }
 
     debug!("Focus worker stopped");
+}
+
+#[allow(clippy::too_many_arguments)]
+fn maybe_log_focus_diagnostics(
+    rx: &Receiver<FocusMsg>,
+    pid_cache: &LruCache<i32, u64>,
+    last_titles: &LruCache<u32, String>,
+    interner: &StringInterner,
+    last_app_window: &LruCache<String, (String, u32)>,
+    weak_app_window: &LruCache<String, (String, u32)>,
+    state: &FocusState,
+    pending_window_title: Option<&String>,
+    scheduled_emit_at: Option<Instant>,
+    poll_ms: u64,
+    poll_lock_active: bool,
+    awaiting_poll_reconcile: bool,
+    reconcile_active: bool,
+    emit_seq: u64,
+    diagnostics_interval: Duration,
+    last_diagnostics_at: &mut Option<Instant>,
+) {
+    let now = Instant::now();
+    if let Some(last_logged_at) = *last_diagnostics_at {
+        if now.duration_since(last_logged_at) < diagnostics_interval {
+            return;
+        }
+    }
+    *last_diagnostics_at = Some(now);
+
+    info!(
+        "Focus worker len stats: mailbox_len={} pid_cache_len={} last_titles_len={} last_app_window_len={} weak_app_window_len={} interner_len={} interner_live_len={} state_complete={} current_app_empty={} current_window_empty={} pending_window_title={} scheduled_emit={} poll_ms={} poll_lock_active={} awaiting_poll_reconcile={} reconcile_active={} emit_seq={}",
+        rx.len(),
+        pid_cache.len(),
+        last_titles.len(),
+        last_app_window.len(),
+        weak_app_window.len(),
+        interner.len(),
+        interner.live_len(),
+        state.is_complete(),
+        state.app_name.is_empty(),
+        state.window_title.is_empty(),
+        pending_window_title.is_some(),
+        scheduled_emit_at.is_some(),
+        poll_ms,
+        poll_lock_active,
+        awaiting_poll_reconcile,
+        reconcile_active,
+        emit_seq
+    );
 }

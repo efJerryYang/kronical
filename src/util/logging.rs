@@ -1,6 +1,9 @@
 use once_cell::sync::OnceCell;
+use std::time::Duration;
 
 static RUN_ID: OnceCell<String> = OnceCell::new();
+const DIAGNOSTICS_INTERVAL_ENV: &str = "KRONID_INTERNAL_LEN_LOG_SECS";
+const DEFAULT_DIAGNOSTICS_INTERVAL_SECS: u64 = 60 * 60;
 
 pub fn set_run_id(run_id: impl Into<String>) {
     let _ = RUN_ID.set(run_id.into());
@@ -8,6 +11,15 @@ pub fn set_run_id(run_id: impl Into<String>) {
 
 pub fn run_id() -> Option<&'static str> {
     RUN_ID.get().map(String::as_str)
+}
+
+pub fn diagnostics_interval() -> Duration {
+    let secs = std::env::var(DIAGNOSTICS_INTERVAL_ENV)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|secs| *secs > 0)
+        .unwrap_or(DEFAULT_DIAGNOSTICS_INTERVAL_SECS);
+    Duration::from_secs(secs)
 }
 
 #[macro_export]

@@ -2,8 +2,7 @@ use crate::daemon::runtime::{ThreadHandle, ThreadRegistry};
 use crate::daemon::snapshot;
 use crate::kroni_api::kroni::v1::kroni_server::{Kroni, KroniServer};
 use crate::kroni_api::kroni::v1::{
-    SnapshotReply, SnapshotRequest, SystemMetric, SystemMetricsReply, SystemMetricsRequest,
-    WatchRequest,
+    SnapshotReply, SnapshotRequest, WatchRequest,
     snapshot_reply::ActivityRecord as PbRecord,
     snapshot_reply::ActivityState as PbState,
     snapshot_reply::Cadence,
@@ -20,14 +19,11 @@ use crate::util::logging::{info, warn};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use futures_core::Stream;
-use once_cell::sync::OnceCell;
 use prost_types::Timestamp;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::net::UnixListener;
-use tokio::sync::{mpsc, oneshot};
-use tokio::time;
 use tokio_stream::StreamExt;
 use tokio_stream::wrappers::WatchStream;
 use tonic::{Request, Response, Status, transport::Server};
@@ -39,12 +35,6 @@ use std::sync::Mutex;
 use std::time::Duration;
 #[cfg(test)]
 use tokio::sync::Notify;
-
-static SYSTEM_TRACKER_DB_PATH: OnceCell<PathBuf> = OnceCell::new();
-static SYSTEM_TRACKER_QUERY_TX: OnceCell<mpsc::Sender<crate::daemon::tracker::MetricsQueryReq>> =
-    OnceCell::new();
-static SYSTEM_TRACKER_CONTROL_TX: OnceCell<mpsc::Sender<crate::daemon::tracker::ControlRequest>> =
-    OnceCell::new();
 
 #[cfg(test)]
 static GRPC_TEST_SHUTDOWN: Lazy<Mutex<Option<Arc<Notify>>>> = Lazy::new(|| Mutex::new(None));
@@ -60,18 +50,6 @@ pub(crate) fn trigger_grpc_shutdown() {
     if let Some(handle) = GRPC_TEST_SHUTDOWN.lock().unwrap().take() {
         handle.notify_waiters();
     }
-}
-
-pub fn set_system_tracker_db_path(db_path: PathBuf) {
-    let _ = SYSTEM_TRACKER_DB_PATH.set(db_path);
-}
-
-pub fn set_system_tracker_query_tx(tx: mpsc::Sender<crate::daemon::tracker::MetricsQueryReq>) {
-    let _ = SYSTEM_TRACKER_QUERY_TX.set(tx);
-}
-
-pub fn set_system_tracker_control_tx(tx: mpsc::Sender<crate::daemon::tracker::ControlRequest>) {
-    let _ = SYSTEM_TRACKER_CONTROL_TX.set(tx);
 }
 
 #[derive(Clone)]
@@ -112,175 +90,6 @@ impl Kroni for KroniSvc {
         let stream = WatchStream::new(rx).map(|arc| Ok(to_pb(&arc)));
         Ok(Response::new(Box::pin(stream)))
     }
-
-    async fn get_system_metrics(
-        &self,
-        req: Request<SystemMetricsRequest>,
-    ) -> Result<Response<SystemMetricsReply>, Status> {
-        let request = req.into_inner();
-
-        if SYSTEM_TRACKER_DB_PATH.get().is_none() {
-            return Err(Status::unavailable("System tracker not configured"));
-        }
-
-        // Proactively request a tracker flush so we read fresh data through the
-        // control channel, then wait for acknowledgement (with timeout).
-        let ctrl_tx = SYSTEM_TRACKER_CONTROL_TX
-            .get()
-            .ok_or_else(|| Status::unavailable("System tracker control channel not configured"))?
-            .clone();
-        let (ack_tx, ack_rx) = oneshot::channel();
-        ctrl_tx
-            .send(crate::daemon::tracker::ControlRequest::Flush(ack_tx))
-            .await
-            .map_err(|_| Status::internal("Failed to request tracker flush"))?;
-        time::timeout(std::time::Duration::from_millis(2000), ack_rx)
-            .await
-            .map_err(|_| Status::deadline_exceeded("Timed out waiting for tracker flush"))?
-            .map_err(|_| Status::internal("Tracker flush acknowledgement dropped"))?;
-
-        // Route the read through the tracker thread using a query channel so
-        // the query runs against the same in-process DB instance as the writer.
-        let tx = SYSTEM_TRACKER_QUERY_TX
-            .get()
-            .ok_or_else(|| Status::unavailable("System tracker not configured (query tx)"))?
-            .clone();
-
-        let pid = request.pid;
-        let mut metrics = if request.limit > 0 {
-            let query = crate::daemon::tracker::MetricsQuery::ByLimit {
-                pid,
-                limit: request.limit as usize,
-            };
-            let (reply_tx, reply_rx) = oneshot::channel();
-            tx.send(crate::daemon::tracker::MetricsQueryReq {
-                query,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| Status::internal("Failed to send query to tracker thread"))?;
-            time::timeout(std::time::Duration::from_millis(1500), reply_rx)
-                .await
-                .map_err(|_| Status::deadline_exceeded("Timed out waiting for tracker reply"))?
-                .map_err(|_| Status::internal("Tracker query channel closed"))?
-                .map_err(|e| Status::internal(format!("Tracker query error: {}", e)))?
-        } else {
-            let start_time = match request.start_time.as_ref() {
-                Some(ts) => ts_to_utc(ts)
-                    .map_err(|e| Status::invalid_argument(format!("Invalid start_time: {}", e)))?,
-                None => Utc::now() - chrono::Duration::minutes(5),
-            };
-            let end_time = match request.end_time.as_ref() {
-                Some(ts) => ts_to_utc(ts)
-                    .map_err(|e| Status::invalid_argument(format!("Invalid end_time: {}", e)))?,
-                None => Utc::now(),
-            };
-            let query = crate::daemon::tracker::MetricsQuery::ByRange {
-                pid,
-                start: start_time,
-                end: end_time,
-            };
-            let (reply_tx, reply_rx) = oneshot::channel();
-            tx.send(crate::daemon::tracker::MetricsQueryReq {
-                query,
-                reply: reply_tx,
-            })
-            .await
-            .map_err(|_| Status::internal("Failed to send query to tracker thread"))?;
-            time::timeout(std::time::Duration::from_millis(1500), reply_rx)
-                .await
-                .map_err(|_| Status::deadline_exceeded("Timed out waiting for tracker reply"))?
-                .map_err(|_| Status::internal("Tracker query channel closed"))?
-                .map_err(|e| Status::internal(format!("Tracker query error: {}", e)))?
-        };
-
-        // Best-effort: if empty, allow one short retry to let the tracker
-        // finish persisting immediately after a flush.
-        if metrics.is_empty() {
-            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-            if request.limit > 0 {
-                let query = crate::daemon::tracker::MetricsQuery::ByLimit {
-                    pid,
-                    limit: request.limit as usize,
-                };
-                let (reply_tx, reply_rx) = oneshot::channel();
-                tx.send(crate::daemon::tracker::MetricsQueryReq {
-                    query,
-                    reply: reply_tx,
-                })
-                .await
-                .map_err(|_| Status::internal("Failed to send query to tracker thread (retry)"))?;
-                metrics = time::timeout(std::time::Duration::from_millis(1200), reply_rx)
-                    .await
-                    .map_err(|_| {
-                        Status::deadline_exceeded("Timed out waiting for tracker reply (retry)")
-                    })?
-                    .map_err(|_| Status::internal("Tracker query channel closed (retry)"))?
-                    .map_err(|e| Status::internal(format!("Tracker query error (retry): {}", e)))?;
-            } else {
-                let start_time = match request.start_time.as_ref() {
-                    Some(ts) => ts_to_utc(ts).map_err(|e| {
-                        Status::invalid_argument(format!("Invalid start_time: {}", e))
-                    })?,
-                    None => Utc::now() - chrono::Duration::minutes(5),
-                };
-                let end_time = match request.end_time.as_ref() {
-                    Some(ts) => ts_to_utc(ts).map_err(|e| {
-                        Status::invalid_argument(format!("Invalid end_time: {}", e))
-                    })?,
-                    None => Utc::now(),
-                };
-                let query = crate::daemon::tracker::MetricsQuery::ByRange {
-                    pid,
-                    start: start_time,
-                    end: end_time,
-                };
-                let (reply_tx, reply_rx) = oneshot::channel();
-                tx.send(crate::daemon::tracker::MetricsQueryReq {
-                    query,
-                    reply: reply_tx,
-                })
-                .await
-                .map_err(|_| Status::internal("Failed to send query to tracker thread (retry)"))?;
-                metrics = time::timeout(std::time::Duration::from_millis(1200), reply_rx)
-                    .await
-                    .map_err(|_| {
-                        Status::deadline_exceeded("Timed out waiting for tracker reply (retry)")
-                    })?
-                    .map_err(|_| Status::internal("Tracker query channel closed (retry)"))?
-                    .map_err(|e| Status::internal(format!("Tracker query error (retry): {}", e)))?;
-            }
-        }
-
-        let pb_metrics = metrics
-            .into_iter()
-            .map(|m| SystemMetric {
-                timestamp: Some(utc_to_ts(m.timestamp)),
-                cpu_percent: m.cpu_percent,
-                memory_bytes: m.memory_bytes,
-                disk_io_bytes: m.disk_io_bytes,
-            })
-            .collect::<Vec<_>>();
-
-        let total_count = pb_metrics.len() as u32;
-
-        let reply = SystemMetricsReply {
-            metrics: pb_metrics,
-            total_count,
-        };
-
-        Ok(Response::new(reply))
-    }
-}
-
-fn ts_to_utc(ts: &Timestamp) -> Result<DateTime<Utc>, &'static str> {
-    // Clamp nanos to u32 and use chrono’s from_timestamp
-    let secs = ts.seconds;
-    let nanos = ts.nanos;
-    if nanos < 0 || nanos >= 1_000_000_000 {
-        return Err("nanos out of range");
-    }
-    DateTime::<Utc>::from_timestamp(secs, nanos as u32).ok_or("invalid timestamp range")
 }
 
 fn utc_to_ts(dt: DateTime<Utc>) -> Timestamp {
@@ -491,7 +300,6 @@ mod tests {
     };
     use crate::kroni_api::kroni::v1::{SnapshotRequest, WatchRequest};
     use chrono::{Duration, TimeZone, Utc};
-    use prost_types::Timestamp;
     use std::path::PathBuf;
     use std::sync::Arc;
     use tokio_stream::StreamExt;
@@ -524,15 +332,6 @@ mod tests {
                 .as_nanos()
         );
         base.join(unique)
-    }
-
-    #[test]
-    fn ts_to_utc_rejects_out_of_range_nanos() {
-        let ts = Timestamp {
-            seconds: 1,
-            nanos: 1_500_000_000,
-        };
-        assert!(ts_to_utc(&ts).is_err());
     }
 
     #[test]

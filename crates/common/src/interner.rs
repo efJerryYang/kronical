@@ -34,6 +34,17 @@ impl StringInterner {
         arc_string
     }
 
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn live_len(&self) -> usize {
+        self.map
+            .values()
+            .filter(|weak_ref| weak_ref.strong_count() > 0)
+            .count()
+    }
+
     fn cleanup_dead_references(&mut self) {
         self.map.retain(|_, weak_ref| weak_ref.strong_count() > 0);
 
@@ -92,5 +103,21 @@ mod tests {
         assert!(!interner.map.contains_key("one"));
         let _three = interner.intern("two");
         drop(one);
+    }
+
+    #[test]
+    fn reports_total_and_live_entries() {
+        let mut interner = StringInterner::new();
+        let one = interner.intern("one");
+        let two = interner.intern("two");
+
+        assert_eq!(interner.len(), 2);
+        assert_eq!(interner.live_len(), 2);
+
+        drop(one);
+        drop(two);
+
+        assert_eq!(interner.len(), 2);
+        assert_eq!(interner.live_len(), 0);
     }
 }

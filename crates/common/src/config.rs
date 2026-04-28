@@ -14,8 +14,6 @@ pub enum DatabaseBackendConfig {
 pub struct AppConfig {
     pub workspace_dir: PathBuf,
     pub db_backend: DatabaseBackendConfig,
-    // Tracker storage backend (separate from main DB)
-    pub tracker_db_backend: DatabaseBackendConfig,
     pub persist_raw_events: bool,
     pub retention_minutes: u64,
     pub active_grace_secs: u64,
@@ -31,14 +29,9 @@ pub struct AppConfig {
     pub focus_interner_max_strings: usize,
     pub focus_window_coalesce_ms: u64,
     pub focus_allow_zero_window_id: bool,
-    pub tracker_enabled: bool,
-    pub tracker_interval_secs: f64,
-    pub tracker_batch_size: usize,
-    pub tracker_refresh_secs: f64,
     pub monitor_apps_sleep_filter_enabled: bool,
     // DuckDB memory caps (MB). Applied when DuckDB is used.
     pub duckdb_memory_limit_mb_main: u64,
-    pub duckdb_memory_limit_mb_tracker: u64,
 }
 
 impl Default for AppConfig {
@@ -52,7 +45,6 @@ impl Default for AppConfig {
         Self {
             workspace_dir,
             db_backend: DatabaseBackendConfig::Duckdb,
-            tracker_db_backend: DatabaseBackendConfig::Duckdb,
             persist_raw_events: false,
             retention_minutes: 72 * 60,
             active_grace_secs: 30,
@@ -68,13 +60,8 @@ impl Default for AppConfig {
             focus_interner_max_strings: 4096,
             focus_window_coalesce_ms: 100,
             focus_allow_zero_window_id: true,
-            tracker_enabled: false,
-            tracker_interval_secs: 1.0,
-            tracker_batch_size: 60,
-            tracker_refresh_secs: 1.0,
             monitor_apps_sleep_filter_enabled: false,
             duckdb_memory_limit_mb_main: 10,
-            duckdb_memory_limit_mb_tracker: 10,
         }
     }
 }
@@ -87,7 +74,6 @@ impl AppConfig {
         let mut builder = Config::builder()
             .set_default("workspace_dir", workspace_dir.to_string_lossy().as_ref())?
             .set_default("db_backend", "duckdb")?
-            .set_default("tracker_db_backend", "duckdb")?
             .set_default("persist_raw_events", false)?
             .set_default("retention_minutes", 72 * 60)?
             .set_default("active_grace_secs", 30)?
@@ -103,13 +89,8 @@ impl AppConfig {
             .set_default("focus_interner_max_strings", 4096)?
             .set_default("focus_window_coalesce_ms", 100)?
             .set_default("focus_allow_zero_window_id", true)?
-            .set_default("tracker_enabled", false)?
-            .set_default("tracker_interval_secs", 1.0)?
-            .set_default("tracker_batch_size", 60)?
-            .set_default("tracker_refresh_secs", 1.0)?
             .set_default("monitor_apps_sleep_filter_enabled", false)?
-            .set_default("duckdb_memory_limit_mb_main", 10)?
-            .set_default("duckdb_memory_limit_mb_tracker", 10)?;
+            .set_default("duckdb_memory_limit_mb_main", 10)?;
 
         if config_path.exists() {
             builder = builder.add_source(File::from(config_path));
@@ -156,7 +137,6 @@ mod tests {
             let cfg = AppConfig::default();
             assert!(cfg.workspace_dir.ends_with(".kronical"));
             assert_eq!(cfg.db_backend, DatabaseBackendConfig::Duckdb);
-            assert_eq!(cfg.tracker_db_backend, DatabaseBackendConfig::Duckdb);
             assert!(!cfg.persist_raw_events);
             assert_eq!(cfg.retention_minutes, 72 * 60);
             assert_eq!(cfg.active_grace_secs, 30);
@@ -165,11 +145,8 @@ mod tests {
             assert_eq!(cfg.max_windows_per_app, 30);
             assert_eq!(cfg.focus_window_coalesce_ms, 100);
             assert!(cfg.focus_allow_zero_window_id);
-            assert!(!cfg.tracker_enabled);
-            assert_eq!(cfg.tracker_batch_size, 60);
             assert!(!cfg.monitor_apps_sleep_filter_enabled);
             assert_eq!(cfg.duckdb_memory_limit_mb_main, 10);
-            assert_eq!(cfg.duckdb_memory_limit_mb_tracker, 10);
         });
     }
 
@@ -193,28 +170,22 @@ mod tests {
             let config_contents =
                 format!("workspace_dir = \"{}\"\n", workspace_dir.to_string_lossy())
                     + "db_backend = \"sqlite3\"\n"
-                    + "tracker_db_backend = \"duckdb\"\n"
                     + "retention_minutes = 45\n"
-                    + "tracker_enabled = true\n"
                     + "title_cache_capacity = 1024\n"
                     + "duckdb_memory_limit_mb_main = 256\n";
             fs::write(&config_path, config_contents).expect("write config");
 
             // Environment vars override the file.
-            set_env("KRONICAL_TRACKER_ENABLED", "false");
             set_env("KRONICAL_TITLE_CACHE_CAPACITY", "2048");
 
             let cfg = AppConfig::load().expect("load config");
 
             assert_eq!(cfg.workspace_dir, workspace_dir);
             assert_eq!(cfg.db_backend, DatabaseBackendConfig::Sqlite3);
-            assert_eq!(cfg.tracker_db_backend, DatabaseBackendConfig::Duckdb);
             assert_eq!(cfg.retention_minutes, 45);
-            assert!(!cfg.tracker_enabled, "env override should win");
             assert_eq!(cfg.title_cache_capacity, 2048);
             assert_eq!(cfg.duckdb_memory_limit_mb_main, 256);
 
-            remove_env("KRONICAL_TRACKER_ENABLED");
             remove_env("KRONICAL_TITLE_CACHE_CAPACITY");
 
             if let Some(val) = original_home {

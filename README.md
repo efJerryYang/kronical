@@ -72,8 +72,6 @@ See [docs/demo-snapshot.md](docs/demo-snapshot.md) for an example snapshot captu
 - `kronictl snapshot [--pretty]` - fetch the latest snapshot via HTTP.
 - `kronictl watch [--pretty]` - follow snapshot updates (SSE).
 - `kronictl monitor` - interactive terminal UI (press `q` to quit).
-- `kronictl tracker show [--watch]` - inspect system-tracker metrics when the
-  tracker is enabled in config.
 
 ## Snapshot Endpoints
 
@@ -90,7 +88,6 @@ gRPC (Unix socket):
 
 - `Snapshot` -> snapshot payload
 - `Watch` -> streaming snapshots
-- `GetSystemMetrics` -> system tracker metrics
 - Example (grpcurl):
   ```sh
   grpcurl -plaintext -import-path proto -proto proto/kroni.proto unix:///Users/$USER/.kronical/kronid.sock kroni.v1.Kroni/Snapshot

@@ -62,7 +62,6 @@ gRPC (Unix socket):
 
 - `Snapshot` -> snapshot payload
 - `Watch` -> streaming snapshots
-- `GetSystemMetrics` -> system tracker metrics (query via tracker thread)
 
 ## Storage & Hydration
 

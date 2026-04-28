@@ -9,12 +9,10 @@ use crossterm::{
 use hyper_util::rt::TokioIo;
 use kronical as _;
 
-use kronical::kroni_api::kroni::v1::{
-    SnapshotRequest, SystemMetricsRequest, WatchRequest, kroni_client::KroniClient,
-};
+use kronical::kroni_api::kroni::v1::{SnapshotRequest, WatchRequest, kroni_client::KroniClient};
 use kronical::util::config::AppConfig;
 use kronical::util::logging::error;
-use kronical_core::records::{AggregatedActivity, ActivityRecord, aggregate_activities_since};
+use kronical_core::records::{ActivityRecord, AggregatedActivity, aggregate_activities_since};
 use ratatui::{
     Terminal,
     prelude::{Backend, Constraint, CrosstermBackend, Direction, Layout},
@@ -257,15 +255,11 @@ fn find_sleep_period(
 fn select_apps_period(records: &[ActivityRecord]) -> AppsPeriod {
     let now_utc = Utc::now();
     let now_local = Local::now();
-    if let Some((start, end)) = find_sleep_period(records, now_utc, MONITOR_SLEEP_MIN_SECS)
-    {
+    if let Some((start, end)) = find_sleep_period(records, now_utc, MONITOR_SLEEP_MIN_SECS) {
         let local_start = start.with_timezone(&Local);
         let local_end = end.with_timezone(&Local);
         let duration_secs = (end - start).num_seconds().max(0) as u64;
-        let title = format!(
-            "Apps (since {})",
-            local_start.format("%H:%M")
-        );
+        let title = format!("Apps (since {})", local_start.format("%H:%M"));
         let line = format!(
             "Period: last loginwindow {}–{} ({})",
             local_start.format("%H:%M"),
@@ -512,22 +506,6 @@ enum Commands {
         #[command(subcommand)]
         action: log_cli::LogCommand,
     },
-    Tracker {
-        #[command(subcommand)]
-        action: TrackerAction,
-    },
-}
-
-#[derive(Subcommand)]
-enum TrackerAction {
-    Show {
-        /// Show last N rows from current daemon run (default: 10)
-        #[arg(value_name = "count")]
-        count: Option<usize>,
-        #[arg(long)]
-        watch: bool,
-    },
-    Status,
 }
 
 fn setup_logging(verbose: u8) {
@@ -1073,9 +1051,8 @@ fn run_monitor_loop<B: Backend>(
                                             }
                                         }
                                     } else if apps_period.is_some() {
-                                        app_lines.push(Line::from(
-                                            "Apps: (no activity in this period)",
-                                        ));
+                                        app_lines
+                                            .push(Line::from("Apps: (no activity in this period)"));
                                     } else {
                                         app_lines.push(Line::from("Apps: (no recent activity)"));
                                     }
@@ -1219,11 +1196,12 @@ fn run_monitor_loop<B: Backend>(
                                         .as_ref()
                                         .map(|p| p.title.as_str())
                                         .unwrap_or("Apps");
-                                    let p_apps = Paragraph::new(app_lines).block(
-                                        Block::default()
-                                            .title(apps_title)
-                                            .borders(Borders::ALL),
-                                    )
+                                    let p_apps = Paragraph::new(app_lines)
+                                        .block(
+                                            Block::default()
+                                                .title(apps_title)
+                                                .borders(Borders::ALL),
+                                        )
                                         .wrap(Wrap { trim: true });
                                     f.render_widget(p_apps, layout[2]);
                                 })?;
@@ -1304,15 +1282,6 @@ fn main() {
         ),
         Commands::Monitor => monitor_realtime(data_file, config.clone()),
         Commands::Log { action } => log_cli::execute(action, &config.workspace_dir),
-        Commands::Tracker { action } => match action {
-            TrackerAction::Show { count, watch } => tracker_show(
-                &config.workspace_dir,
-                count,
-                watch,
-                config.tracker_refresh_secs,
-            ),
-            TrackerAction::Status => tracker_status(&config),
-        },
     };
     if let Err(e) = result {
         error!("Error: {}", e);
@@ -1379,17 +1348,34 @@ mod tests {
         let base_local = Local.with_ymd_and_hms(2024, 1, 1, 21, 0, 0).unwrap();
         let t0 = base_local.with_timezone(&Utc);
         let records = vec![
-            record_with_focus(LOGINWINDOW_APP, t0 + chrono::Duration::hours(1), t0 + chrono::Duration::hours(3)),
-            record_with_focus("Terminal", t0 + chrono::Duration::hours(3), t0 + chrono::Duration::hours(4)),
-            record_with_focus(LOGINWINDOW_APP, t0 + chrono::Duration::hours(5), t0 + chrono::Duration::hours(10)),
-            record_with_focus("Browser", t0 + chrono::Duration::hours(10), t0 + chrono::Duration::hours(11)),
-            record_with_focus(LOGINWINDOW_APP, t0 + chrono::Duration::hours(12), t0 + chrono::Duration::hours(15)),
+            record_with_focus(
+                LOGINWINDOW_APP,
+                t0 + chrono::Duration::hours(1),
+                t0 + chrono::Duration::hours(3),
+            ),
+            record_with_focus(
+                "Terminal",
+                t0 + chrono::Duration::hours(3),
+                t0 + chrono::Duration::hours(4),
+            ),
+            record_with_focus(
+                LOGINWINDOW_APP,
+                t0 + chrono::Duration::hours(5),
+                t0 + chrono::Duration::hours(10),
+            ),
+            record_with_focus(
+                "Browser",
+                t0 + chrono::Duration::hours(10),
+                t0 + chrono::Duration::hours(11),
+            ),
+            record_with_focus(
+                LOGINWINDOW_APP,
+                t0 + chrono::Duration::hours(12),
+                t0 + chrono::Duration::hours(15),
+            ),
         ];
 
-        let window_start = base_local
-            .date_naive()
-            .and_hms_opt(21, 0, 0)
-            .unwrap();
+        let window_start = base_local.date_naive().and_hms_opt(21, 0, 0).unwrap();
         let window_start = Local
             .from_local_datetime(&window_start)
             .earliest()
@@ -1413,15 +1399,24 @@ mod tests {
         let base_local = Local.with_ymd_and_hms(2024, 1, 2, 21, 0, 0).unwrap();
         let t0 = base_local.with_timezone(&Utc);
         let records = vec![
-            record_with_focus(LOGINWINDOW_APP, t0 + chrono::Duration::hours(1), t0 + chrono::Duration::hours(2)),
-            record_with_focus(LOGINWINDOW_APP, t0 + chrono::Duration::hours(2), t0 + chrono::Duration::hours(4)),
-            record_with_focus("Terminal", t0 + chrono::Duration::hours(4), t0 + chrono::Duration::hours(5)),
+            record_with_focus(
+                LOGINWINDOW_APP,
+                t0 + chrono::Duration::hours(1),
+                t0 + chrono::Duration::hours(2),
+            ),
+            record_with_focus(
+                LOGINWINDOW_APP,
+                t0 + chrono::Duration::hours(2),
+                t0 + chrono::Duration::hours(4),
+            ),
+            record_with_focus(
+                "Terminal",
+                t0 + chrono::Duration::hours(4),
+                t0 + chrono::Duration::hours(5),
+            ),
         ];
 
-        let window_start = base_local
-            .date_naive()
-            .and_hms_opt(21, 0, 0)
-            .unwrap();
+        let window_start = base_local.date_naive().and_hms_opt(21, 0, 0).unwrap();
         let window_start = Local
             .from_local_datetime(&window_start)
             .earliest()
@@ -1442,7 +1437,9 @@ mod tests {
 
     #[test]
     fn local_midnight_returns_start_of_day() {
-        let local_now = chrono::Local.with_ymd_and_hms(2024, 6, 1, 13, 45, 0).unwrap();
+        let local_now = chrono::Local
+            .with_ymd_and_hms(2024, 6, 1, 13, 45, 0)
+            .unwrap();
         let midnight = local_midnight(local_now);
         assert_eq!(midnight.hour(), 0);
         assert_eq!(midnight.minute(), 0);
@@ -1970,172 +1967,6 @@ fn print_snapshot_line(s: &kronical::daemon::snapshot::Snapshot) {
         s.cadence_ms,
         s.storage.backlog_count
     );
-}
-
-fn tracker_status(config: &AppConfig) -> Result<()> {
-    println!("System Tracker Status");
-    println!("════════════════════");
-    let _ = config;
-    println!("Status: DISABLED");
-    println!("Reason: tracker runtime is intentionally disabled to avoid adding memory and CPU noise");
-    Ok(())
-}
-
-fn cleanup_stale_tracker_pid(workspace_dir: &PathBuf) {
-    let tracker_pid_file = workspace_dir.join("tracker.pid");
-    if tracker_pid_file.exists() {
-        println!("Removing stale tracker.pid file (tracker is now part of daemon)");
-        let _ = std::fs::remove_file(&tracker_pid_file);
-    }
-}
-
-fn tracker_show(
-    workspace_dir: &PathBuf,
-    _count: Option<usize>,
-    _watch: bool,
-    _refresh_interval_secs: f64,
-) -> Result<()> {
-    cleanup_stale_tracker_pid(workspace_dir);
-    println!("System tracker output is unavailable.");
-    println!("Reason: tracker runtime is intentionally disabled to avoid adding memory and CPU noise.");
-    Ok(())
-}
-
-#[allow(dead_code)]
-fn show_tracker_data_grpc(
-    workspace_dir: &PathBuf,
-    count: Option<usize>,
-    daemon_pid: u32,
-) -> Result<()> {
-    use tonic::transport::Endpoint;
-    use tower::service_fn;
-
-    // Server is responsible for flush-before-query to avoid client/server
-    // workspace drift and snapshot ordering issues.
-
-    let uds_grpc = kronical::util::paths::grpc_uds(workspace_dir);
-    let rt = runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
-
-    rt.block_on(async move {
-        let uds_grpc_dbg = uds_grpc.clone();
-        let ep = Endpoint::try_from("http://localhost")?;
-        let channel = ep
-            .connect_with_connector(service_fn(move |_| {
-                let p = uds_grpc.clone();
-                async move {
-                    let stream = tokio::net::UnixStream::connect(p).await?;
-                    Ok::<_, std::io::Error>(TokioIo::new(stream))
-                }
-            }))
-            .await?;
-
-        let mut client = KroniClient::new(channel);
-
-        // Default to the last 10 rows from the current daemon run (by PID).
-        let limit_rows: usize = count.unwrap_or(10);
-        let pid_to_query = daemon_pid;
-
-        // Ask the server for the latest N rows for this PID (no time range).
-        let request = SystemMetricsRequest {
-            pid: pid_to_query,
-            start_time: None,
-            end_time: None,
-            limit: limit_rows as u32,
-        };
-
-        println!(
-            "Debug: UDS={} PID={} limit={} (server flush-before-query)",
-            uds_grpc_dbg.display(),
-            pid_to_query,
-            limit_rows
-        );
-
-        let response = client
-            .get_system_metrics(tonic::Request::new(request))
-            .await?
-            .into_inner();
-
-        if response.metrics.is_empty() {
-            println!("No tracker data found for current daemon run");
-            return Ok(());
-        }
-
-        println!(
-            "{:<32} {:>8} {:>12} {:>12}",
-            "Timestamp (RFC3339)", "CPU %", "Memory KB", "Disk IO KB"
-        );
-        println!("{}", "-".repeat(68));
-
-        for metric in &response.metrics {
-            let time_part = match &metric.timestamp {
-                Some(ts) => {
-                    let secs = ts.seconds;
-                    let nanos = ts.nanos;
-                    let dt = chrono::DateTime::<chrono::Utc>::from_timestamp(secs, nanos as u32)
-                        .ok_or_else(|| anyhow::anyhow!("Invalid timestamp range"))?;
-                    use chrono::SecondsFormat;
-                    // Fixed-width RFC3339 with micros to keep columns aligned (32 chars in UTC)
-                    dt.to_rfc3339_opts(SecondsFormat::Micros, true)
-                }
-                None => "unknown".to_string(),
-            };
-            let memory_kb = metric.memory_bytes / 1024;
-            let disk_io_kb = metric.disk_io_bytes / 1024;
-
-            println!(
-                "{:<32} {:>8.1} {:>12} {:>12}",
-                time_part, metric.cpu_percent, memory_kb, disk_io_kb
-            );
-        }
-
-        if let (Some(first), Some(last)) = (response.metrics.first(), response.metrics.last()) {
-            let first_time = first
-                .timestamp
-                .as_ref()
-                .and_then(|ts| {
-                    use chrono::SecondsFormat;
-                    chrono::DateTime::<chrono::Utc>::from_timestamp(ts.seconds, ts.nanos as u32)
-                        .map(|dt| dt.to_rfc3339_opts(SecondsFormat::Micros, true))
-                })
-                .unwrap_or_else(|| "unknown".to_string());
-            let last_time = last
-                .timestamp
-                .as_ref()
-                .and_then(|ts| {
-                    use chrono::SecondsFormat;
-                    chrono::DateTime::<chrono::Utc>::from_timestamp(ts.seconds, ts.nanos as u32)
-                        .map(|dt| dt.to_rfc3339_opts(SecondsFormat::Micros, true))
-                })
-                .unwrap_or_else(|| "unknown".to_string());
-
-            println!();
-            println!(
-                "Showing {} entries from {} to {}",
-                response.metrics.len(),
-                first_time,
-                last_time
-            );
-            // Help users diagnose mismatches: show the PID we queried
-            println!("Source: PID={}", pid_to_query);
-
-            // Diagnostic: show recency delta
-            if let Some(ts) = last.timestamp.as_ref() {
-                if let Some(last_dt) =
-                    chrono::DateTime::<chrono::Utc>::from_timestamp(ts.seconds, ts.nanos as u32)
-                {
-                    let now = chrono::Utc::now();
-                    let delta = now.signed_duration_since(last_dt).num_seconds();
-                    println!("Debug: last_ts_age={}s (now={})", delta, now.to_rfc3339());
-                }
-            }
-        }
-
-        Ok::<(), anyhow::Error>(())
-    })?;
-
-    Ok(())
 }
 
 // gRPC API always available; feature gate removed

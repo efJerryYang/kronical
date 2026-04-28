@@ -9,7 +9,7 @@ pub use kronical_core::snapshot;
 
 // Grouped subsystems
 pub mod server; // gRPC + HTTP
-pub mod tracker; // focus + system tracker
+pub mod tracker;
 
 // Unified API facade around available transports (gRPC, HTTP/SSE)
 pub mod api;
