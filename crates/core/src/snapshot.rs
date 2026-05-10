@@ -29,7 +29,18 @@ pub struct Snapshot {
     pub health: Vec<String>,
     pub aggregated_apps: Vec<SnapshotApp>,
     #[serde(default)]
+    pub title_revisions_recent: Vec<TitleRevisionRef>,
+    #[serde(default)]
     pub records: Vec<ActivityRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct TitleRevisionRef {
+    pub event_id: u64,
+    pub at: chrono::DateTime<chrono::Utc>,
+    pub window_id: u32,
+    pub title: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -73,6 +84,7 @@ impl Snapshot {
             config: ConfigSummary::default(),
             health: Vec::new(),
             aggregated_apps: Vec::new(),
+            title_revisions_recent: Vec::new(),
             records: Vec::new(),
         }
     }
@@ -87,6 +99,8 @@ pub struct SnapshotBus {
     health_rx: watch::Receiver<VecDeque<String>>,
     transitions_tx: watch::Sender<VecDeque<Transition>>,
     transitions_rx: watch::Receiver<VecDeque<Transition>>,
+    title_revisions_tx: watch::Sender<VecDeque<TitleRevisionRef>>,
+    title_revisions_rx: watch::Receiver<VecDeque<TitleRevisionRef>>,
 }
 
 impl SnapshotBus {
@@ -94,6 +108,7 @@ impl SnapshotBus {
         let (snapshot_tx, snapshot_rx) = watch::channel(Arc::new(Snapshot::empty()));
         let (health_tx, health_rx) = watch::channel(VecDeque::with_capacity(64));
         let (transitions_tx, transitions_rx) = watch::channel(VecDeque::with_capacity(64));
+        let (title_revisions_tx, title_revisions_rx) = watch::channel(VecDeque::with_capacity(128));
         Self {
             seq: AtomicU64::new(0),
             run_id: None,
@@ -103,6 +118,8 @@ impl SnapshotBus {
             health_rx,
             transitions_tx,
             transitions_rx,
+            title_revisions_tx,
+            title_revisions_rx,
         }
     }
 
@@ -133,6 +150,7 @@ impl SnapshotBus {
     ) {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
         let transitions_recent = self.recent_transitions(5);
+        let title_revisions_recent = self.recent_title_revisions(64);
         let snap = Snapshot {
             seq,
             mono_ns: monotonic_ns(),
@@ -149,6 +167,7 @@ impl SnapshotBus {
             config,
             health,
             aggregated_apps,
+            title_revisions_recent,
             records,
         };
         let _ = self.snapshot_tx.send(Arc::new(snap));
@@ -168,6 +187,25 @@ impl SnapshotBus {
 
     pub fn recent_transitions(&self, limit: usize) -> Vec<Transition> {
         let buf = self.transitions_rx.borrow();
+        let len = buf.len();
+        let n = limit.min(len);
+        buf.iter().rev().take(n).cloned().collect()
+    }
+
+    pub fn push_title_revision(&self, revision: TitleRevisionRef) {
+        let mut buf = {
+            let guard = self.title_revisions_rx.borrow();
+            guard.clone()
+        };
+        if buf.len() >= 128 {
+            let _ = buf.pop_front();
+        }
+        buf.push_back(revision);
+        let _ = self.title_revisions_tx.send(buf);
+    }
+
+    pub fn recent_title_revisions(&self, limit: usize) -> Vec<TitleRevisionRef> {
+        let buf = self.title_revisions_rx.borrow();
         let len = buf.len();
         let n = limit.min(len);
         buf.iter().rev().take(n).cloned().collect()
@@ -281,6 +319,17 @@ mod tests {
         }
     }
 
+    fn sample_title_revision(seq: usize) -> TitleRevisionRef {
+        TitleRevisionRef {
+            event_id: 1_000 + seq as u64,
+            at: Utc
+                .with_ymd_and_hms(2024, 4, 22, 10, 4, seq as u32 % 60)
+                .unwrap(),
+            window_id: 50 + seq as u32,
+            title: format!("tab-{seq}"),
+        }
+    }
+
     #[test]
     fn publish_basic_updates_snapshot_and_sequence() {
         let bus = SnapshotBus::new();
@@ -305,6 +354,8 @@ mod tests {
 
         let transition = sample_transition(1);
         bus.push_transition(transition.clone());
+        let title_revision = sample_title_revision(1);
+        bus.push_title_revision(title_revision.clone());
 
         bus.publish_basic(
             ActivityState::Active,
@@ -329,9 +380,13 @@ mod tests {
         assert_eq!(snap.cadence_reason, "timer");
         assert_eq!(snap.health, vec!["healthy".to_string()]);
         assert_eq!(snap.transitions_recent.len(), 1);
+        assert_eq!(snap.title_revisions_recent.len(), 1);
         let recent = &snap.transitions_recent[0];
         assert_eq!(recent.by_signal.as_deref(), Some("signal-1"));
         assert_eq!(recent.to, ActivityState::Active);
+        let recent_title = &snap.title_revisions_recent[0];
+        assert_eq!(recent_title.event_id, title_revision.event_id);
+        assert_eq!(recent_title.title, title_revision.title);
 
         // Second publish bumps the sequence counter.
         bus.publish_basic(
@@ -374,5 +429,19 @@ mod tests {
         assert_eq!(health.len(), 64);
         assert_eq!(health.first().unwrap(), "health-6");
         assert_eq!(health.last().unwrap(), "health-69");
+    }
+
+    #[test]
+    fn title_revision_buffer_trims_to_capacity() {
+        let bus = SnapshotBus::new();
+
+        for i in 0..140 {
+            bus.push_title_revision(sample_title_revision(i));
+        }
+
+        let recent = bus.recent_title_revisions(10);
+        assert_eq!(recent.len(), 10);
+        assert_eq!(recent[0].event_id, 1_139);
+        assert_eq!(recent.last().unwrap().event_id, 1_130);
     }
 }

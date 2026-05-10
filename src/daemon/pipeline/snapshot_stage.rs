@@ -257,12 +257,13 @@ fn apply_update(
     if let Some(state) = update.state {
         *current_state = state;
     }
-    if let Some((window_id, title)) = update.focus_title {
+    if let Some(revision) = update.focus_title {
         if let Some(focus) = current_focus.as_mut() {
-            if focus.window_id == window_id {
-                focus.window_title = Arc::new(title);
+            if focus.window_id == revision.window_id {
+                focus.window_title = Arc::new(revision.title.clone());
             }
         }
+        snapshot_bus.push_title_revision(revision);
     }
     if let Some(mut transition) = update.transition {
         attach_run_id(snapshot_bus.as_ref(), &mut transition);
@@ -740,6 +741,22 @@ mod tests {
         update.hints_delta = 1;
         update.signals_delta = 1;
         update.state = Some(ActivityState::Active);
+        update.focus = Some(WindowFocusInfo {
+            pid: 42,
+            process_start_time: 777,
+            app_name: Arc::new("Terminal".to_string()),
+            window_title: Arc::new("before".to_string()),
+            window_id: 9,
+            window_instance_start: Utc::now(),
+            window_position: None,
+            window_size: None,
+        });
+        update.focus_title = Some(snapshot::TitleRevisionRef {
+            event_id: 1234,
+            at: Utc::now(),
+            window_id: 9,
+            title: "after".to_string(),
+        });
         update.transition = Some(snapshot::Transition {
             from: ActivityState::Inactive,
             to: ActivityState::Active,
@@ -778,5 +795,14 @@ mod tests {
         assert_eq!(snapshot.counts.hints_seen, 1);
         assert_eq!(snapshot.counts.signals_seen, 1);
         assert_eq!(snapshot.counts.records_emitted, 1);
+        assert_eq!(
+            snapshot
+                .focus
+                .as_ref()
+                .map(|focus| focus.window_title.as_str()),
+            Some("after")
+        );
+        assert_eq!(snapshot.title_revisions_recent.len(), 1);
+        assert_eq!(snapshot.title_revisions_recent[0].event_id, 1234);
     }
 }

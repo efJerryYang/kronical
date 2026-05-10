@@ -1795,6 +1795,7 @@ fn map_pb_snapshot(
         config,
         health,
         aggregated_apps,
+        title_revisions_recent: Vec::new(),
         records,
     }
 }

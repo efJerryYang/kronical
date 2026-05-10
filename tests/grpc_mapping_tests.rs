@@ -58,6 +58,7 @@ fn maps_aggregated_apps_in_grpc_snapshot_reply() {
             total_duration_secs: 300,
             total_duration_pretty: "5m".into(),
         }],
+        title_revisions_recent: vec![],
         records: Vec::new(),
     };
 

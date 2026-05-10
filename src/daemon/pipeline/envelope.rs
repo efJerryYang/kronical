@@ -188,7 +188,12 @@ fn apply_focus_update(update: &mut SnapshotUpdate, env: &EventEnvelope) {
     if let EventPayload::Focus(focus) = &env.payload {
         update.focus = Some(focus.clone());
     } else if let EventPayload::Title { window_id, title } = &env.payload {
-        update.focus_title = Some((*window_id, title.clone()));
+        update.focus_title = Some(snapshot::TitleRevisionRef {
+            event_id: env.id,
+            at: env.timestamp,
+            window_id: *window_id,
+            title: title.clone(),
+        });
     }
 }
 

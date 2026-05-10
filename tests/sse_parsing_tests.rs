@@ -22,6 +22,7 @@ fn parses_single_sse_event_into_snapshot() {
         config: Default::default(),
         health: vec![],
         aggregated_apps: vec![],
+        title_revisions_recent: vec![],
         records: vec![],
     };
     let json = serde_json::to_string(&snap).unwrap();

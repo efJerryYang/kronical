@@ -47,7 +47,7 @@ pub struct SnapshotUpdate {
     pub hints_delta: u64,
     pub signals_delta: u64,
     pub focus: Option<WindowFocusInfo>,
-    pub focus_title: Option<(u32, String)>,
+    pub focus_title: Option<snapshot::TitleRevisionRef>,
     pub transition: Option<snapshot::Transition>,
     pub state: Option<ActivityState>,
 }
