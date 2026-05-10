@@ -143,12 +143,16 @@ impl RecordBuilder {
             .map(|cf| cf.window_id == window_id)
             .unwrap_or(false);
         if should_update {
-            let completed = self.finalize_current();
             if let Some(cf) = &mut self.current_focus {
                 cf.window_title = self.string_interner.intern(new_title);
             }
-            self.start_new_current();
-            return completed;
+            if let Some(record) = &mut self.current_record {
+                if let Some(focus) = &mut record.focus_info {
+                    if focus.window_id == window_id {
+                        focus.window_title = self.string_interner.intern(new_title);
+                    }
+                }
+            }
         }
         None
     }
@@ -568,21 +572,28 @@ mod tests {
 
         builder.on_hint(&focus_hint(1, focus.clone(), now));
 
-        let record = builder
-            .on_hint(&title_hint(
-                2,
-                200,
-                "Inbox – Reply",
-                now + Duration::milliseconds(5),
-            ))
-            .expect("title change closes previous slice");
-
-        assert_eq!(record.focus_info.unwrap().window_title.as_str(), "Inbox");
+        assert!(
+            builder
+                .on_hint(&title_hint(
+                    2,
+                    200,
+                    "Inbox – Reply",
+                    now + Duration::milliseconds(5),
+                ))
+                .is_none()
+        );
         assert_eq!(builder.current_state(), ActivityState::Inactive);
 
         let updated_focus = builder.current_focus().expect("focus retained");
         assert_eq!(updated_focus.window_id, 200);
         assert_eq!(updated_focus.window_title.as_str(), "Inbox – Reply");
+
+        let current_record = builder
+            .current_record
+            .as_ref()
+            .and_then(|record| record.focus_info.as_ref())
+            .expect("current record focus retained");
+        assert_eq!(current_record.window_title.as_str(), "Inbox – Reply");
     }
 
     #[test]
@@ -781,5 +792,20 @@ mod tests {
         assert!(agg.windows.get(&10).is_none());
         assert!(agg.windows.contains_key(&11));
         assert!(agg.windows.contains_key(&12));
+    }
+
+    #[test]
+    fn title_change_updates_metadata_without_splitting_record() {
+        let mut builder = RecordBuilder::new(ActivityState::Active);
+        let at = Utc.with_ymd_and_hms(2024, 5, 1, 12, 0, 0).unwrap();
+        let focus = make_focus(42, 777, "iTerm2", 7, "kronical", at);
+
+        assert!(builder.on_hint(&focus_hint(1, focus, at)).is_none());
+
+        let result = builder.on_hint(&title_hint(2, 7, "⠦ kronical", at + Duration::seconds(1)));
+        assert!(result.is_none());
+
+        let current_focus = builder.current_focus().expect("focus should remain active");
+        assert_eq!(current_focus.window_title.as_ref(), "⠦ kronical");
     }
 }

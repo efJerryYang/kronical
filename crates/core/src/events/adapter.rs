@@ -364,6 +364,29 @@ mod tests {
     }
 
     #[test]
+    fn spinner_style_title_change_is_still_preserved_as_title_hint() {
+        let mut adapter = EventAdapter::new();
+        let _ = adapter.adapt_batch(&vec![focus_event(
+            31,
+            4_100,
+            focus_info("Terminal", 1, "kronical"),
+        )]);
+
+        let info = focus_info("Terminal", 1, "⠦ kronical");
+        let out = adapter.adapt_batch(&vec![focus_event(32, 4_101, info.clone())]);
+
+        assert_eq!(out.len(), 1);
+        let evt = &out[0];
+        assert!(matches!(evt.kind, EventKind::Hint(HintKind::TitleChanged)));
+        if let EventPayload::Title { window_id, title } = &evt.payload {
+            assert_eq!(*window_id, info.window_id);
+            assert_eq!(title, info.window_title.as_ref());
+        } else {
+            panic!("expected title payload");
+        }
+    }
+
+    #[test]
     fn identical_focus_updates_emit_nothing() {
         let mut adapter = EventAdapter::new();
         let focus = focus_info("Terminal", 1, "tab1");

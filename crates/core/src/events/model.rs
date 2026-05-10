@@ -24,7 +24,7 @@ pub enum SignalKind {
     LockEnd,
 }
 
-// Hints split records or enrich metadata, but do not affect state
+// Hints enrich metadata and record context, but do not affect state
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum HintKind {
     FocusChanged,
@@ -117,7 +117,7 @@ impl SplitPolicy for DefaultSplitPolicy {
             EventKind::Signal(SignalKind::AppChanged | SignalKind::WindowChanged) => {
                 Some(SplitReason::AppWindowChanged)
             }
-            EventKind::Hint(HintKind::TitleChanged) => Some(SplitReason::TitleChanged),
+            EventKind::Hint(HintKind::TitleChanged) => None,
             _ => None,
         }
     }
@@ -239,7 +239,7 @@ mod tests {
     use chrono::{Duration, TimeZone, Utc};
 
     #[test]
-    fn default_split_policy_detects_title_and_window_changes() {
+    fn default_split_policy_detects_window_changes_but_not_title_metadata_updates() {
         let ts = Utc.with_ymd_and_hms(2024, 4, 22, 12, 0, 0).unwrap();
         let app_changed = EventEnvelope {
             id: 1,
@@ -270,10 +270,7 @@ mod tests {
             policy.split_reason(&app_changed),
             Some(SplitReason::AppWindowChanged)
         );
-        assert_eq!(
-            policy.split_reason(&title_changed),
-            Some(SplitReason::TitleChanged)
-        );
+        assert_eq!(policy.split_reason(&title_changed), None);
     }
 
     #[test]
