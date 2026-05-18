@@ -5,5 +5,4 @@ edition = "2024"
 
 [dependencies]
 kronical-core = { path = "../core" }
-# uiohook-rs = "0.2"
-uiohook-rs = { path = "../../../vendor/uiohook-rs" }
+uiohook-rs = { git = "https://github.com/efJerryYang/uiohook-rs.git", branch = "main" }
