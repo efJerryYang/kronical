@@ -2,7 +2,7 @@ use crate::daemon::runtime::{ThreadHandle, ThreadRegistry};
 use crate::daemon::snapshot;
 use crate::kroni_api::kroni::v1::kroni_server::{Kroni, KroniServer};
 use crate::kroni_api::kroni::v1::{
-    SnapshotReply, SnapshotRequest, WatchRequest,
+    SnapshotDelta, SnapshotReply, SnapshotRequest, TitleRevisionRef, WatchRequest,
     snapshot_reply::ActivityRecord as PbRecord,
     snapshot_reply::ActivityState as PbState,
     snapshot_reply::Cadence,
@@ -19,13 +19,14 @@ use crate::util::logging::{info, warn};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use futures_core::Stream;
+use futures_util::stream;
 use prost_types::Timestamp;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::Arc;
 use tokio::net::UnixListener;
 use tokio_stream::StreamExt;
-use tokio_stream::wrappers::WatchStream;
+use tokio_stream::wrappers::BroadcastStream;
 use tonic::{Request, Response, Status, transport::Server};
 
 #[cfg(test)]
@@ -79,15 +80,34 @@ impl Kroni for KroniSvc {
         Ok(Response::new(to_pb(&s)))
     }
 
-    type WatchStream = Pin<Box<dyn Stream<Item = Result<SnapshotReply, Status>> + Send + 'static>>;
+    type WatchStream = Pin<Box<dyn Stream<Item = Result<SnapshotDelta, Status>> + Send + 'static>>;
 
     async fn watch(
         &self,
-        _req: Request<WatchRequest>,
+        req: Request<WatchRequest>,
     ) -> Result<Response<Self::WatchStream>, Status> {
-        // Stream updates via the snapshot watch channel
-        let rx = self.snapshot_bus.watch_snapshot();
-        let stream = WatchStream::new(rx).map(|arc| Ok(to_pb(&arc)));
+        let after_seq = req.into_inner().after_seq;
+        let (replay, rx) = self
+            .snapshot_bus
+            .watch_deltas_after(after_seq)
+            .map_err(|_| {
+                Status::failed_precondition(
+                    "after_seq is older than the retained delta window; resync required",
+                )
+            })?;
+        let mut last_seq = replay.last().map(|delta| delta.seq).unwrap_or(after_seq);
+        let replay_stream = stream::iter(replay.into_iter().map(|delta| Ok(to_pb_delta(&delta))));
+        let live_stream = BroadcastStream::new(rx).filter_map(move |item| match item {
+            Ok(delta) if delta.seq > last_seq => {
+                last_seq = delta.seq;
+                Some(Ok(to_pb_delta(&delta)))
+            }
+            Ok(_) => None,
+            Err(_) => Some(Err(Status::aborted(
+                "watch stream lagged behind the retained delta buffer; resync required",
+            ))),
+        });
+        let stream = replay_stream.chain(live_stream);
         Ok(Response::new(Box::pin(stream)))
     }
 }
@@ -203,6 +223,110 @@ pub fn to_pb(s: &snapshot::Snapshot) -> SnapshotReply {
         health: s.health.clone(),
         aggregated_apps,
         records,
+    }
+}
+
+fn to_pb_title_revision(revision: &snapshot::TitleRevisionRef) -> TitleRevisionRef {
+    TitleRevisionRef {
+        event_id: revision.event_id,
+        at: Some(utc_to_ts(revision.at)),
+        window_id: revision.window_id,
+        title: revision.title.clone(),
+    }
+}
+
+fn to_pb_delta(delta: &snapshot::SnapshotDelta) -> SnapshotDelta {
+    let map_state = |state: crate::daemon::records::ActivityState| match state {
+        crate::daemon::records::ActivityState::Active => PbState::Active,
+        crate::daemon::records::ActivityState::Passive => PbState::Passive,
+        crate::daemon::records::ActivityState::Inactive => PbState::Inactive,
+        crate::daemon::records::ActivityState::Locked => PbState::Locked,
+    } as i32;
+    let map_focus = |f: &crate::daemon::events::WindowFocusInfo| Focus {
+        app_name: (*f.app_name).clone(),
+        pid: f.pid,
+        window_id: f.window_id.to_string(),
+        window_title: (*f.window_title).clone(),
+        window_instance_start: Some(utc_to_ts(f.window_instance_start)),
+        process_start_time: f.process_start_time,
+        window_position: f
+            .window_position
+            .as_ref()
+            .map(|pos| PbPosition { x: pos.x, y: pos.y }),
+        window_size: f
+            .window_size
+            .map(|(width, height)| PbSize { width, height }),
+    };
+    let map_transition = |t: &snapshot::Transition| Transition {
+        from: map_state(t.from),
+        to: map_state(t.to),
+        at: Some(utc_to_ts(t.at)),
+        run_id: t.run_id.clone().unwrap_or_default(),
+    };
+    let map_app = |a: &snapshot::SnapshotApp| PbApp {
+        app_name: a.app_name.clone(),
+        pid: a.pid,
+        process_start_time: a.process_start_time,
+        windows: a
+            .windows
+            .iter()
+            .map(|w| PbWin {
+                window_id: w.window_id.clone(),
+                window_title: w.window_title.clone(),
+                first_seen: Some(utc_to_ts(w.first_seen)),
+                last_seen: Some(utc_to_ts(w.last_seen)),
+                duration_seconds: w.duration_seconds,
+                is_group: w.is_group,
+            })
+            .collect(),
+        total_duration_secs: a.total_duration_secs,
+        total_duration_pretty: a.total_duration_pretty.clone(),
+    };
+
+    SnapshotDelta {
+        seq: delta.seq,
+        mono_ns: delta.mono_ns,
+        run_id: delta.run_id.clone().unwrap_or_default(),
+        activity_state: delta.activity_state.map(map_state),
+        focus_cleared: delta.focus_cleared,
+        focus: delta.focus.as_ref().map(map_focus),
+        last_transition: delta.last_transition.as_ref().map(map_transition),
+        transitions_added: delta.transitions_added.iter().map(map_transition).collect(),
+        counts: delta.counts.as_ref().map(|counts| Counts {
+            signals_seen: counts.signals_seen,
+            hints_seen: counts.hints_seen,
+            records_emitted: counts.records_emitted,
+        }),
+        cadence: match (delta.cadence_ms, delta.cadence_reason.as_ref()) {
+            (Some(current_ms), Some(reason)) => Some(Cadence {
+                current_ms,
+                reason: reason.clone(),
+            }),
+            _ => None,
+        },
+        next_timeout_cleared: delta.next_timeout_cleared,
+        next_timeout: delta.next_timeout.as_ref().map(|t| utc_to_ts(*t)),
+        storage: delta.storage.as_ref().map(|storage| Storage {
+            backlog_count: storage.backlog_count,
+            last_flush: storage.last_flush_at.as_ref().map(|t| utc_to_ts(*t)),
+        }),
+        config: delta.config.as_ref().map(|config| Config {
+            active_grace_secs: config.active_grace_secs,
+            idle_threshold_secs: config.idle_threshold_secs,
+            retention_minutes: config.retention_minutes,
+            ephemeral_max_duration_secs: config.ephemeral_max_duration_secs,
+            ephemeral_min_distinct_ids: config.ephemeral_min_distinct_ids as u32,
+            ephemeral_app_max_duration_secs: config.ephemeral_app_max_duration_secs,
+            ephemeral_app_min_distinct_procs: config.ephemeral_app_min_distinct_procs as u32,
+        }),
+        health_appended: delta.health_appended.clone(),
+        aggregated_apps_changed: delta.aggregated_apps_changed,
+        aggregated_apps: delta.aggregated_apps.iter().map(map_app).collect(),
+        title_revisions_added: delta
+            .title_revisions_added
+            .iter()
+            .map(to_pb_title_revision)
+            .collect(),
     }
 }
 
@@ -464,17 +588,31 @@ mod tests {
         let bus = Arc::new(snapshot::SnapshotBus::new());
         let svc = KroniSvc::new(Arc::clone(&bus));
 
+        bus.publish_basic(
+            ActivityState::Inactive,
+            None,
+            None,
+            Vec::new(),
+            SnapshotCounts::default(),
+            250,
+            "idle".into(),
+            None,
+            StorageInfo::default(),
+            ConfigSummary::default(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let after_seq = bus.snapshot().seq;
+
         let mut stream = svc
             .watch(Request::new(WatchRequest {
+                after_seq,
                 sections: Vec::new(),
                 detail: "summary".into(),
             }))
             .await
             .expect("watch call succeeds")
             .into_inner();
-
-        let first = stream.next().await.expect("first item").expect("ok");
-        assert_eq!(first.activity_state, PbState::Inactive as i32);
 
         bus.publish_basic(
             ActivityState::Active,
@@ -494,9 +632,10 @@ mod tests {
             Vec::new(),
         );
 
-        let second = stream.next().await.expect("second item").expect("ok");
-        assert_eq!(second.activity_state, PbState::Active as i32);
-        assert_eq!(second.focus.unwrap().window_title, "Build log");
+        let delta = stream.next().await.expect("delta item").expect("ok");
+        assert_eq!(delta.activity_state, Some(PbState::Active as i32));
+        assert_eq!(delta.focus.unwrap().window_title, "Build log");
+        assert!(delta.counts.is_none());
     }
 
     #[test]

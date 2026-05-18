@@ -6,7 +6,9 @@ use std::sync::{
     Arc,
     atomic::{AtomicU64, Ordering},
 };
-use tokio::sync::watch;
+use tokio::sync::{broadcast, watch};
+
+const DELTA_HISTORY_CAPACITY: usize = 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -43,7 +45,7 @@ pub struct TitleRevisionRef {
     pub title: String,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Transition {
     pub from: ActivityState,
@@ -55,12 +57,53 @@ pub struct Transition {
     pub run_id: Option<String>,
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct Counts {
     pub signals_seen: u64,
     pub hints_seen: u64,
     pub records_emitted: u64,
+}
+
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct SnapshotDelta {
+    pub seq: u64,
+    pub mono_ns: u64,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity_state: Option<ActivityState>,
+    #[serde(default)]
+    pub focus_cleared: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus: Option<WindowFocusInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_transition: Option<Transition>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub transitions_added: Vec<Transition>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub counts: Option<Counts>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cadence_ms: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cadence_reason: Option<String>,
+    #[serde(default)]
+    pub next_timeout_cleared: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub next_timeout: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage: Option<StorageInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config: Option<ConfigSummary>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub health_appended: Vec<String>,
+    #[serde(default)]
+    pub aggregated_apps_changed: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub aggregated_apps: Vec<SnapshotApp>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub title_revisions_added: Vec<TitleRevisionRef>,
 }
 
 impl Snapshot {
@@ -101,6 +144,14 @@ pub struct SnapshotBus {
     transitions_rx: watch::Receiver<VecDeque<Transition>>,
     title_revisions_tx: watch::Sender<VecDeque<TitleRevisionRef>>,
     title_revisions_rx: watch::Receiver<VecDeque<TitleRevisionRef>>,
+    delta_history_tx: watch::Sender<VecDeque<SnapshotDelta>>,
+    delta_history_rx: watch::Receiver<VecDeque<SnapshotDelta>>,
+    delta_tx: broadcast::Sender<SnapshotDelta>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeltaReplayError {
+    AfterSeqTooOld,
 }
 
 impl SnapshotBus {
@@ -109,6 +160,9 @@ impl SnapshotBus {
         let (health_tx, health_rx) = watch::channel(VecDeque::with_capacity(64));
         let (transitions_tx, transitions_rx) = watch::channel(VecDeque::with_capacity(64));
         let (title_revisions_tx, title_revisions_rx) = watch::channel(VecDeque::with_capacity(128));
+        let (delta_history_tx, delta_history_rx) =
+            watch::channel(VecDeque::with_capacity(DELTA_HISTORY_CAPACITY));
+        let (delta_tx, _) = broadcast::channel(DELTA_HISTORY_CAPACITY);
         Self {
             seq: AtomicU64::new(0),
             run_id: None,
@@ -120,6 +174,9 @@ impl SnapshotBus {
             transitions_rx,
             title_revisions_tx,
             title_revisions_rx,
+            delta_history_tx,
+            delta_history_rx,
+            delta_tx,
         }
     }
 
@@ -151,6 +208,7 @@ impl SnapshotBus {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed) + 1;
         let transitions_recent = self.recent_transitions(5);
         let title_revisions_recent = self.recent_title_revisions(64);
+        let previous = self.snapshot();
         let snap = Snapshot {
             seq,
             mono_ns: monotonic_ns(),
@@ -170,7 +228,11 @@ impl SnapshotBus {
             title_revisions_recent,
             records,
         };
+        let delta = build_delta(previous.as_ref(), &snap);
         let _ = self.snapshot_tx.send(Arc::new(snap));
+        if let Some(delta) = delta {
+            self.record_delta(delta);
+        }
     }
 
     pub fn push_transition(&self, t: Transition) {
@@ -234,6 +296,38 @@ impl SnapshotBus {
     pub fn watch_snapshot(&self) -> watch::Receiver<Arc<Snapshot>> {
         self.snapshot_rx.clone()
     }
+
+    pub fn watch_deltas_after(
+        &self,
+        after_seq: u64,
+    ) -> Result<(Vec<SnapshotDelta>, broadcast::Receiver<SnapshotDelta>), DeltaReplayError> {
+        let rx = self.delta_tx.subscribe();
+        let history = self.delta_history_rx.borrow().clone();
+        if let Some(oldest) = history.front().map(|delta| delta.seq) {
+            if after_seq < oldest.saturating_sub(1) {
+                return Err(DeltaReplayError::AfterSeqTooOld);
+            }
+        }
+        let replay = history
+            .iter()
+            .filter(|delta| delta.seq > after_seq)
+            .cloned()
+            .collect();
+        Ok((replay, rx))
+    }
+
+    fn record_delta(&self, delta: SnapshotDelta) {
+        let mut buf = {
+            let guard = self.delta_history_rx.borrow();
+            guard.clone()
+        };
+        if buf.len() >= DELTA_HISTORY_CAPACITY {
+            let _ = buf.pop_front();
+        }
+        buf.push_back(delta.clone());
+        let _ = self.delta_history_tx.send(buf);
+        let _ = self.delta_tx.send(delta);
+    }
 }
 
 fn monotonic_ns() -> u64 {
@@ -244,14 +338,14 @@ fn monotonic_ns() -> u64 {
     now.as_nanos() as u64
 }
 
-#[derive(Debug, Default, Clone, Serialize, Deserialize)]
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct StorageInfo {
     pub backlog_count: u64,
     pub last_flush_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct ConfigSummary {
     pub active_grace_secs: u64,
@@ -263,7 +357,7 @@ pub struct ConfigSummary {
     pub ephemeral_app_min_distinct_procs: usize,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotWindow {
     pub window_id: String,
@@ -274,7 +368,7 @@ pub struct SnapshotWindow {
     pub is_group: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct SnapshotApp {
     pub app_name: String,
@@ -283,6 +377,156 @@ pub struct SnapshotApp {
     pub windows: Vec<SnapshotWindow>,
     pub total_duration_secs: u64,
     pub total_duration_pretty: String,
+}
+
+impl Snapshot {
+    pub fn apply_delta(&mut self, delta: &SnapshotDelta) {
+        self.seq = delta.seq;
+        self.mono_ns = delta.mono_ns;
+        self.run_id = delta.run_id.clone();
+        if let Some(state) = delta.activity_state {
+            self.activity_state = state;
+        }
+        if delta.focus_cleared {
+            self.focus = None;
+        }
+        if let Some(focus) = &delta.focus {
+            self.focus = Some(focus.clone());
+        }
+        if let Some(transition) = &delta.last_transition {
+            self.last_transition = Some(transition.clone());
+        }
+        if !delta.transitions_added.is_empty() {
+            self.transitions_recent
+                .splice(0..0, delta.transitions_added.iter().rev().cloned());
+            if self.transitions_recent.len() > 64 {
+                self.transitions_recent.truncate(64);
+            }
+        }
+        if let Some(counts) = &delta.counts {
+            self.counts = counts.clone();
+        }
+        if let Some(cadence_ms) = delta.cadence_ms {
+            self.cadence_ms = cadence_ms;
+        }
+        if let Some(cadence_reason) = &delta.cadence_reason {
+            self.cadence_reason = cadence_reason.clone();
+        }
+        if delta.next_timeout_cleared {
+            self.next_timeout = None;
+        }
+        if let Some(next_timeout) = delta.next_timeout {
+            self.next_timeout = Some(next_timeout);
+        }
+        if let Some(storage) = &delta.storage {
+            self.storage = storage.clone();
+        }
+        if let Some(config) = &delta.config {
+            self.config = config.clone();
+        }
+        if !delta.health_appended.is_empty() {
+            self.health.extend(delta.health_appended.iter().cloned());
+        }
+        if delta.aggregated_apps_changed {
+            self.aggregated_apps = delta.aggregated_apps.clone();
+        }
+        if !delta.title_revisions_added.is_empty() {
+            self.title_revisions_recent
+                .splice(0..0, delta.title_revisions_added.iter().rev().cloned());
+            if self.title_revisions_recent.len() > 64 {
+                self.title_revisions_recent.truncate(64);
+            }
+        }
+    }
+}
+
+fn build_delta(previous: &Snapshot, current: &Snapshot) -> Option<SnapshotDelta> {
+    let mut delta = SnapshotDelta {
+        seq: current.seq,
+        mono_ns: current.mono_ns,
+        run_id: current.run_id.clone(),
+        ..SnapshotDelta::default()
+    };
+
+    if previous.activity_state != current.activity_state {
+        delta.activity_state = Some(current.activity_state);
+    }
+    if previous.focus != current.focus {
+        match &current.focus {
+            Some(focus) => delta.focus = Some(focus.clone()),
+            None => delta.focus_cleared = true,
+        }
+    }
+    if previous.last_transition != current.last_transition {
+        delta.last_transition = current.last_transition.clone();
+    }
+    delta.transitions_added =
+        prepended_newest_first(&previous.transitions_recent, &current.transitions_recent);
+    if previous.counts != current.counts {
+        delta.counts = Some(current.counts.clone());
+    }
+    if previous.cadence_ms != current.cadence_ms
+        || previous.cadence_reason != current.cadence_reason
+    {
+        delta.cadence_ms = Some(current.cadence_ms);
+        delta.cadence_reason = Some(current.cadence_reason.clone());
+    }
+    if previous.next_timeout != current.next_timeout {
+        match current.next_timeout {
+            Some(next_timeout) => delta.next_timeout = Some(next_timeout),
+            None => delta.next_timeout_cleared = true,
+        }
+    }
+    if previous.storage != current.storage {
+        delta.storage = Some(current.storage.clone());
+    }
+    if previous.config != current.config {
+        delta.config = Some(current.config.clone());
+    }
+    delta.health_appended = appended_suffix(&previous.health, &current.health);
+    if previous.aggregated_apps != current.aggregated_apps {
+        delta.aggregated_apps_changed = true;
+        delta.aggregated_apps = current.aggregated_apps.clone();
+    }
+    delta.title_revisions_added = prepended_newest_first(
+        &previous.title_revisions_recent,
+        &current.title_revisions_recent,
+    );
+
+    if delta
+        == (SnapshotDelta {
+            seq: current.seq,
+            mono_ns: current.mono_ns,
+            run_id: current.run_id.clone(),
+            ..SnapshotDelta::default()
+        })
+    {
+        None
+    } else {
+        Some(delta)
+    }
+}
+
+fn appended_suffix<T: Clone + PartialEq>(previous: &[T], current: &[T]) -> Vec<T> {
+    if current.starts_with(previous) {
+        current[previous.len()..].to_vec()
+    } else {
+        current.to_vec()
+    }
+}
+
+fn prepended_newest_first<T: Clone + PartialEq>(previous: &[T], current: &[T]) -> Vec<T> {
+    if current.len() > previous.len() && current.ends_with(previous) {
+        current[..current.len() - previous.len()]
+            .iter()
+            .rev()
+            .cloned()
+            .collect()
+    } else if current != previous {
+        current.iter().rev().cloned().collect()
+    } else {
+        Vec::new()
+    }
 }
 
 #[cfg(test)]

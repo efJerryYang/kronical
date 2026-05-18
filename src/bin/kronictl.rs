@@ -9,7 +9,9 @@ use crossterm::{
 use hyper_util::rt::TokioIo;
 use kronical as _;
 
-use kronical::kroni_api::kroni::v1::{SnapshotRequest, WatchRequest, kroni_client::KroniClient};
+use kronical::kroni_api::kroni::v1::{
+    SnapshotDelta as PbSnapshotDelta, SnapshotRequest, WatchRequest, kroni_client::KroniClient,
+};
 use kronical::util::config::AppConfig;
 use kronical::util::logging::error;
 use kronical_core::records::{ActivityRecord, AggregatedActivity, aggregate_activities_since};
@@ -726,6 +728,42 @@ fn monitor_realtime(data_file: PathBuf, config: AppConfig) -> Result<()> {
     Ok(())
 }
 
+fn draw_monitor_snapshot_loaded<B: Backend>(
+    terminal: &mut Terminal<B>,
+    snap: &kronical::daemon::snapshot::Snapshot,
+) -> io::Result<()> {
+    terminal.draw(|f| {
+        let size = f.area();
+        let block = Block::default().title("Daemon Stats").borders(Borders::ALL);
+        let focus = snap
+            .focus
+            .as_ref()
+            .map(|f| format!("{} [{}] - {}", f.app_name, f.pid, f.window_title))
+            .unwrap_or_else(|| "-".to_string());
+        let lines = vec![
+            Line::from(vec![
+                Span::styled("Status: ", Style::default().fg(Color::Gray)),
+                Span::styled(
+                    "running",
+                    Style::default()
+                        .fg(Color::Green)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(format!("State: {:?}", snap.activity_state)),
+            Line::from(format!("Run: {}", snap.run_id.as_deref().unwrap_or("-"))),
+            Line::from(format!(
+                "Counts: signals={} hints={} records={}",
+                snap.counts.signals_seen, snap.counts.hints_seen, snap.counts.records_emitted
+            )),
+            Line::from(format!("Focus: {focus}")),
+            Line::from("Waiting for live deltas... press q to quit"),
+        ];
+        f.render_widget(Paragraph::new(lines).block(block), size);
+    })?;
+    Ok(())
+}
+
 fn run_monitor_loop<B: Backend>(
     terminal: &mut Terminal<B>,
     data_file: PathBuf,
@@ -734,11 +772,45 @@ fn run_monitor_loop<B: Backend>(
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream as StdUnixStream;
     let uds_http = kronical::util::paths::http_uds(data_file.parent().unwrap());
+    let mut current: Option<kronical::daemon::snapshot::Snapshot> = None;
     loop {
+        if current.is_none() {
+            match http_get_snapshot(&uds_http) {
+                Ok(snap) => {
+                    draw_monitor_snapshot_loaded(terminal, &snap)?;
+                    current = Some(snap);
+                }
+                Err(_) => {
+                    terminal.draw(|f| {
+                        let size = f.area();
+                        let block = Block::default()
+                            .title("Connecting...")
+                            .borders(Borders::ALL);
+                        let p = Paragraph::new("Could not fetch snapshot. Waiting for daemon...")
+                            .block(block);
+                        f.render_widget(p, size);
+                    })?;
+                    if crossterm_event::poll(Duration::from_millis(1000))? {
+                        if let crossterm_event::Event::Key(key) = crossterm_event::read()? {
+                            if key.code == crossterm_event::KeyCode::Char('q') {
+                                return Ok(());
+                            }
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(500));
+                    continue;
+                }
+            }
+        }
+
         match StdUnixStream::connect(&uds_http) {
             Ok(mut stream) => {
-                let req = b"GET /v1/stream HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\nConnection: close\r\n\r\n";
-                if let Err(_) = stream.write_all(req) {
+                stream.set_read_timeout(Some(Duration::from_millis(250)))?;
+                let after_seq = current.as_ref().map(|snap| snap.seq).unwrap_or(0);
+                let req = format!(
+                    "GET /v1/stream?afterSeq={after_seq} HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\nConnection: close\r\n\r\n"
+                );
+                if let Err(_) = stream.write_all(req.as_bytes()) {
                     std::thread::sleep(Duration::from_millis(500));
                     continue;
                 }
@@ -747,7 +819,18 @@ fn run_monitor_loop<B: Backend>(
                 // Skip headers
                 loop {
                     line.clear();
-                    let n = reader.read_line(&mut line)?;
+                    let n = match reader.read_line(&mut line) {
+                        Ok(n) => n,
+                        Err(err)
+                            if matches!(
+                                err.kind(),
+                                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                            ) =>
+                        {
+                            continue;
+                        }
+                        Err(err) => return Err(err),
+                    };
                     if n == 0 {
                         break;
                     }
@@ -765,7 +848,18 @@ fn run_monitor_loop<B: Backend>(
                         }
                     }
                     line.clear();
-                    let n = reader.read_line(&mut line)?;
+                    let n = match reader.read_line(&mut line) {
+                        Ok(n) => n,
+                        Err(err)
+                            if matches!(
+                                err.kind(),
+                                io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                            ) =>
+                        {
+                            continue;
+                        }
+                        Err(err) => return Err(err),
+                    };
                     if n == 0 {
                         break;
                     }
@@ -775,10 +869,12 @@ fn run_monitor_loop<B: Backend>(
                         data_buf.push('\n');
                     } else if line == "\r\n" || line == "\n" {
                         if !data_buf.is_empty() {
-                            let snap_result = serde_json::from_str::<
-                                kronical::daemon::snapshot::Snapshot,
+                            let delta_result = serde_json::from_str::<
+                                kronical::daemon::snapshot::SnapshotDelta,
                             >(data_buf.trim_end());
-                            if let Ok(snap) = snap_result {
+                            if let (Some(snap), Ok(delta)) = (&mut current, delta_result) {
+                                snap.apply_delta(&delta);
+                                let snap = &*snap;
                                 terminal.draw(|f| {
                                     let size = f.area();
                                     let layout = Layout::default()
@@ -1069,6 +1165,7 @@ fn run_monitor_loop<B: Backend>(
                                         snap.storage.backlog_count,
                                         snap.storage
                                             .last_flush_at
+                                            .as_ref()
                                             .map(|t| t.to_rfc3339())
                                             .unwrap_or_else(|| "".into())
                                     )));
@@ -1210,6 +1307,7 @@ fn run_monitor_loop<B: Backend>(
                         }
                     }
                 }
+                current = None;
             }
             Err(_) => {
                 terminal.draw(|f| {
@@ -1495,10 +1593,19 @@ fn http_get_snapshot(uds_path: &PathBuf) -> Result<kronical::daemon::snapshot::S
 fn sse_watch_via_http(uds_path: &PathBuf, pretty: bool) -> Result<()> {
     use std::io::{BufRead, BufReader, Write};
     use std::os::unix::net::UnixStream as StdUnixStream;
+    let mut current = http_get_snapshot(uds_path)?;
+    if pretty {
+        print_snapshot_pretty(&current);
+    } else {
+        println!("{}", serde_json::to_string(&current).unwrap_or_default());
+    }
     let mut stream =
         StdUnixStream::connect(uds_path).with_context(|| format!("connect UDS {:?}", uds_path))?;
-    let req = b"GET /v1/stream HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\nConnection: close\r\n\r\n";
-    stream.write_all(req)?;
+    let req = format!(
+        "GET /v1/stream?afterSeq={} HTTP/1.1\r\nHost: localhost\r\nAccept: text/event-stream\r\nConnection: close\r\n\r\n",
+        current.seq
+    );
+    stream.write_all(req.as_bytes())?;
     let mut reader = BufReader::new(stream);
     // Skip headers
     let mut line = String::new();
@@ -1527,13 +1634,14 @@ fn sse_watch_via_http(uds_path: &PathBuf, pretty: bool) -> Result<()> {
         } else if line == "\r\n" || line == "\n" {
             // event delimiter
             if !data_buf.is_empty() {
-                if let Ok(snap) = serde_json::from_str::<kronical::daemon::snapshot::Snapshot>(
+                if let Ok(delta) = serde_json::from_str::<kronical::daemon::snapshot::SnapshotDelta>(
                     data_buf.trim_end(),
                 ) {
+                    current.apply_delta(&delta);
                     if pretty {
-                        print_snapshot_pretty(&snap);
+                        print_snapshot_pretty(&current);
                     } else {
-                        println!("{}", data_buf.trim_end());
+                        println!("{}", serde_json::to_string(&current).unwrap_or_default());
                     }
                 }
                 data_buf.clear();
@@ -1800,6 +1908,157 @@ fn map_pb_snapshot(
     }
 }
 
+fn map_pb_delta(reply: PbSnapshotDelta) -> kronical::daemon::snapshot::SnapshotDelta {
+    let map_state = |state: i32| match state {
+        1 => kronical::daemon::records::ActivityState::Active,
+        2 => kronical::daemon::records::ActivityState::Passive,
+        3 => kronical::daemon::records::ActivityState::Inactive,
+        4 => kronical::daemon::records::ActivityState::Locked,
+        _ => kronical::daemon::records::ActivityState::Inactive,
+    };
+    let map_focus = |f: kronical::kroni_api::kroni::v1::snapshot_reply::Focus| {
+        kronical::daemon::events::WindowFocusInfo {
+            pid: f.pid,
+            process_start_time: f.process_start_time,
+            app_name: Arc::new(f.app_name),
+            window_title: Arc::new(f.window_title),
+            window_id: f.window_id.parse().unwrap_or(0),
+            window_instance_start: f
+                .window_instance_start
+                .and_then(|ts| chrono::DateTime::<Utc>::from_timestamp(ts.seconds, ts.nanos as u32))
+                .unwrap_or_else(Utc::now),
+            window_position: f
+                .window_position
+                .map(|pos| kronical::daemon::events::MousePosition { x: pos.x, y: pos.y }),
+            window_size: f.window_size.map(|size| (size.width, size.height)),
+        }
+    };
+    let map_transition = |t: kronical::kroni_api::kroni::v1::snapshot_reply::Transition| {
+        kronical::daemon::snapshot::Transition {
+            from: map_state(t.from),
+            to: map_state(t.to),
+            at: t
+                .at
+                .and_then(|ts| chrono::DateTime::<Utc>::from_timestamp(ts.seconds, ts.nanos as u32))
+                .unwrap_or_else(Utc::now),
+            by_signal: None,
+            run_id: if t.run_id.is_empty() {
+                None
+            } else {
+                Some(t.run_id)
+            },
+        }
+    };
+    let aggregated_apps = reply
+        .aggregated_apps
+        .into_iter()
+        .map(|a| {
+            let windows = a
+                .windows
+                .into_iter()
+                .map(|w| kronical::daemon::snapshot::SnapshotWindow {
+                    window_id: w.window_id,
+                    window_title: w.window_title,
+                    first_seen: w
+                        .first_seen
+                        .and_then(|ts| {
+                            chrono::DateTime::<Utc>::from_timestamp(ts.seconds, ts.nanos as u32)
+                        })
+                        .unwrap_or_else(Utc::now),
+                    last_seen: w
+                        .last_seen
+                        .and_then(|ts| {
+                            chrono::DateTime::<Utc>::from_timestamp(ts.seconds, ts.nanos as u32)
+                        })
+                        .unwrap_or_else(Utc::now),
+                    duration_seconds: w.duration_seconds,
+                    is_group: w.is_group,
+                })
+                .collect();
+            kronical::daemon::snapshot::SnapshotApp {
+                app_name: a.app_name,
+                pid: a.pid,
+                process_start_time: a.process_start_time,
+                windows,
+                total_duration_secs: a.total_duration_secs,
+                total_duration_pretty: if a.total_duration_pretty.is_empty() {
+                    pretty_duration(a.total_duration_secs)
+                } else {
+                    a.total_duration_pretty
+                },
+            }
+        })
+        .collect();
+    kronical::daemon::snapshot::SnapshotDelta {
+        seq: reply.seq,
+        mono_ns: reply.mono_ns,
+        run_id: if reply.run_id.is_empty() {
+            None
+        } else {
+            Some(reply.run_id)
+        },
+        activity_state: reply.activity_state.map(map_state),
+        focus_cleared: reply.focus_cleared,
+        focus: reply.focus.map(map_focus),
+        last_transition: reply.last_transition.map(map_transition),
+        transitions_added: reply
+            .transitions_added
+            .into_iter()
+            .map(map_transition)
+            .collect(),
+        counts: reply
+            .counts
+            .map(|counts| kronical::daemon::snapshot::Counts {
+                signals_seen: counts.signals_seen,
+                hints_seen: counts.hints_seen,
+                records_emitted: counts.records_emitted,
+            }),
+        cadence_ms: reply.cadence.as_ref().map(|cadence| cadence.current_ms),
+        cadence_reason: reply.cadence.map(|cadence| cadence.reason),
+        next_timeout_cleared: reply.next_timeout_cleared,
+        next_timeout: reply
+            .next_timeout
+            .and_then(|ts| chrono::DateTime::<Utc>::from_timestamp(ts.seconds, ts.nanos as u32)),
+        storage: reply
+            .storage
+            .map(|storage| kronical::daemon::snapshot::StorageInfo {
+                backlog_count: storage.backlog_count,
+                last_flush_at: storage.last_flush.and_then(|ts| {
+                    chrono::DateTime::<Utc>::from_timestamp(ts.seconds, ts.nanos as u32)
+                }),
+            }),
+        config: reply
+            .config
+            .map(|config| kronical::daemon::snapshot::ConfigSummary {
+                active_grace_secs: config.active_grace_secs,
+                idle_threshold_secs: config.idle_threshold_secs,
+                retention_minutes: config.retention_minutes,
+                ephemeral_max_duration_secs: config.ephemeral_max_duration_secs,
+                ephemeral_min_distinct_ids: config.ephemeral_min_distinct_ids as usize,
+                ephemeral_app_max_duration_secs: config.ephemeral_app_max_duration_secs,
+                ephemeral_app_min_distinct_procs: config.ephemeral_app_min_distinct_procs as usize,
+            }),
+        health_appended: reply.health_appended,
+        aggregated_apps_changed: reply.aggregated_apps_changed,
+        aggregated_apps,
+        title_revisions_added: reply
+            .title_revisions_added
+            .into_iter()
+            .map(|revision| kronical::daemon::snapshot::TitleRevisionRef {
+                event_id: revision.event_id,
+                at: revision
+                    .at
+                    .and_then(|ts| {
+                        chrono::DateTime::<Utc>::from_timestamp(ts.seconds, ts.nanos as u32)
+                    })
+                    .unwrap_or_else(Utc::now),
+                window_id: revision.window_id,
+                title: revision.title,
+            })
+            .collect(),
+    }
+}
+
 fn sse_watch_via_grpc_then_http(uds_path: &PathBuf, pretty: bool) -> Result<()> {
     {
         if let Err(_e) = grpc_watch(uds_path, pretty) {
@@ -1831,22 +2090,36 @@ fn grpc_watch(_uds_http_sock: &PathBuf, pretty: bool) -> Result<()> {
             }))
             .await?;
         let mut client = KroniClient::new(channel);
+        let mut current = map_pb_snapshot(
+            client
+                .snapshot(tonic::Request::new(SnapshotRequest {
+                    sections: vec![],
+                    detail: "summary".into(),
+                }))
+                .await?
+                .into_inner(),
+        );
+        if pretty {
+            print_snapshot_pretty(&current);
+        } else {
+            println!("{}", serde_json::to_string(&current).unwrap_or_default());
+        }
         let stream = client
             .watch(tonic::Request::new(WatchRequest {
+                after_seq: current.seq,
                 sections: vec![],
                 detail: "summary".into(),
             }))
             .await?
             .into_inner();
         use tonic::codec::Streaming;
-        let mut s: Streaming<kronical::kroni_api::kroni::v1::SnapshotReply> = stream;
+        let mut s: Streaming<PbSnapshotDelta> = stream;
         while let Some(item) = s.message().await? {
+            current.apply_delta(&map_pb_delta(item));
             if pretty {
-                let snap = map_pb_snapshot(item);
-                print_snapshot_pretty(&snap);
+                print_snapshot_pretty(&current);
             } else {
-                let snap = map_pb_snapshot(item);
-                println!("{}", serde_json::to_string(&snap).unwrap_or_default());
+                println!("{}", serde_json::to_string(&current).unwrap_or_default());
             }
         }
         Ok::<(), anyhow::Error>(())

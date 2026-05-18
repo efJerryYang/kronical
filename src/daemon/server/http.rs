@@ -2,7 +2,9 @@ use crate::daemon::runtime::{ThreadHandle, ThreadRegistry};
 use crate::daemon::snapshot;
 use crate::util::logging::{debug, info, warn};
 use anyhow::{Context, Result};
+use axum::extract::Query;
 use axum::extract::State;
+use axum::http::StatusCode;
 use axum::response::sse::{Event, Sse};
 use axum::{Json, Router, routing::get};
 use futures_util::stream::Stream;
@@ -15,6 +17,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UnixListener;
+use tokio_stream::wrappers::BroadcastStream;
 use tower::Service;
 
 #[cfg(test)]
@@ -42,15 +45,42 @@ async fn snapshot_handler(
 
 async fn stream_handler(
     State(snapshot_bus): State<Arc<snapshot::SnapshotBus>>,
-) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+    Query(params): Query<StreamQuery>,
+) -> Result<Sse<impl Stream<Item = Result<Event, Infallible>>>, (StatusCode, String)> {
     use tokio_stream::StreamExt;
-    use tokio_stream::wrappers::WatchStream;
-    let rx = snapshot_bus.watch_snapshot();
-    let stream = WatchStream::new(rx).map(|snap| {
-        let data = serde_json::to_string(&*snap).unwrap_or_else(|_| "{}".into());
+    let (replay, rx) = snapshot_bus
+        .watch_deltas_after(params.after_seq)
+        .map_err(|_| {
+            (
+                StatusCode::CONFLICT,
+                "afterSeq is older than the retained delta window; resync required".to_string(),
+            )
+        })?;
+    let mut last_seq = replay
+        .last()
+        .map(|delta| delta.seq)
+        .unwrap_or(params.after_seq);
+    let replay_stream = tokio_stream::iter(replay.into_iter().map(|delta| {
+        let data = serde_json::to_string(&delta).unwrap_or_else(|_| "{}".into());
         Ok(Event::default().data(data))
+    }));
+    let live_stream = BroadcastStream::new(rx).filter_map(move |item| match item {
+        Ok(delta) if delta.seq > last_seq => {
+            last_seq = delta.seq;
+            let data = serde_json::to_string(&delta).unwrap_or_else(|_| "{}".into());
+            Some(Ok(Event::default().data(data)))
+        }
+        Ok(_) => None,
+        Err(_) => None,
     });
-    Sse::new(stream)
+    Ok(Sse::new(replay_stream.chain(live_stream)))
+}
+
+#[derive(Debug, Default, Clone, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StreamQuery {
+    #[serde(default)]
+    after_seq: u64,
 }
 
 pub fn spawn_http_server(
@@ -238,7 +268,9 @@ mod tests {
         let bus = Arc::new(SnapshotBus::new());
         publish_sample(&bus, "initial");
 
-        let sse = stream_handler(State(Arc::clone(&bus))).await;
+        let sse = stream_handler(State(Arc::clone(&bus)), Query(StreamQuery { after_seq: 0 }))
+            .await
+            .expect("stream handler succeeds");
         let response = sse.into_response();
         let headers = response.headers();
         assert_eq!(

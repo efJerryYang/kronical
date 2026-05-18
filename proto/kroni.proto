@@ -106,11 +106,40 @@ message SnapshotReply {
 }
 
 message WatchRequest {
-  repeated string sections = 1;
-  string detail = 2;
+  uint64 after_seq = 1;
+  repeated string sections = 2;
+  string detail = 3;
+}
+
+message TitleRevisionRef {
+  uint64 event_id = 1;
+  google.protobuf.Timestamp at = 2;
+  uint32 window_id = 3;
+  string title = 4;
+}
+
+message SnapshotDelta {
+  uint64 seq = 1;
+  uint64 mono_ns = 2;
+  string run_id = 3;
+  optional SnapshotReply.ActivityState activity_state = 4;
+  bool focus_cleared = 5;
+  SnapshotReply.Focus focus = 6;
+  SnapshotReply.Transition last_transition = 7;
+  repeated SnapshotReply.Transition transitions_added = 8;
+  SnapshotReply.Counts counts = 9;
+  SnapshotReply.Cadence cadence = 10;
+  bool next_timeout_cleared = 11;
+  google.protobuf.Timestamp next_timeout = 12;
+  SnapshotReply.Storage storage = 13;
+  SnapshotReply.Config config = 14;
+  repeated string health_appended = 15;
+  bool aggregated_apps_changed = 16;
+  repeated SnapshotReply.SnapshotApp aggregated_apps = 17;
+  repeated TitleRevisionRef title_revisions_added = 18;
 }
 
 service Kroni {
   rpc Snapshot (SnapshotRequest) returns (SnapshotReply);
-  rpc Watch (WatchRequest) returns (stream SnapshotReply);
+  rpc Watch (WatchRequest) returns (stream SnapshotDelta);
 }

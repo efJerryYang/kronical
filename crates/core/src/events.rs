@@ -2,7 +2,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MousePosition {
     pub x: i32,
     pub y: i32,
@@ -65,7 +65,7 @@ pub enum WheelScrollType {
     Unknown(u8),
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct WindowFocusInfo {
     pub pid: i32,
